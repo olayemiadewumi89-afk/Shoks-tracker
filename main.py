@@ -4,13 +4,6 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# === CONFIG FROM ENV ===
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-HELIUS_KEY = os.getenv("HELIUS_API_KEY")
-ALCHEMY_KEY = os.getenv("ALCHEMY_API_KEY")
-
-# === YOUR WALLETS ===
 EVM_WALLETS = [
     "0xfd87eda88be6c372453b721da63d58ad1a5b2d94",
     "0x2a17e1e796dd7bd3b27efe2cda72d4b909baaacf",
@@ -51,61 +44,93 @@ SOL_WALLETS = [
     "D9tPQeij7vSTZwkxzxZibso4GFuRW8aBMpCg5QhCSfVL",
 ]
 
-# Override with env if provided
-WATCH_RAW = os.getenv("WATCH_WALLETS","")
-if WATCH_RAW:
-    all_raw = [w.strip() for w in WATCH_RAW.split(",") if w.strip()]
-    evm_from_env = [w for w in all_raw if w.startswith("0x")]
-    sol_from_env = [w for w in all_raw if not w.startswith("0x") and len(w) > 30]
-    if evm_from_env: EVM_WALLETS = evm_from_env
-    if sol_from_env: SOL_WALLETS = sol_from_env
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+HELIUS_KEY = os.getenv("HELIUS_API_KEY")
+ALCHEMY_KEY = os.getenv("ALCHEMY_API_KEY")
 
 seen_evm = set()
 seen_sol = set()
 
 def send_tg(t):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("No TG keys")
+        return
     try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", 
-                      json={"chat_id":CHAT_ID,"text":t,"parse_mode":"HTML","disable_web_page_preview":True}, timeout=15)
-        print(f"TG: {t[:80]}")
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id":CHAT_ID,"text":t,"parse_mode":"HTML"}, timeout=10)
     except Exception as e:
-        print(f"TG err: {e}")
+        print(f"TG err {e}")
 
-# --- EVM LOGIC ---
-def get_evm_transfers(rpc_url, wallet):
-    payload = {"jsonrpc":"2.0","id":1,"method":"alchemy_getAssetTransfers","params":[{"toAddress":wallet,"category":["erc20"],"order":"desc","maxCount":"0x3","withMetadata":True}]}
+def get_evm(rpc, wallet):
     try:
-        r = requests.post(rpc_url, json=payload, timeout=15)
+        p = {"jsonrpc":"2.0","id":1,"method":"alchemy_getAssetTransfers","params":[{"toAddress":wallet,"category":["erc20"],"order":"desc","maxCount":"0x2"}]}
+        r = requests.post(rpc, json=p, timeout=10)
         return r.json().get("result",{}).get("transfers",[])
     except: return []
 
+def get_sol(wallet):
+    try:
+        url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions?api-key={HELIUS_KEY}&limit=2"
+        r = requests.get(url, timeout=10)
+        return r.json()
+    except: return []
+
+@app.route('/')
+def home():
+    return f"Shoks DUAL LIVE - SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} - {datetime.now()}"
+
 def evm_loop():
-    print(f"EVM TRACKER STARTED - {len(EVM_WALLETS)} wallets")
     if not ALCHEMY_KEY:
-        print("No ALCHEMY_KEY - EVM disabled")
+        print("EVM disabled - no ALCHEMY_KEY")
         return
-    eth_rpc = f"https://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_KEY}"
+    print(f"EVM tracking {len(EVM_WALLETS)} wallets")
     base_rpc = f"https://base-mainnet.g.alchemy.com/v2/{ALCHEMY_KEY}"
-    rpcs = [("BASE", base_rpc), ("ETH", eth_rpc)]
-    
     while True:
-        for chain, rpc in rpcs:
-            for wallet in EVM_WALLETS:
-                try:
-                    transfers = get_evm_transfers(rpc, wallet)
-                    for tx in transfers[:1]:
-                        h = tx.get("hash")
-                        if not h or h in seen_evm:
-                            continue
-                        if len(seen_evm) < len(EVM_WALLETS)*2:
-                            seen_evm.add(h)
-                            continue
-                        seen_evm.add(h)
-                        token = tx.get("asset","Token")
-                        value = tx.get("value","?")
-                        short_w = wallet[:6]+"..."+wallet[-4:]
-                        scan = "basescan.org" if chain=="BASE" else "etherscan.io"
-                        msg = f"🔥 <b>EVM BUY [{chain}]</b>\n\n💼 <code>{short_w}</code>\n🪙 <b>{token}</b> - {value}\n🔗 <a href='https://{scan}/tx/{h}'>View TX</a>\n⏰ {datetime.now().strftime('%H:%M:%S')}"
-                        send_tg(msg)
-                except Exception as e:
-                    print(f"EVM err: {e
+        for w in EVM_WALLETS:
+            try:
+                txs = get_evm(base_rpc, w)
+                for tx in txs[:1]:
+                    h = tx.get("hash")
+                    if not h or h in seen_evm: continue
+                    if len(seen_evm) < 5:
+                        seen_evm.add(h); continue
+                    seen_evm.add(h)
+                    send_tg(f"🔥 <b>BASE BUY</b>\n<code>{w[:6]}...{w[-4:]}</code>\n{tx.get('asset')} {tx.get('value')}\nhttps://basescan.org/tx/{h}")
+            except: pass
+            time.sleep(1)
+        time.sleep(20)
+
+def sol_loop():
+    if not HELIUS_KEY:
+        print("SOL disabled - no HELIUS_KEY")
+        return
+    print(f"SOL tracking {len(SOL_WALLETS)} wallets")
+    while True:
+        for w in SOL_WALLETS:
+            try:
+                txs = get_sol(w)
+                if not isinstance(txs, list): continue
+                for tx in txs[:1]:
+                    sig = tx.get("signature")
+                    if not sig or sig in seen_sol: continue
+                    if len(seen_sol) < 5:
+                        seen_sol.add(sig); continue
+                    seen_sol.add(sig)
+                    send_tg(f"⚡ <b>SOL BUY</b>\n<code>{w[:6]}...{w[-4:]}</code>\n{tx.get('description','New tx')[:100]}\nhttps://solscan.io/tx/{sig}")
+            except: pass
+            time.sleep(1)
+        time.sleep(25)
+
+threading.Thread(target=evm_loop, daemon=True).start()
+threading.Thread(target=sol_loop, daemon=True).start()
+
+# Startup message - safe
+def startup():
+    time.sleep(5)
+    send_tg(f"🚀 <b>SHOKS DUAL TRACKER LIVE</b>\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)}\n{datetime.now().strftime('%H:%M')}")
+
+threading.Thread(target=startup, daemon=True).start()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
