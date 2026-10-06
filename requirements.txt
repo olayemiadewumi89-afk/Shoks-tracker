@@ -1,2 +1,4 @@
 flask
+web3
+websockets
 requests
