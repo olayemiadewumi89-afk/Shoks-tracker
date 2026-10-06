@@ -8,9 +8,8 @@ SOL_WALLETS = ["Beqv6dzTcjV2eodo8RRXCiCcnSYrS1vkQKhfqwHXqeit","5t8FA8z7SFiEpjau2
 BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN");CHAT_ID=os.getenv("TELEGRAM_CHAT_ID");HELIUS_KEY=os.getenv("HELIUS_API_KEY");ALCHEMY_KEY=os.getenv("ALCHEMY_API_KEY");MIN_USD=20.0
 seen_evm=set();seen_sol=set()
 
-# NEW: MEMORY FOR RE-BUYS
-buy_history_sol = {} # mint -> [(ts, wallet, usd, symbol),...]
-buy_history_evm = {} # contract -> [(ts, wallet, symbol),...]
+buy_history_sol = {}
+buy_history_evm = {}
 
 def send_tg(t):
     try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json={"chat_id":CHAT_ID,"text":t,"parse_mode":"HTML","disable_web_page_preview":True},timeout=10)
@@ -20,7 +19,7 @@ def time_ago(ts):
     diff=int(time.time()-ts)
     if diff<60: return f"{diff}s ago"
     if diff<3600: return f"{diff//60}m ago"
-    if diff<86400: return f"{diff//3600}h { (diff%3600)//60 }m ago"
+    if diff<86400: return f"{diff//3600}h {(diff%3600)//60}m ago"
     return f"{diff//86400}d ago"
 
 @app.route('/')
@@ -55,25 +54,17 @@ def sol_loop():
                             mint=tt.get("mint","")
                             if tt.get("tokenSymbol"): coin_name=tt.get("tokenSymbol")
                             break
-                    if not mint:
-                        for tt in tx.get("tokenTransfers",[]):
-                            mint=tt.get("mint","")
-                            break
                     if not mint: continue
 
-                    # === RE-BUY LOGIC ===
                     now=time.time()
                     history = buy_history_sol.get(mint, [])
-                    # clean old >24h
                     recent = [h for h in history if now - h[0] < 86400]
 
                     if recent:
-                        # Check if different wallets bought same coin before
                         prev_wallets = list(set([h[1] for h in recent]))
                         total_usd = sum([h[2] for h in recent]) + usdc
-
                         lines = []
-                        for h in recent[-5:]: # last 5 buys
+                        for h in recent[-5:]:
                             lines.append(f"• {h[1][:4]}...{h[1][-3:]} bought ${h[2]:.2f} - {time_ago(h[0])}")
                         past_text = "\n".join(lines)
 
@@ -90,7 +81,6 @@ def sol_loop():
 <a href="https://solscan.io/tx/{sig}">Tx {sig[:8]}</a>"""
                         send_tg(msg)
                     else:
-                        # First time buy
                         msg=f"""⚡ <b>SOL BUY ${usdc:.2f}</b>
 
 🪙 <b>{coin_name}</b>
@@ -102,7 +92,6 @@ def sol_loop():
 🔗 <a href="https://solscan.io/tx/{sig}">View Tx {sig[:8]}</a>"""
                         send_tg(msg)
 
-                    # Save to memory
                     recent.append((now, w, usdc, coin_name))
                     buy_history_sol[mint] = recent
 
@@ -126,7 +115,6 @@ def evm_loop():
                     seen_evm.add(h)
                     addr=tx.get("rawContract",{}).get("address",""); val=tx.get("value","?"); sym=tx.get("asset","TOKEN")
 
-                    # RE-BUY for EVM too
                     now=time.time()
                     recent = [x for x in buy_history_evm.get(addr,[]) if now - x[0] < 86400]
                     if recent:
