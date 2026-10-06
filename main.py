@@ -11,9 +11,17 @@ seen_evm=set();seen_sol=set()
 buy_history_sol = {}
 buy_history_evm = {}
 
-def send_tg(t):
-    try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json={"chat_id":CHAT_ID,"text":t,"parse_mode":"HTML","disable_web_page_preview":True},timeout=10)
-    except: pass
+# NEW: Multiple users support
+subscribers = set()
+if CHAT_ID: subscribers.add(str(CHAT_ID))
+tg_offset = 0
+
+def send_tg_all(t):
+    for cid in list(subscribers):
+        try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json={"chat_id":cid,"text":t,"parse_mode":"HTML","disable_web_page_preview":True},timeout=10)
+        except: pass
+
+def send_tg(t): send_tg_all(t)
 
 def time_ago(ts):
     diff=int(time.time()-ts)
@@ -23,7 +31,25 @@ def time_ago(ts):
     return f"{diff//86400}d ago"
 
 @app.route('/')
-def home(): return "LIVE"
+def home(): return f"LIVE - {len(subscribers)} users"
+
+def telegram_listener():
+    global tg_offset
+    while True:
+        try:
+            r=requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={tg_offset}&timeout=20",timeout=25).json()
+            for upd in r.get("result",[]):
+                tg_offset = upd["update_id"]+1
+                msg=upd.get("message",{})
+                chat_id=str(msg.get("chat",{}).get("id",""))
+                text=msg.get("text","")
+                if not chat_id: continue
+                if text.startswith("/start"):
+                    if chat_id not in subscribers:
+                        subscribers.add(chat_id)
+                    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json={"chat_id":chat_id,"text":f"🔥 <b>Shoks Tracker ACTIVE</b>\n\nYou will now get alerts when my {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} BASE wallets buy.\n\n✅ Re-buy detection ON\n✅ Time history ON\n\nWait for next buy...","parse_mode":"HTML"},timeout=10)
+        except: pass
+        time.sleep(2)
 
 def sol_loop():
     while True:
@@ -41,13 +67,10 @@ def sol_loop():
                     m=re.search(r'([\d\.]+) USDC',desc)
                     usdc=float(m.group(1)) if m else 0
                     if usdc<MIN_USD: continue
-
                     coin_name="NEW TOKEN"; amount_str="?"
                     dm=re.search(r'for ([\d,\.]+) ([A-Za-z0-9\$]+)',desc)
                     if dm:
-                        amount_str=dm.group(1)
-                        coin_name=dm.group(2)
-
+                        amount_str=dm.group(1); coin_name=dm.group(2)
                     mint=""
                     for tt in tx.get("tokenTransfers",[]):
                         if "EPjFWdd" not in tt.get("mint",""):
@@ -55,19 +78,15 @@ def sol_loop():
                             if tt.get("tokenSymbol"): coin_name=tt.get("tokenSymbol")
                             break
                     if not mint: continue
-
                     now=time.time()
                     history = buy_history_sol.get(mint, [])
                     recent = [h for h in history if now - h[0] < 86400]
-
                     if recent:
                         prev_wallets = list(set([h[1] for h in recent]))
                         total_usd = sum([h[2] for h in recent]) + usdc
-                        lines = []
-                        for h in recent[-5:]:
-                            lines.append(f"• {h[1][:4]}...{h[1][-3:]} bought ${h[2]:.2f} - {time_ago(h[0])}")
-                        past_text = "\n".join(lines)
-
+                        lines=[]
+                        for h in recent[-5:]: lines.append(f"• {h[1][:4]}...{h[1][-3:]} bought ${h[2]:.2f} - {time_ago(h[0])}")
+                        past_text="\n".join(lines)
                         msg=f"""🔁🔁 <b>RE-BUY ALERT! SAME COIN!</b> 🔁🔁
 
 🪙 <b>{coin_name}</b> <code>{mint[:4]}..{mint[-3:]}</code>
@@ -79,7 +98,7 @@ def sol_loop():
 👥 Total: {len(prev_wallets)+1} wallets | 💰 Combined: ${total_usd:.2f}
 🔗 <a href="https://dexscreener.com/solana/{mint}">Dexscreener</a> | <a href="https://solscan.io/token/{mint}">Solscan</a>
 <a href="https://solscan.io/tx/{sig}">Tx {sig[:8]}</a>"""
-                        send_tg(msg)
+                        send_tg_all(msg)
                     else:
                         msg=f"""⚡ <b>SOL BUY ${usdc:.2f}</b>
 
@@ -90,13 +109,10 @@ def sol_loop():
 
 👛 Wallet: <code>{w[:6]}...{w[-4:]}</code>
 🔗 <a href="https://solscan.io/tx/{sig}">View Tx {sig[:8]}</a>"""
-                        send_tg(msg)
-
+                        send_tg_all(msg)
                     recent.append((now, w, usdc, coin_name))
                     buy_history_sol[mint] = recent
-
-            except Exception as e:
-                pass
+            except: pass
             time.sleep(1)
         time.sleep(20)
 
@@ -114,7 +130,6 @@ def evm_loop():
                     if len(seen_evm)<1: seen_evm.add(h); continue
                     seen_evm.add(h)
                     addr=tx.get("rawContract",{}).get("address",""); val=tx.get("value","?"); sym=tx.get("asset","TOKEN")
-
                     now=time.time()
                     recent = [x for x in buy_history_evm.get(addr,[]) if now - x[0] < 86400]
                     if recent:
@@ -127,7 +142,7 @@ def evm_loop():
 📜 Past buys:
 {lines}
 🔗 <a href="https://basescan.org/tx/{h}">View Tx</a>"""
-                        send_tg(msg)
+                        send_tg_all(msg)
                     else:
                         msg=f"""🔥 <b>BASE BUY</b>
 
@@ -137,14 +152,14 @@ def evm_loop():
 
 👛 Wallet: <code>{w[:6]}...{w[-4:]}</code>
 🔗 <a href="https://basescan.org/tx/{h}">View Tx {h[:8]}</a>"""
-                        send_tg(msg)
-
+                        send_tg_all(msg)
                     recent.append((now, w, sym))
                     buy_history_evm[addr]=recent
             except: pass
             time.sleep(1)
         time.sleep(20)
 
+threading.Thread(target=telegram_listener,daemon=True).start()
 threading.Thread(target=sol_loop,daemon=True).start()
 threading.Thread(target=evm_loop,daemon=True).start()
 
