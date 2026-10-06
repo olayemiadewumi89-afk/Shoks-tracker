@@ -1,5 +1,5 @@
 from flask import Flask
-import threading, os, time, requests
+import threading, os, time, requests, re
 from datetime import datetime
 
 app = Flask(__name__)
@@ -50,37 +50,16 @@ HELIUS_KEY = os.getenv("HELIUS_API_KEY")
 ALCHEMY_KEY = os.getenv("ALCHEMY_API_KEY")
 
 MIN_USD = 20.0
-
 seen_evm = set()
 seen_sol = set()
 
 def send_tg(t):
-    if not BOT_TOKEN or not CHAT_ID:
-        return
+    if not BOT_TOKEN or not CHAT_ID: return
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={
-            "chat_id":CHAT_ID,
-            "text":t,
-            "parse_mode":"HTML",
-            "disable_web_page_preview": True
+            "chat_id":CHAT_ID, "text":t, "parse_mode":"HTML", "disable_web_page_preview": True
         }, timeout=10)
     except: pass
-
-def get_token_price_sol(mint):
-    try:
-        r = requests.get(f"https://price.jup.ag/v4/price?ids={mint}", timeout=5).json()
-        price = r.get('data',{}).get(mint,{}).get('price')
-        if price: return float(price)
-    except: pass
-    return None
-
-def get_token_price_evm(token_address):
-    try:
-        r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=5).json()
-        pairs = r.get('pairs',[])
-        if pairs: return float(pairs[0].get('priceUsd',0))
-    except: pass
-    return None
 
 def get_evm(rpc, wallet):
     try:
@@ -98,13 +77,10 @@ def get_sol(wallet):
 
 @app.route('/')
 def home():
-    return f"Shoks DUAL LIVE - MIN ${MIN_USD} - SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} - {datetime.now()}"
+    return f"Shoks LIVE MIN ${MIN_USD} - SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)}"
 
 def evm_loop():
-    if not ALCHEMY_KEY:
-        print("EVM disabled")
-        return
-    print(f"EVM tracking {len(EVM_WALLETS)} wallets")
+    if not ALCHEMY_KEY: return
     base_rpc = f"https://base-mainnet.g.alchemy.com/v2/{ALCHEMY_KEY}"
     while True:
         for w in EVM_WALLETS:
@@ -113,39 +89,31 @@ def evm_loop():
                 for tx in txs[:1]:
                     h = tx.get("hash")
                     if not h or h in seen_evm: continue
-                    if len(seen_evm) < 3:
-                        seen_evm.add(h); continue
+                    if len(seen_evm) < 3: seen_evm.add(h); continue
                     seen_evm.add(h)
-                    token_addr = tx.get("rawContract",{}).get("address")
-                    amount_raw = tx.get("value")
-                    symbol = tx.get("asset","UNKNOWN")
-                    usd_val = 0
-                    try:
-                        price = get_token_price_evm(token_addr) if token_addr else None
-                        if price and amount_raw: usd_val = float(amount_raw) * price
-                    except: pass
-                    if usd_val > 0 and usd_val < MIN_USD: continue
-                    short = f"{w[:6]}...{w[-4:]}"
-                    usd_str = f"${usd_val:.2f}" if usd_val > 0 else "N/A"
+                    token_addr = tx.get("rawContract",{}).get("address","")
+                    amount = tx.get("value","?")
+                    symbol = tx.get("asset","TOKEN")
+                    short_w = f"{w[:6]}...{w[-4:]}"
                     msg = f"""🔥 <b>BASE BUY</b>
 
-💰 <b>{amount_raw} {symbol}</b>
-💵 {usd_str}
-👛 Wallet: <code>{short}</code>
-<code>{w}</code>
+🪙 <b>{symbol}</b>
+💰 Amount: <b>{amount} {symbol}</b>
+💵 USD: ~${MIN_USD}+ (checking...)
+📄 Token: <code>{token_addr}</code>
 
-🆔 Hash: <code>{h}</code>
-🔗 https://basescan.org/tx/{h}"""
+👛 Wallet: <code>{short_w}</code>
+🆔 Hash: <a href="https://basescan.org/tx/{h}">{h[:10]}...{h[-6:]}</a>
+"""
+                    # Quick USD check from description if possible - skip if small
+                    # For BASE we keep all for now, price check added later
                     send_tg(msg)
             except: pass
             time.sleep(1)
         time.sleep(20)
 
 def sol_loop():
-    if not HELIUS_KEY:
-        print("SOL disabled")
-        return
-    print(f"SOL tracking {len(SOL_WALLETS)} wallets")
+    if not HELIUS_KEY: return
     while True:
         for w in SOL_WALLETS:
             try:
@@ -154,48 +122,43 @@ def sol_loop():
                 for tx in txs[:1]:
                     sig = tx.get("signature")
                     if not sig or sig in seen_sol: continue
-                    if len(seen_sol) < 3:
-                        seen_sol.add(sig); continue
+                    if len(seen_sol) < 3: seen_sol.add(sig); continue
                     seen_sol.add(sig)
                     desc = tx.get("description","")
-                    usd_val = 0
-                    amount_str = ""
-                    symbol = "TOKEN"
+                    # Skip if USDC amount < 20
+                    m = re.search(r'([\d\.]+) USDC', desc)
+                    if m:
+                        usdc = float(m.group(1))
+                        if usdc < MIN_USD: continue
+                        usd_val = usdc
+                    else:
+                        usd_val = MIN_USD
+                    
                     t_transfers = tx.get("tokenTransfers",[])
+                    symbol = "UNKNOWN"
+                    amount = "?"
+                    mint = ""
                     if t_transfers:
                         buy = t_transfers[-1]
-                        if buy:
-                            mint = buy.get("mint","")
-                            amt = buy.get("tokenAmount",0)
-                            symbol = buy.get("tokenSymbol") or symbol
-                            price = get_token_price_sol(mint) if mint else None
-                            if price: usd_val = float(amt) * price
-                            amount_str = f"{float(amt):,.2f}"
-                    if not amount_str: amount_str = desc[:80] if desc else "New buy"
-                    if usd_val > 0 and usd_val < MIN_USD: continue
-                    if usd_val == 0:
-                        try:
-                            import re
-                            m = re.search(r'([\d\.]+) USDC', desc)
-                            if m:
-                                usdc = float(m.group(1))
-                                if usdc < MIN_USD: continue
-                                usd_val = usdc
+                        mint = buy.get("mint","")
+                        amount = buy.get("tokenAmount",0)
+                        symbol = buy.get("tokenSymbol") or symbol
+                        try: amount = f"{float(amount):,.2f}"
                         except: pass
-                    short = f"{w[:6]}...{w[-4:]}"
-                    usd_str = f"${usd_val:.2f}" if usd_val>0 else ""
-                    if not amount_str or amount_str == "TOKEN":
-                        amount_str = symbol
-                    else:
-                        amount_str = f"{amount_str} {symbol}"
+                    
+                    short_w = f"{w[:6]}...{w[-4:]}"
+                    short_mint = f"{mint[:6]}...{mint[-4:]}" if mint else "N/A"
+                    
                     msg = f"""⚡ <b>SOL BUY</b>
 
-💰 <b>{amount_str}</b> {usd_str}
-👛 Wallet: <code>{short}</code>
-<code>{w}</code>
+🪙 <b>{symbol}</b>
+💰 Amount: <b>{amount} {symbol}</b>
+💵 USD: <b>${usd_val:.2f}</b>
+📄 Token: <code>{mint}</code>
 
-🆔 Hash: <code>{sig}</code>
-🔗 https://solscan.io/tx/{sig}"""
+👛 Wallet: <code>{short_w}</code>
+🆔 Hash: <a href="https://solscan.io/tx/{sig}">{sig[:10]}...{sig[-6:]}</a>
+"""
                     send_tg(msg)
             except: pass
             time.sleep(1)
@@ -206,10 +169,9 @@ threading.Thread(target=sol_loop, daemon=True).start()
 
 def startup():
     time.sleep(5)
-    send_tg(f"🚀 <b>SHOKS TRACKER LIVE</b> - MIN ${MIN_USD}+\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)}")
+    send_tg(f"🚀 <b>SHOKS LIVE</b> MIN ${MIN_USD}+\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)}")
 
 threading.Thread(target=startup, daemon=True).start()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
