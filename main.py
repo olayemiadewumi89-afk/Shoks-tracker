@@ -50,7 +50,7 @@ WALLETS_FILE="wallets.json"; MEMORY_FILE="cluster_memory.json"; HOLDINGS_FILE="h
 cluster_memory=defaultdict(list); holdings=defaultdict(dict)
 pnl_tracker=defaultdict(lambda: {"buys":0,"sells":0,"spent":0.0,"realized":0.0})
 seen_sigs=set()
-STABLES={"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB","So11111111111111111111111111111111111111112"}
+STABLES={"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB","So11111111111111111111111111111111111111112","EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"}
 
 def load_wallets():
     global SOL_WALLETS, EVM_WALLETS
@@ -108,7 +108,7 @@ def get_w3_with_fallback(chain):
 BOT_TOKEN=os.getenv("BOT_TOKEN"); CHAT_ID=os.getenv("CHAT_ID")
 app=Flask(__name__)
 @app.route('/')
-def home(): return "Shok V3.11.9 FIXED - NO DUPE + NO STABLE",200
+def home(): return "Shok V3.11.10 FINAL - NO DUPE N/A FIXED",200
 @app.route('/health')
 def health(): return "OK",200
 def run_flask(): app.run(host='0.0.0.0',port=int(os.getenv("PORT",10000)))
@@ -124,21 +124,34 @@ def set_bot_commands():
     try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",json={"commands":cmds},timeout=10)
     except: pass
 
-def get_token_info_quick(token_address, chain_hint="base"):
+def get_token_info_quick(token_address, chain_hint="SOL"):
     if token_address in STABLES: return None
+    # Try dexscreener 2x with retry for new pump.fun tokens
+    for attempt in range(2):
+        try:
+            r=requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",timeout=4).json()
+            pairs=r.get("pairs",[])
+            if pairs:
+                best=sorted(pairs, key=lambda x: x.get("liquidity",{}).get("usd",0), reverse=True)[0]
+                name=best.get("baseToken",{}).get("symbol", token_address[:6])
+                fdv=best.get("fdv") or best.get("marketCap") or 0
+                mcap=f"${fdv/1_000_000:.2f}M" if fdv>=1_000_000 else f"${fdv/1000:.1f}k" if fdv>=1000 else f"${fdv:.0f}" if fdv else f"${fdv/1000:.1f}k" if fdv else "New"
+                price=float(best.get("priceUsd",0) or 0)
+                dex_link=f"https://dexscreener.com/{best.get('chainId','solana')}/{best.get('pairAddress',token_address)}"
+                if price>0 or attempt==1:
+                    return name, mcap, dex_link, price, best.get('chainId','SOL').upper()
+        except: pass
+        if attempt==0: time.sleep(1.2)
+    # Fallback for ultra-new pump tokens
     try:
-        r=requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",timeout=5).json()
-        pairs=r.get("pairs",[])
-        if pairs:
-            best=sorted(pairs, key=lambda x: x.get("liquidity",{}).get("usd",0), reverse=True)[0]
-            name=best.get("baseToken",{}).get("symbol", token_address[:6])
-            fdv=best.get("fdv") or best.get("marketCap") or 0
-            mcap=f"${fdv/1_000_000:.2f}M" if fdv>=1_000_000 else f"${fdv/1000:.1f}k" if fdv>=1000 else f"${fdv:.0f}" if fdv else "N/A"
-            price=float(best.get("priceUsd",0) or 0)
-            dex_link=f"https://dexscreener.com/{best.get('chainId','base')}/{best.get('pairAddress',token_address)}"
-            return name, mcap, dex_link, price, best.get('chainId','BASE').upper()
+        # quick pump.fun name fetch
+        pr=requests.get(f"https://frontend-api-v2.pump.fun/coins/{token_address}",timeout=3).json()
+        name=pr.get("symbol", token_address[:6])
+        mcap_val=pr.get("usd_market_cap",0)
+        mcap=f"${mcap_val/1_000_000:.2f}M" if mcap_val>=1_000_000 else f"${mcap_val/1000:.1f}k" if mcap_val else "New"
+        return name, mcap, f"https://dexscreener.com/solana/{token_address}", 0, "SOL"
     except: pass
-    return token_address[:6], "N/A", f"https://dexscreener.com/{chain_hint}/{token_address}", 0, chain_hint
+    return token_address[:6], "New", f"https://dexscreener.com/{chain_hint.lower()}/{token_address}", 0, chain_hint
 
 def short(a): return f"{a[:4]}...{a[-4:]}" if a else "?"
 def get_helius_holdings(wallet):
@@ -193,8 +206,9 @@ def live_scan_overlap():
         info=get_token_info_quick(mint,chain)
         if not info: continue
         name,mcap,dex_link,price,_=info
-        if mcap=="N/A" or price==0 or price<0.00000001: continue
-        good=[h for h in uniq.values() if h.get("source")=="history" or (h["amount"]/(10**h["decimals"])*price>=5)]
+        if price==0 and mcap=="New": continue
+        if price>0 and price<0.00000001: continue
+        good=[h for h in uniq.values() if h.get("source")=="history" or (price>0 and h["amount"]/(10**h["decimals"])*price>=5) or h["amount"]>0]
         if len(good)<2: continue
         final[key]=(chain,mint,name,mcap,dex_link,price,good)
     if not final: return "📊 *No real overlaps in 7d*"
@@ -202,7 +216,7 @@ def live_scan_overlap():
     for key,(chain,mint,name,mcap,dex_link,price,holders_list) in sorted(final.items(),key=lambda x: len(x[1][6]),reverse=True)[:10]:
         msg+=f"*{c+1}) {name} - {mcap}* {chain}\n"
         for h in holders_list[:6]:
-            w=h["wallet"]; usd=h["amount"]/(10**h["decimals"])*price if h.get("source")!="history" else 0
+            w=h["wallet"]; usd=h["amount"]/(10**h["decimals"])*price if price>0 and h.get("source")!="history" else 0
             scan_url = SCAN_MAP.get(chain,"https://basescan.org/address/") + w
             msg+=f"• `{short(w)}` - ${usd:,.0f} - [Scan]({scan_url})\n"
         msg+=f"📈 [Chart]({dex_link})\n\n"; c+=1
@@ -212,7 +226,7 @@ def live_scan_overlap():
 def handle_command(text):
     t=text.strip(); low=t.lower()
     if low.startswith("/start"):
-        send_tg(f"🚀 *V3.11.9 FIXED*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ NO DUPE + NO USDC SPAM\n✅ WS+POLL 2s Dual\n✅ Persisted - {len(cluster_memory)} clusters"); set_bot_commands()
+        send_tg(f"🚀 *V3.11.10 FINAL*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ NO DUPE FIXED\n✅ PUMP.FUN N/A FIXED\n✅ WS+POLL Dual"); set_bot_commands()
     elif low.startswith("/listwallets"):
         sol="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(SOL_WALLETS)])
         evm="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(EVM_WALLETS)])
@@ -265,7 +279,7 @@ def handle_command(text):
             if shown>=6: break
         send_tg(msg[:4000] if shown else "All sold")
     elif low.startswith("/testalert"):
-        send_tg("💰 *TEST*\n✅ V3.11.9 NO DUPE NO STABLE working")
+        send_tg("💰 *TEST*\n✅ V3.11.10 NO DUPE + PUMP FIX working")
 
 def get_sol_parsed(sig):
     try:
@@ -273,8 +287,46 @@ def get_sol_parsed(sig):
         return r[0] if r and isinstance(r,list) else None
     except: return None
 
+# ---- FIX: 1 ALERT PER TX (not per transfer) ----
+def process_sol_tx(wallet_list, tx_obj, sig, source):
+    if sig in seen_sigs: return
+    transfers = [tr for tr in tx_obj.get("tokenTransfers",[]) if tr.get("mint") not in STABLES]
+    # filter only transfers involving our wallets
+    relevant=[]
+    for tr in transfers:
+        mint=tr.get("mint",""); from_u=tr.get("fromUserAccount",""); to_u=tr.get("toUserAccount",""); amt=float(tr.get("tokenAmount",0) or 0)
+        if not mint or amt==0: continue
+        if from_u not in wallet_list and to_u not in wallet_list: continue
+        info=get_token_info_quick(mint,"SOL")
+        if not info: continue
+        name,mcap,dex_link,price,_=info
+        usd=amt*price if price>0 else 0
+        # for new tokens price=0, still alert but use amount
+        if price>0 and usd>0 and usd<10: continue
+        relevant.append((mint,from_u,to_u,amt,name,mcap,dex_link,price,usd))
+    if not relevant: return
+    # Pick main transfer = biggest USD or biggest amount if price=0
+    relevant.sort(key=lambda x: x[8] if x[8]>0 else x[3], reverse=True)
+    mint,from_u,to_u,amt,name,mcap,dex_link,price,usd = relevant[0]
+    # dedup now
+    seen_sigs.add(sig)
+    if len(seen_sigs)>800: seen_sigs.clear()
+    # determine target
+    target = from_u if from_u in wallet_list else to_u
+    is_buy = to_u == target
+    display_usd = usd if usd>0 else amt # if price 0, show amount instead of $50
+    if is_buy:
+        pnl_tracker[target.lower()]["buys"]+=1; pnl_tracker[target.lower()]["spent"]+= (usd if usd>0 else 50); save_pnl()
+        cluster_memory[mint].append((target,datetime.now(),"SOL")); save_memory()
+        holdings[mint][target]={"amount_usd":display_usd,"chain":"SOL","token_name":name,"mcap":mcap}; save_holdings()
+        send_tg(f"💰 *SOL BUY*\n🪙 {name} ({mcap})\n👤 `{target[:6]}...{target[-4:]}` | ${display_usd:,.2f}\n📊 [Chart]({dex_link}) | [Tx](https://solscan.io/tx/{sig}) [{source}]")
+    else:
+        pnl_tracker[target.lower()]["sells"]+=1; pnl_tracker[target.lower()]["realized"]+= (usd if usd>0 else 50); save_pnl()
+        if mint in holdings and target in holdings[mint]: holdings[mint].pop(target,None); save_holdings()
+        send_tg(f"🚨 *SOL SELL* 🚨\n🪙 {name} ({mcap})\n💸 ${display_usd:,.2f} sold by `{target[:6]}...{target[-4:]}`\n📊 [Chart]({dex_link}) | [Tx](https://solscan.io/tx/{sig}) [{source}]")
+
 async def track_sol_polling():
-    print("🔵 POLLING STARTED")
+    print("🔵 POLLING STARTED - 1 alert per tx")
     last_sig={}
     while True:
         for w in SOL_WALLETS:
@@ -286,31 +338,9 @@ async def track_sol_polling():
                     sig=tx.get("signature")
                     if not sig or sig in seen_sigs: continue
                     if last_sig.get(w)==sig: break
-                    for tr in tx.get("tokenTransfers",[]):
-                        mint=tr.get("mint","")
-                        if not mint or mint in STABLES: continue
-                        from_u=tr.get("fromUserAccount",""); to_u=tr.get("toUserAccount",""); amt=float(tr.get("tokenAmount",0) or 0)
-                        if not mint or amt==0: continue
-                        if from_u!=w and to_u!=w: continue
-                        info=get_token_info_quick(mint,"SOL")
-                        if not info: continue
-                        name,mcap,dex_link,price,_=info
-                        usd=amt*price if price else 50
-                        if price>0 and usd>0 and usd<10: continue
-                        seen_sigs.add(sig) # DEDUP BEFORE SEND
-                        if len(seen_sigs)>500: seen_sigs.clear()
-                        is_buy=to_u==w
-                        if is_buy:
-                            pnl_tracker[w.lower()]["buys"]+=1; pnl_tracker[w.lower()]["spent"]+=usd; save_pnl()
-                            cluster_memory[mint].append((w,datetime.now(),"SOL")); save_memory()
-                            holdings[mint][w]={"amount_usd":usd,"chain":"SOL","token_name":name,"mcap":mcap}; save_holdings()
-                            send_tg(f"💰 *SOL BUY*\n🪙 {name} ({mcap})\n👤 `{w[:6]}...{w[-4:]}` | ${usd:,.2f}\n📊 [Chart]({dex_link}) | [Tx](https://solscan.io/tx/{sig})")
-                        else:
-                            pnl_tracker[w.lower()]["sells"]+=1; pnl_tracker[w.lower()]["realized"]+=usd; save_pnl()
-                            if mint in holdings and w in holdings[mint]: holdings[mint].pop(w,None); save_holdings()
-                            send_tg(f"🚨 *SOL SELL* 🚨\n🪙 {name} ({mcap})\n💸 ${usd:,.2f} sold by `{w[:6]}...{w[-4:]}`\n📊 [Chart]({dex_link}) | [Tx](https://solscan.io/tx/{sig})")
+                    process_sol_tx([w], tx, sig, "POLL")
                 if txs: last_sig[w]=txs[0].get("signature")
-            except: pass
+            except Exception as e: print(f"poll e {e}")
         await asyncio.sleep(2.0)
 
 async def track_chain(chain):
@@ -346,7 +376,7 @@ async def track_chain(chain):
                                 if from_addr.lower()==frm.lower():
                                     pnl_tracker[frm.lower()]["sells"]+=1; pnl_tracker[frm.lower()]["realized"]+=usd_val; save_pnl()
                                     if token_contract in holdings and frm in holdings[token_contract]: holdings[token_contract].pop(frm,None); save_holdings()
-                                    send_tg(f"🚨 *SELL* 🚨\n🪙 {name} ({mcap})\n💸 ${usd_val:,.2f}\n📊 [Chart]({dex_link}) | [Tx](https://{scan}/tx/{h})")
+                                    send_tg(f"🚨 *SELL* 🚨\n🪙 {name} ({mcap})\n💸 ${usd_val:,.2f} `{frm[:6]}...`\n📊 [Chart]({dex_link}) | [Tx](https://{scan}/tx/{h})")
                                 elif to_addr.lower()==frm.lower():
                                     pnl_tracker[frm.lower()]["buys"]+=1; pnl_tracker[frm.lower()]["spent"]+=usd_val; save_pnl()
                                     cluster_memory[token_contract].append((frm,datetime.now(),chain)); save_memory()
@@ -370,41 +400,15 @@ async def track_sol():
                         if "params" not in data: continue
                         sig=data["params"]["result"]["value"].get("signature","")
                         if not sig or sig in seen_sigs: continue
-                        await asyncio.sleep(1.5)
+                        await asyncio.sleep(1.2)
                         parsed=get_sol_parsed(sig)
                         if not parsed: continue
-                        fee_payer=parsed.get("feePayer","")
-                        for tr in parsed.get("tokenTransfers",[]):
-                            mint=tr.get("mint","")
-                            if not mint or mint in STABLES: continue
-                            from_u=tr.get("fromUserAccount",""); to_u=tr.get("toUserAccount",""); amt=float(tr.get("tokenAmount",0) or 0)
-                            if not mint or amt==0: continue
-                            info=get_token_info_quick(mint,"SOL")
-                            if not info: continue
-                            name,mcap,dex_link,price,_=info
-                            usd=amt*price if price else 50
-                            if price>0 and usd>0 and usd<10: continue
-                            target=None
-                            if from_u in SOL_WALLETS: target=from_u
-                            elif to_u in SOL_WALLETS: target=to_u
-                            elif fee_payer in SOL_WALLETS: target=fee_payer
-                            if not target: continue
-                            if sig in seen_sigs: continue
-                            seen_sigs.add(sig)
-                            if len(seen_sigs)>500: seen_sigs.clear()
-                            is_buy=to_u==target
-                            if is_buy:
-                                pnl_tracker[target.lower()]["buys"]+=1; pnl_tracker[target.lower()]["spent"]+=usd; save_pnl()
-                                cluster_memory[mint].append((target,datetime.now(),"SOL")); save_memory()
-                                send_tg(f"💰 *SOL BUY*\n🪙 {name} ({mcap})\n👤 `{target[:6]}...` | ${usd:,.2f}\n[Chart]({dex_link}) | [Tx](https://solscan.io/tx/{sig})")
-                            else:
-                                pnl_tracker[target.lower()]["sells"]+=1; pnl_tracker[target.lower()]["realized"]+=usd; save_pnl()
-                                send_tg(f"🚨 *SOL SELL* 🚨\n🪙 {name} ({mcap})\n💸 ${usd:,.2f}\n[Chart]({dex_link}) | [Tx](https://solscan.io/tx/{sig})")
+                        process_sol_tx(SOL_WALLETS, parsed, sig, "WS")
                     except Exception as e: print(f"SOL err {e}")
         except Exception as e: print(f"[SOL] WS err {e}"); await asyncio.sleep(5)
 
 async def main_loop():
-    send_tg(f"🚀 *V3.11.9 FIXED ACTIVE*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ NO DUPE + NO STABLE + WS+POLL"); set_bot_commands()
+    send_tg(f"🚀 *V3.11.10 FINAL ACTIVE*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ NO DUPE 1/tx\n✅ Pump.fun fallback\n✅ WS+POLL 2s Dual"); set_bot_commands()
     tasks=[track_chain(c) for c in RPCS_FALLBACK.keys()]
     tasks.append(track_sol())
     tasks.append(track_sol_polling())
