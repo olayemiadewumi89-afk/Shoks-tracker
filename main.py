@@ -87,7 +87,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Shok Tracker V3.1 Filtered Overlap",200
+def home(): return "Shok Tracker V3.2 7d Hybrid",200
 @app.route('/health')
 def health(): return "OK",200
 def run_flask():
@@ -117,7 +117,7 @@ def set_bot_commands():
         {"command":"delsol","description":"Del SOL: /delsol <addr>"},
         {"command":"delevm","description":"Del EVM: /delevm 0x..."},
         {"command":"history","description":"Current cluster holders"},
-        {"command":"overlap","description":"Find 2+ wallets holding same coin LIVE"},
+        {"command":"overlap","description":"Find 2+ wallets holding same coin 7d+LIVE"},
         {"command":"testalert","description":"Test buy/sell format"},
     ]
     try:
@@ -181,12 +181,13 @@ def live_scan_overlap():
                     "wallet": sol_w,
                     "amount": t.get("amount",0),
                     "decimals": t.get("decimals",6),
-                    "chain": "SOL"
+                    "chain": "SOL",
+                    "source": "live"
                 })
-            time.sleep(0.1)
+            time.sleep(0.08)
         except: continue
 
-    # 2. EVM LIVE x5 chains
+    # 2. EVM LIVE x5
     EVM_SCN = {
         "ETH": "https://eth.blockscout.com",
         "BASE": "https://base.blockscout.com",
@@ -198,7 +199,7 @@ def live_scan_overlap():
         for chain, base_url in EVM_SCN.items():
             try:
                 bals = get_evm_holdings_blockscout(evm_w, base_url)
-                for h in bals[:100]:
+                for h in bals[:150]:
                     tok = h.get("token",{})
                     t_addr = tok.get("address_hash") or (tok.get("address",{}).get("hash") if isinstance(tok.get("address"), dict) else tok.get("address"))
                     if not t_addr: continue
@@ -207,71 +208,83 @@ def live_scan_overlap():
                     except: continue
                     if val == 0: continue
                     dec = int(tok.get("decimals",18) or 18)
-                    real = val / (10**dec) if dec else val
-                    if real == 1.0: continue
-                    if real < 0.001: continue
+                    if dec == 0: continue
                     token_to_wallets[f"{chain}:{t_addr.lower()}"].append({
                         "mint": t_addr,
                         "wallet": evm_w,
                         "amount": val,
                         "decimals": dec,
-                        "chain": chain
+                        "chain": chain,
+                        "source": "live"
                     })
-                time.sleep(0.04)
+                time.sleep(0.03)
             except: continue
 
-    # 3. FILTER REAL ONLY
-    filtered_overlaps = {}
+    # 3. HISTORY - 7 DAYS ONLY
+    now = datetime.now()
+    for token, events in cluster_memory.items():
+        recent = [e for e in events if (now - e[1]).days <= 7]
+        if len(recent) < 2: continue
+        uniq_w = set([w.lower() if w.startswith("0x") else w for w,_,_ in recent])
+        if len(uniq_w) < 2: continue
+        for w, ts, ch in recent:
+            key = f"{ch}:{token.lower()}" if ch!="SOL" else f"SOL:{token}"
+            if any(x["wallet"].lower()==w.lower() for x in token_to_wallets.get(key,[])):
+                continue
+            token_to_wallets[key].append({
+                "mint": token,
+                "wallet": w,
+                "amount": 0,
+                "decimals": 18,
+                "chain": ch,
+                "source": "history",
+                "time": ts
+            })
+
+    # 4. FINAL
+    final = {}
     for key, holders in token_to_wallets.items():
-        if len(holders) < 2: continue
-        chain = holders[0]["chain"]
-        mint = holders[0]["mint"]
-        name, mcap, dex_link, price, _ = get_token_info_quick(mint, chain)
-
-        if mcap == "N/A": continue
-        # parse mcap value
-        mv = 0
-        try:
-            if "M" in mcap: mv = float(mcap.replace("$","").replace("M","")) * 1_000_000
-            elif "k" in mcap.lower(): mv = float(mcap.replace("$","").lower().replace("k","")) * 1000
-        except: mv = 0
-        if mv < 10000 and price == 0: continue
-
-        # check real USD value
-        valid_holders = []
+        uniq_map = {}
         for h in holders:
-            raw = h["amount"]
-            dec = h["decimals"]
-            real = raw / (10**dec) if dec else raw
-            usd = real * price if price>0 else 0
-            if usd >= 10 or (price==0 and real>500):
-                valid_holders.append((h, real, usd))
+            uniq_map[h["wallet"].lower()] = h
+        if len(uniq_map) < 2: continue
+        chain = list(uniq_map.values())[0]["chain"]
+        mint = list(uniq_map.values())[0]["mint"]
+        name, mcap, dex_link, price, _ = get_token_info_quick(mint, chain)
+        if mcap == "N/A": continue
+        final[key] = (chain, mint, name, mcap, dex_link, price, list(uniq_map.values()))
 
-        if len(valid_holders) >= 2:
-            filtered_overlaps[key] = (chain, mint, name, mcap, dex_link, price, valid_holders)
+    if not final:
+        return "📊 *No overlaps in 7d*\n\nNo coin bought by 2+ wallets in last 7 days and no current shared holdings.\nLet it run - history builds from now."
 
-    if not filtered_overlaps:
-        return "📊 *No real overlaps found*\n\nLive-scanned 19 SOL + 17 EVM x5 chains.\nFiltered out dust/NFT airdrops.\nNo coin >$10 is held by 2+ wallets."
-
-    msg = f"🔍 *OVERLAP FOUND - {len(filtered_overlaps)} real coin(s)*\n\n"
-    count = 0
-    for key, (chain, mint, name, mcap, dex_link, price, valid_holders) in sorted(filtered_overlaps.items(), key=lambda x: sum(v[2] for v in x[1][6]), reverse=True)[:10]:
+    msg = f"🔍 *OVERLAP FOUND - {len(final)} coin(s) - 7d + LIVE*\n\n"
+    count=0
+    for key, (chain, mint, name, mcap, dex_link, price, holders_list) in sorted(final.items(), key=lambda x: len(x[1][6]), reverse=True)[:15]:
         scan_map = {"ETH":"etherscan.io","BSC":"bscscan.com","BASE":"basescan.org","ARB":"arbiscan.io","POLY":"polygonscan.com","SOL":"solscan.io"}
         explorer_token = f"https://solscan.io/token/{mint}" if chain=="SOL" else f"https://{scan_map.get(chain,'basescan.org')}/token/{mint}"
         msg += f"*{count+1}) {name} - {mcap}*\n"
         msg += f"Chain: {chain}\n"
         msg += f"Token: `{short(mint)}` - [View]({explorer_token})\n"
-        msg += f"Holders ({len(valid_holders)}):\n"
-        for h, real, usd in valid_holders[:6]:
-            w = h["wallet"]
-            scan_url = f"https://solscan.io/account/{w}" if chain=="SOL" else f"https://{scan_map.get(chain,'basescan.org')}/address/{w}"
-            if usd >= 1:
-                msg += f"• `{short(w)}` - ${usd:,.0f} - [Scan]({scan_url})\n"
-            else:
-                msg += f"• `{short(w)}` - {real:,.2f} - [Scan]({scan_url})\n"
+        live_h = [h for h in holders_list if h.get("source")=="live"]
+        hist_h = [h for h in holders_list if h.get("source")=="history"]
+        if live_h:
+            msg += f"Still Holding ({len(live_h)}):\n"
+            for h in live_h[:6]:
+                w=h["wallet"]
+                raw=h["amount"]; dec=h["decimals"]
+                real=raw/(10**dec) if dec else raw
+                usd=real*price if price>0 else 0
+                scan_url = f"https://solscan.io/account/{w}" if chain=="SOL" else f"https://{scan_map.get(chain,'basescan.org')}/address/{w}"
+                msg += f"• `{short(w)}` - ${usd:,.0f} - [Scan]({scan_url})\n" if usd>=1 else f"• `{short(w)}` - {real:,.4f} - [Scan]({scan_url})\n"
+        if hist_h:
+            msg += f"Bought together 7d ({len(hist_h)}):\n"
+            for h in hist_h[:6]:
+                w=h["wallet"]
+                scan_url = f"https://solscan.io/account/{w}" if chain=="SOL" else f"https://{scan_map.get(chain,'basescan.org')}/address/{w}"
+                msg += f"• `{short(w)}` - bought - [Scan]({scan_url})\n"
         msg += f"📈 [Chart]({dex_link})\n\n"
         count+=1
-        if len(msg) > 3600: break
+        if len(msg) > 3800: break
     return msg[:4000]
 
 def build_overlap_report():
@@ -282,14 +295,14 @@ def handle_command(text):
     low=t.lower()
     if low.startswith("/start"):
         chains=", ".join(RPCS_FALLBACK.keys())
-        send_tg(f"🚀 *Shok Tracker V3.1 ACTIVE*\n\nTracking {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM x {len(RPCS_FALLBACK)} chains\nChains: {chains}\n\n✅ Sell >$500 + mcap\n✅ Short clickable [Chart] | [Tx]\n✅ Fallback RPCs\n✅ /overlap FILTERED LIVE\n\nPress / to see commands")
+        send_tg(f"🚀 *Shok Tracker V3.2 7d ACTIVE*\n\nTracking {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM x {len(RPCS_FALLBACK)} chains\nChains: {chains}\n\n✅ Sell >$500 + mcap\n✅ Short clickable [Chart] | [Tx]\n✅ /overlap LIVE + 7d HISTORY\n\nPress / to see commands")
         set_bot_commands()
     elif low.startswith("/listwallets"):
         sol="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(SOL_WALLETS)])
         evm="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(EVM_WALLETS)])
         send_tg((f"*SOL ({len(SOL_WALLETS)}):*\n{sol}\n\n*EVM ({len(EVM_WALLETS)}):*\n{evm}")[:4000])
     elif low.startswith("/overlap"):
-        send_tg("⏳ Live scanning 19 SOL + 17 EVM wallets (5 chains) for shared holdings...")
+        send_tg("⏳ Live scanning 19 SOL + 17 EVM wallets (5 chains) + 7d history for shared holdings...")
         report = build_overlap_report()
         send_tg(report)
     elif low.startswith("/pnl"):
@@ -439,7 +452,7 @@ async def track_sol():
             print(f"[SOL] WS err {e}"); await asyncio.sleep(5)
 
 async def main_loop():
-    send_tg(f"🚀 *Shok Tracker V3.1 ACTIVE*\nTracking {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM x {len(RPCS_FALLBACK)} chains\nChains: {', '.join(RPCS_FALLBACK.keys())}\n✅ Sell >$500 + mcap + Short [Chart]|[Tx] + Fallback + /overlap FILTERED")
+    send_tg(f"🚀 *Shok Tracker V3.2 7d ACTIVE*\nTracking {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM x {len(RPCS_FALLBACK)} chains\nChains: {', '.join(RPCS_FALLBACK.keys())}\n✅ Sell >$500 + mcap + Short [Chart]|[Tx] + /overlap 7d+LIVE")
     set_bot_commands()
     tasks=[track_chain(c) for c in RPCS_FALLBACK.keys()]
     tasks.append(track_sol())
