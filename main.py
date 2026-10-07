@@ -233,4 +233,126 @@ def handle_command(text):
         try:
             addr=t.split()[1].strip().lower()
             found=[x for x in EVM_WALLETS if x.lower()==addr]
-            if found: EVM_WALLETS.remove(found[0]); save_wallets(); send_tg(f"🗑️ Removed
+            if found: EVM_WALLETS.remove(found[0]); save_wallets(); send_tg(f"🗑️ Removed EVM Left: {len(EVM_WALLETS)}")
+            else: send_tg("Not found")
+        except: send_tg("Usage: /delevm 0x...")
+    elif low.startswith("/history"):
+        if not holdings: send_tg("📜 No clusters yet - use /overlap to scan"); return
+        msg="📜 *Current Holders (Persisted)*\n\n"; shown=0
+        for token,wallets_dict in holdings.items():
+            if len(wallets_dict)<2: continue
+            sample=list(wallets_dict.values())[0]; name2,mcap,dex_link,_,_=get_token_info_quick(token,sample.get("chain","?"))
+            msg+=f"🪙 *{name2}* ({mcap})\n"
+            for w_addr,data in wallets_dict.items(): msg+=f"• `${data.get('amount_usd',0):.0f}` - `{w_addr[:6]}...{w_addr[-4:]}`\n"
+            msg+=f"📊 [Chart]({dex_link})\n\n"; shown+=1
+            if shown>=6: break
+        send_tg(msg[:4000] if shown else "All clusters sold - run /overlap")
+    elif low.startswith("/testalert"):
+        send_tg("💰 *TEST ALERT*\n🪙 TEST ($1M)\n👤 `0x123...abc` | $100\n✅ V3.11.2 BUY>$10 SELL>$10 EVM+SOL working\n📊 [Chart](https://dexscreener.com)")
+
+def get_sol_parsed(sig):
+    try:
+        r=requests.post(f"https://api.helius.xyz/v0/transactions/?api-key={HELIUS_KEY}",json={"transactions":[sig]},timeout=10).json()
+        return r[0] if r and isinstance(r,list) else None
+    except: return None
+
+async def track_chain(chain):
+    seen=set(); scan_map={"ETH":"etherscan.io","BSC":"bscscan.com","BASE":"basescan.org","ARB":"arbiscan.io","POLY":"polygonscan.com"}
+    scan=scan_map[chain]; tracked_lower=set([x.lower() for x in EVM_WALLETS])
+    while True:
+        try:
+            w3=get_w3_with_fallback(chain)
+            if not w3: await asyncio.sleep(10); continue
+            bn=w3.eth.block_number
+            for b in range(max(0,bn-3), bn+1):
+                if b in seen: continue
+                seen.add(b)
+                if len(seen)>200: seen=set(list(seen)[-100:])
+                try:
+                    block=w3.eth.get_block(b,full_transactions=True)
+                    for tx in block.transactions:
+                        frm=tx.get('from')
+                        if not frm or frm.lower() not in tracked_lower: continue
+                        h=tx.hash.hex() if hasattr(tx.hash,'hex') else tx['hash'].hex()
+                        try:
+                            receipt=w3.eth.get_transaction_receipt(h)
+                            for log in receipt.get('logs',[]):
+                                if len(log.get('topics',[]))!=3: continue
+                                if log['topics'][0].hex()!='ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef': continue
+                                from_addr='0x'+log['topics'][1].hex()[-40:]; to_addr='0x'+log['topics'][2].hex()[-40:]
+                                token_contract=log['address']; amount_raw=int(log['data'],16)
+                                name,mcap,dex_link,price,_=get_token_info_quick(token_contract,chain)
+                                usd_val=(amount_raw/1e18*price) if price>0 else 0
+                                if from_addr.lower()==frm.lower():
+                                    if usd_val!=0 and usd_val<10: continue
+                                    pnl_tracker[frm.lower()]["sells"]+=1; pnl_tracker[frm.lower()]["realized"]+=usd_val; save_pnl()
+                                    if token_contract in holdings and frm in holdings[token_contract]: holdings[token_contract].pop(frm,None); save_holdings()
+                                    send_tg(f"🚨 *SELL ALERT* 🚨\n🪙 *{name}* ({mcap})\n💸 ${usd_val:,.2f} sold by `{frm[:6]}...{frm[-4:]}`\n🔗 {chain}\n📊 [Chart]({dex_link}) | 🔍 [Tx](https://{scan}/tx/{h})")
+                                elif to_addr.lower()==frm.lower():
+                                    if usd_val>0 and usd_val<10: continue
+                                    pnl_tracker[frm.lower()]["buys"]+=1; pnl_tracker[frm.lower()]["spent"]+=usd_val; save_pnl()
+                                    cluster_memory[token_contract].append((frm,datetime.now(),chain)); save_memory()
+                                    holdings[token_contract][frm]={"amount_usd": usd_val if usd_val>0 else 100,"chain":chain,"token_name":name,"mcap":mcap}; save_holdings()
+                                    send_tg(f"💰 *{chain} BUY*\n🪙 {name} ({mcap})\n👤 `{frm[:6]}...{frm[-4:]}` | ${usd_val:,.2f}\n📊 [Chart]({dex_link}) | 🔍 [Tx](https://{scan}/tx/{h})")
+                        except: pass
+                except: pass
+            await asyncio.sleep(1.5)
+        except Exception as e: print(f"[{chain}] err {e}"); await asyncio.sleep(5)
+
+import websockets
+async def track_sol():
+    uri=f"wss://atlas-mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
+    while True:
+        try:
+            async with websockets.connect(uri) as ws:
+                await ws.send(json.dumps({"jsonrpc":"2.0","id":1,"method":"logsSubscribe","params":[{"mentions": SOL_WALLETS},{"commitment":"confirmed"}]}))
+                async for msg in ws:
+                    try:
+                        data=json.loads(msg)
+                        if "params" not in data: continue
+                        sig=data["params"]["result"]["value"].get("signature","")
+                        if not sig: continue
+                        await asyncio.sleep(2)
+                        parsed=get_sol_parsed(sig)
+                        if not parsed: continue
+                        fee_payer=parsed.get("feePayer","")
+                        for tr in parsed.get("tokenTransfers",[]):
+                            mint=tr.get("mint",""); from_u=tr.get("fromUserAccount",""); to_u=tr.get("toUserAccount",""); amt=tr.get("tokenAmount",0)
+                            name,mcap,dex_link,price,_=get_token_info_quick(mint,"SOL")
+                            usd=amt*price if price else 0
+                            if from_u in SOL_WALLETS:
+                                if usd!=0 and usd<10: continue
+                                pnl_tracker[from_u.lower()]["sells"]+=1; pnl_tracker[from_u.lower()]["realized"]+=usd; save_pnl()
+                                if mint in holdings and from_u in holdings[mint]: holdings[mint].pop(from_u,None); save_holdings()
+                                send_tg(f"🚨 *SOL SELL ALERT* 🚨\n🪙 *{name}* ({mcap})\n💸 ${usd:,.2f} sold by `{from_u[:6]}...{from_u[-4:]}`\n🔗 SOL\n📊 [Chart]({dex_link}) | 🔍 [Tx](https://solscan.io/tx/{sig})")
+                            elif to_u in SOL_WALLETS:
+                                if usd>0 and usd<10: continue
+                                pnl_tracker[to_u.lower()]["buys"]+=1; pnl_tracker[to_u.lower()]["spent"]+=usd; save_pnl()
+                                cluster_memory[mint].append((to_u,datetime.now(),"SOL")); save_memory()
+                                holdings[mint][to_u]={"amount_usd": usd if usd>0 else 100,"chain":"SOL","token_name":name,"mcap":mcap}; save_holdings()
+                                send_tg(f"💰 *SOL BUY*\n🪙 {name} ({mcap})\n👤 `{to_u[:6]}...{to_u[-4:]}` | ${usd:,.2f}\n📊 [Chart]({dex_link}) | 🔍 [Tx](https://solscan.io/tx/{sig})")
+                            elif fee_payer in SOL_WALLETS and to_u not in SOL_WALLETS and from_u!="":
+                                if usd!=0 and usd<10: continue
+                                pnl_tracker[fee_payer.lower()]["sells"]+=1; pnl_tracker[fee_payer.lower()]["realized"]+=usd; save_pnl()
+                                send_tg(f"🚨 *SOL SELL ALERT* 🚨\n🪙 *{name}* ({mcap})\n💸 ${usd:,.2f} sold by `{fee_payer[:6]}...{fee_payer[-4:]}`\n🔗 SOL via router\n📊 [Chart]({dex_link}) | 🔍 [Tx](https://solscan.io/tx/{sig})")
+                    except Exception as e: print(f"SOL err {e}")
+        except Exception as e: print(f"[SOL] WS err {e}"); await asyncio.sleep(5)
+
+async def main_loop():
+    send_tg(f"🚀 *V3.11.2 FINAL ACTIVE*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ BUY>$10 SELL>$10 EVM+SOL\n✅ 10 CMDS + Persisted"); set_bot_commands()
+    tasks=[track_chain(c) for c in RPCS_FALLBACK.keys()]; tasks.append(track_sol()); await asyncio.gather(*tasks)
+def start_bot():
+    loop=asyncio.new_event_loop(); asyncio.set_event_loop(loop); loop.run_until_complete(main_loop())
+if __name__=="__main__":
+    threading.Thread(target=run_flask,daemon=True).start()
+    def poll_cmd():
+        off=0
+        while True:
+            try:
+                if not BOT_TOKEN: time.sleep(5); continue
+                r=requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={off}&timeout=10",timeout=15).json()
+                for u in r.get("result",[]):
+                    off=u["update_id"]+1; txt=u.get("message",{}).get("text","")
+                    if txt.startswith("/"): handle_command(txt)
+            except: time.sleep(4)
+    threading.Thread(target=poll_cmd,daemon=True).start(); start_bot()
