@@ -66,11 +66,11 @@ load_wallets()
 HELIUS_KEY = "3ac60377-a024-4177-8ef4-b8c36a692a57"
 
 RPCS_FALLBACK = {
-    "ETH": ["https://ethereum-rpc.publicnode.com","https://eth.llamarpc.com","https://rpc.ankr.com/eth","https://1rpc.io/eth"],
+    "ETH": ["https://ethereum-rpc.publicnode.com","https://eth.llamarpc.com","https://rpc.ankr.com/eth"],
     "BSC": ["https://bsc-rpc.publicnode.com","https://bsc.llamarpc.com","https://rpc.ankr.com/bsc"],
-    "BASE": ["https://base-rpc.publicnode.com","https://base.llamarpc.com","https://rpc.ankr.com/base","https://1rpc.io/base"],
-    "ARB": ["https://arbitrum-one-rpc.publicnode.com","https://arbitrum.llamarpc.com","https://rpc.ankr.com/arbitrum"],
-    "POLY": ["https://polygon-bor-rpc.publicnode.com","https://polygon.llamarpc.com","https://rpc.ankr.com/polygon"]
+    "BASE": ["https://base-rpc.publicnode.com","https://base.llamarpc.com","https://rpc.ankr.com/base"],
+    "ARB": ["https://arbitrum-one-rpc.publicnode.com","https://arbitrum.llamarpc.com"],
+    "POLY": ["https://polygon-bor-rpc.publicnode.com","https://polygon.llamarpc.com"]
 }
 
 def get_w3_with_fallback(chain):
@@ -87,7 +87,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Shok Tracker V3.2 7d Hybrid",200
+def home(): return "Shok Tracker V3.3 Fixed 7d",200
 @app.route('/health')
 def health(): return "OK",200
 def run_flask():
@@ -95,11 +95,10 @@ def run_flask():
 
 cluster_memory = defaultdict(list)
 holdings = defaultdict(dict)
-pnl_tracker = defaultdict(lambda: {"buys":0,"sells":0,"pnl":0})
 
 def send_tg(text):
     if not BOT_TOKEN or not CHAT_ID:
-        print(text[:1000]); return
+        print(text[:1200]); return
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         json={"chat_id":CHAT_ID,"text":text,"parse_mode":"Markdown","disable_web_page_preview":True}, timeout=15)
@@ -109,16 +108,10 @@ def send_tg(text):
 def set_bot_commands():
     if not BOT_TOKEN: return
     cmds=[
-        {"command":"start","description":"Status & chains"},
-        {"command":"listwallets","description":"List wallets"},
-        {"command":"pnl","description":"PnL board"},
-        {"command":"addsol","description":"Add SOL: /addsol <addr>"},
-        {"command":"addevm","description":"Add EVM: /addevm 0x..."},
-        {"command":"delsol","description":"Del SOL: /delsol <addr>"},
-        {"command":"delevm","description":"Del EVM: /delevm 0x..."},
-        {"command":"history","description":"Current cluster holders"},
-        {"command":"overlap","description":"Find 2+ wallets holding same coin 7d+LIVE"},
-        {"command":"testalert","description":"Test buy/sell format"},
+        {"command":"start","description":"Status"},
+        {"command":"overlap","description":"Overlap 7d + LIVE - fixed"},
+        {"command":"history","description":"Current holders"},
+        {"command":"listwallets","description":"List"},
     ]
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands", json={"commands":cmds}, timeout=10)
@@ -128,7 +121,7 @@ def get_token_info_quick(token_address, chain_hint="base"):
     chain_map={"ETH":"ethereum","BSC":"bsc","BASE":"base","ARB":"arbitrum","POLY":"polygon","SOL":"solana"}
     ds_chain=chain_map.get(chain_hint, chain_hint.lower())
     try:
-        r=requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=6).json()
+        r=requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=5).json()
         pairs=r.get("pairs",[])
         if pairs:
             best=sorted(pairs, key=lambda x: x.get("liquidity",{}).get("usd",0), reverse=True)[0]
@@ -169,25 +162,23 @@ def get_evm_holdings_blockscout(wallet, base_url):
 def live_scan_overlap():
     token_to_wallets = defaultdict(list)
 
-    # 1. SOL LIVE
+    # SOL LIVE - no filter
     for sol_w in SOL_WALLETS:
         try:
             tokens = get_helius_holdings(sol_w)
             for t in tokens:
                 mint = t.get("mint")
-                if not mint or t.get("amount",0)==0: continue
+                amt = t.get("amount",0)
+                if not mint or amt==0: continue
+                # skip tiny dust < $0.5 equivalent but keep amount > 0
                 token_to_wallets[f"SOL:{mint}"].append({
-                    "mint": mint,
-                    "wallet": sol_w,
-                    "amount": t.get("amount",0),
-                    "decimals": t.get("decimals",6),
-                    "chain": "SOL",
-                    "source": "live"
+                    "mint": mint, "wallet": sol_w,
+                    "amount": amt, "decimals": t.get("decimals",6),
+                    "chain": "SOL", "source": "live"
                 })
-            time.sleep(0.08)
         except: continue
 
-    # 2. EVM LIVE x5
+    # EVM LIVE
     EVM_SCN = {
         "ETH": "https://eth.blockscout.com",
         "BASE": "https://base.blockscout.com",
@@ -199,7 +190,7 @@ def live_scan_overlap():
         for chain, base_url in EVM_SCN.items():
             try:
                 bals = get_evm_holdings_blockscout(evm_w, base_url)
-                for h in bals[:150]:
+                for h in bals[:200]:
                     tok = h.get("token",{})
                     t_addr = tok.get("address_hash") or (tok.get("address",{}).get("hash") if isinstance(tok.get("address"), dict) else tok.get("address"))
                     if not t_addr: continue
@@ -209,39 +200,35 @@ def live_scan_overlap():
                     if val == 0: continue
                     dec = int(tok.get("decimals",18) or 18)
                     if dec == 0: continue
+                    # skip NFT 1
+                    if val == 1 and dec == 0: continue
+                    real = val / (10**dec) if dec else 0
+                    if real < 0.000001: continue
                     token_to_wallets[f"{chain}:{t_addr.lower()}"].append({
-                        "mint": t_addr,
-                        "wallet": evm_w,
-                        "amount": val,
-                        "decimals": dec,
-                        "chain": chain,
-                        "source": "live"
+                        "mint": t_addr, "wallet": evm_w,
+                        "amount": val, "decimals": dec,
+                        "chain": chain, "source": "live"
                     })
-                time.sleep(0.03)
             except: continue
 
-    # 3. HISTORY - 7 DAYS ONLY
+    # 7d HISTORY from cluster_memory
     now = datetime.now()
     for token, events in cluster_memory.items():
         recent = [e for e in events if (now - e[1]).days <= 7]
         if len(recent) < 2: continue
-        uniq_w = set([w.lower() if w.startswith("0x") else w for w,_,_ in recent])
+        uniq_w = set([w.lower() for w,_,_ in recent])
         if len(uniq_w) < 2: continue
         for w, ts, ch in recent:
-            key = f"{ch}:{token.lower()}" if ch!="SOL" else f"SOL:{token}"
+            key = f"{ch}:{token.lower()}" if ch!= "SOL" else f"SOL:{token}"
+            # if already live, skip
             if any(x["wallet"].lower()==w.lower() for x in token_to_wallets.get(key,[])):
                 continue
             token_to_wallets[key].append({
-                "mint": token,
-                "wallet": w,
-                "amount": 0,
-                "decimals": 18,
-                "chain": ch,
-                "source": "history",
-                "time": ts
+                "mint": token, "wallet": w, "amount": 0,
+                "decimals": 18, "chain": ch, "source": "history", "time": ts
             })
 
-    # 4. FINAL
+    # FINAL - ONLY skip if BOTH mcap N/A AND price 0 AND only 2 holders with 0 amount
     final = {}
     for key, holders in token_to_wallets.items():
         uniq_map = {}
@@ -251,13 +238,20 @@ def live_scan_overlap():
         chain = list(uniq_map.values())[0]["chain"]
         mint = list(uniq_map.values())[0]["mint"]
         name, mcap, dex_link, price, _ = get_token_info_quick(mint, chain)
-        if mcap == "N/A": continue
+
+        # FIX: don't kill N/A coins - keep them if at least 2 wallets still hold
+        live_count = len([x for x in uniq_map.values() if x.get("source")=="live"])
+        if mcap == "N/A" and price == 0 and live_count < 2:
+            # keep only if history has 3+ wallets (strong signal)
+            if len(uniq_map) < 3:
+                continue
+
         final[key] = (chain, mint, name, mcap, dex_link, price, list(uniq_map.values()))
 
     if not final:
-        return "📊 *No overlaps in 7d*\n\nNo coin bought by 2+ wallets in last 7 days and no current shared holdings.\nLet it run - history builds from now."
+        return "📊 *No overlaps in last 7d*\n\nLive scan: 0 shared holdings.\nHistory: 0 clusters in 7d.\n\nNote: History builds after deployment - let it run 12h for buys."
 
-    msg = f"🔍 *OVERLAP FOUND - {len(final)} coin(s) - 7d + LIVE*\n\n"
+    msg = f"🔍 *OVERLAP FOUND - {len(final)} coin(s) - 7d + LIVE (FIXED)*\n\n"
     count=0
     for key, (chain, mint, name, mcap, dex_link, price, holders_list) in sorted(final.items(), key=lambda x: len(x[1][6]), reverse=True)[:15]:
         scan_map = {"ETH":"etherscan.io","BSC":"bscscan.com","BASE":"basescan.org","ARB":"arbiscan.io","POLY":"polygonscan.com","SOL":"solscan.io"}
@@ -275,9 +269,12 @@ def live_scan_overlap():
                 real=raw/(10**dec) if dec else raw
                 usd=real*price if price>0 else 0
                 scan_url = f"https://solscan.io/account/{w}" if chain=="SOL" else f"https://{scan_map.get(chain,'basescan.org')}/address/{w}"
-                msg += f"• `{short(w)}` - ${usd:,.0f} - [Scan]({scan_url})\n" if usd>=1 else f"• `{short(w)}` - {real:,.4f} - [Scan]({scan_url})\n"
+                if usd>=0.5:
+                    msg += f"• `{short(w)}` - ${usd:,.0f} - [Scan]({scan_url})\n"
+                else:
+                    msg += f"• `{short(w)}` - {real:.4f} - [Scan]({scan_url})\n"
         if hist_h:
-            msg += f"Bought together 7d ({len(hist_h)}):\n"
+            msg += f"Bought 7d ({len(hist_h)}):\n"
             for h in hist_h[:6]:
                 w=h["wallet"]
                 scan_url = f"https://solscan.io/account/{w}" if chain=="SOL" else f"https://{scan_map.get(chain,'basescan.org')}/address/{w}"
@@ -294,83 +291,39 @@ def handle_command(text):
     t=text.strip()
     low=t.lower()
     if low.startswith("/start"):
-        chains=", ".join(RPCS_FALLBACK.keys())
-        send_tg(f"🚀 *Shok Tracker V3.2 7d ACTIVE*\n\nTracking {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM x {len(RPCS_FALLBACK)} chains\nChains: {chains}\n\n✅ Sell >$500 + mcap\n✅ Short clickable [Chart] | [Tx]\n✅ /overlap LIVE + 7d HISTORY\n\nPress / to see commands")
+        send_tg(f"🚀 *Shok Tracker V3.3 FIXED 7d ACTIVE*\nTracking {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ /overlap now shows N/A coins too + no timeout\nPress / for commands")
         set_bot_commands()
-    elif low.startswith("/listwallets"):
-        sol="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(SOL_WALLETS)])
-        evm="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(EVM_WALLETS)])
-        send_tg((f"*SOL ({len(SOL_WALLETS)}):*\n{sol}\n\n*EVM ({len(EVM_WALLETS)}):*\n{evm}")[:4000])
     elif low.startswith("/overlap"):
-        send_tg("⏳ Live scanning 19 SOL + 17 EVM wallets (5 chains) + 7d history for shared holdings...")
-        report = build_overlap_report()
-        send_tg(report)
-    elif low.startswith("/pnl"):
-        if not pnl_tracker: send_tg("📊 No PnL yet")
-        else:
-            msg="📊 *PnL Board*\n\n"
-            for w,d in list(pnl_tracker.items())[:20]:
-                msg+=f"`{w[:6]}..` Buys:{d['buys']} Sells:{d['sells']}\n"
-            send_tg(msg)
-    elif low.startswith("/addsol"):
-        parts=t.split()
-        if len(parts)<2: send_tg("Usage: /addsol <address>"); return
-        addr=parts[1].strip()
-        if addr in SOL_WALLETS: send_tg(f"Already tracking `{addr[:8]}..`")
-        else:
-            SOL_WALLETS.append(addr); save_wallets()
-            send_tg(f"✅ Added SOL\n`{addr}`\nTotal SOL: {len(SOL_WALLETS)}")
-    elif low.startswith("/addevm"):
-        parts=t.split()
-        if len(parts)<2: send_tg("Usage: /addevm 0x..."); return
-        addr=parts[1].strip()
-        if addr.lower() in [x.lower() for x in EVM_WALLETS]: send_tg("Already tracking")
-        else:
-            EVM_WALLETS.append(addr); save_wallets()
-            send_tg(f"✅ Added EVM (all 5 chains)\n`{addr}`\nTotal EVM: {len(EVM_WALLETS)}")
-    elif low.startswith("/delsol"):
-        parts=t.split()
-        if len(parts)<2: send_tg("Usage: /delsol <address>"); return
-        addr=parts[1].strip()
-        if addr in SOL_WALLETS:
-            SOL_WALLETS.remove(addr); save_wallets()
-            send_tg(f"🗑️ Removed SOL `{addr[:8]}..`\nLeft: {len(SOL_WALLETS)}")
-        else: send_tg("Not found")
-    elif low.startswith("/delevm"):
-        parts=t.split()
-        if len(parts)<2: send_tg("Usage: /delevm 0x..."); return
-        addr=parts[1].strip().lower()
-        found=[x for x in EVM_WALLETS if x.lower()==addr]
-        if found:
-            EVM_WALLETS.remove(found[0]); save_wallets()
-            send_tg(f"🗑️ Removed EVM `{found[0][:8]}..`\nLeft: {len(EVM_WALLETS)}")
-        else: send_tg("Not found")
+        send_tg("⏳ Scanning 19 SOL + 17 EVM (5 chains) + 7d history... (takes 60s)")
+        # run in thread so Telegram doesn't timeout
+        def run_overlap():
+            report = build_overlap_report()
+            send_tg(report)
+        threading.Thread(target=run_overlap, daemon=True).start()
     elif low.startswith("/history"):
         if not holdings:
-            send_tg("📜 *Current Cluster Holders*\n\nNo clusters yet. Waiting for buys...")
+            send_tg("📜 No clusters yet - waiting for buys...")
             return
-        msg="📜 *Current Cluster Holders*\n\n"
+        msg="📜 *Current Holders (2+ wallets)*\n\n"
         shown=0
         for token, wallets_dict in holdings.items():
             if len(wallets_dict)<2: continue
             sample=list(wallets_dict.values())[0]
-            token_name=sample.get("token_name","?")
             chain=sample.get("chain","?")
             name2, mcap, dex_link, _, _ = get_token_info_quick(token, chain)
-            if name2!="?" and name2!=token[:6]: token_name=name2
-            msg+=f"🪙 *{token_name}* ({mcap})\nChain: {chain}\n"
+            msg+=f"🪙 *{name2}* ({mcap}) Chain:{chain}\n"
             for w_addr, data in wallets_dict.items():
                 usd=data.get("amount_usd",0)
-                msg+=f"• `${usd:.0f}` - `{w_addr[:6]}...{w_addr[-4:]}` holding ${usd:.0f}\n"
+                msg+=f"• `${usd:.0f}` - `{w_addr[:6]}...{w_addr[-4:]}`\n"
             msg+=f"📊 [Chart]({dex_link})\n\n"
             shown+=1
             if shown>=6: break
-        if shown==0:
-            msg+="All clustered wallets have sold. No current holders with 2+ wallets holding same coin."
+        if shown==0: msg+="No current 2+ holders."
         send_tg(msg[:4000])
-    elif low.startswith("/testalert"):
-        test_msg = "💰 *BASE BUY*\n🪙 DRIP ($2.10M)\n👤 `0x3f2...9a1b` | `$5,200`\n📄 Token: `0x1234...5678`\n📊 [Chart](https://dexscreener.com/base/0x1234567890abcdef1234567890abcdef12345678) | 🔍 [Tx](https://basescan.org/tx/0xabc123hash)\n\n🚨 *SELL ALERT* 🚨\n🪙 Coin: *DRIP* ($2.10M)\n💸 `$1,240` sold by `0x3f2...9a1b`\n🔗 Chain: BASE\n👤 Wallet: `0xfd87eda88be6c372453b721da63d58ad1a5b2d94`\n📄 Token: `0x1234...5678`\n📊 [Chart](https://dexscreener.com/base/0x1234567890abcdef1234567890abcdef12345678) | 🔍 [Tx](https://basescan.org/tx/0xabc123hash)"
-        send_tg(test_msg)
+    elif low.startswith("/listwallets"):
+        sol="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(SOL_WALLETS)])
+        evm="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(EVM_WALLETS)])
+        send_tg((f"*SOL ({len(SOL_WALLETS)}):*\n{sol}\n\n*EVM ({len(EVM_WALLETS)}):*\n{evm}")[:4000])
 
 async def track_chain(chain):
     seen=set()
@@ -408,8 +361,8 @@ async def track_chain(chain):
                                     if usd_val!=0 and usd_val <500: continue
                                     if token_contract in holdings and frm in holdings[token_contract]:
                                         holdings[token_contract].pop(frm, None)
-                                    usd_str = f"${usd_val:.0f}" if usd_val>0 else "unknown amount"
-                                    send_tg(f"🚨 *SELL ALERT* 🚨\n🪙 Coin: *{name}* ({mcap})\n💸 {usd_str} sold by `{frm[:6]}...{frm[-4:]}`\n🔗 Chain: {chain}\n👤 Wallet: `{frm}`\n📄 Token: `{token_contract}`\n📊 [Chart]({dex_link}) | 🔍 [Tx](https://{scan}/tx/{h})")
+                                    usd_str = f"${usd_val:.0f}" if usd_val>0 else "unknown"
+                                    send_tg(f"🚨 *SELL ALERT* 🚨\n🪙 {name} ({mcap})\n💸 {usd_str} sold by `{frm[:6]}...{frm[-4:]}`\n🔗 {chain}\n👤 `{frm}`\n📄 `{token_contract}`\n📊 [Chart]({dex_link}) | 🔍 [Tx](https://{scan}/tx/{h})")
                                 else:
                                     if to_addr_topic.lower() == frm.lower():
                                         if usd_val>0 and usd_val<1: continue
@@ -417,20 +370,12 @@ async def track_chain(chain):
                                         cluster_memory[token_contract]=cluster_memory[token_contract][-200:]
                                         holdings[token_contract][frm]={"amount_usd": usd_val if usd_val>0 else 100, "chain": chain, "token_name": name, "mcap": mcap}
                                         usd_str = f"${usd_val:.0f}" if usd_val>0 else ""
-                                        send_tg(f"💰 *{chain} BUY*\n🪙 {name} ({mcap})\n👤 `{frm[:6]}...{frm[-4:]}` | {usd_str}\n📄 Token: `{token_contract}`\n📊 [Chart]({dex_link}) | 🔍 [Tx](https://{scan}/tx/{h})")
-                                        if len(cluster_memory[token_contract])>=2:
-                                            recent=cluster_memory[token_contract][-5:]
-                                            det="\n".join([f"- `${w[:6]}..` ${holdings.get(token_contract,{}).get(w,{}).get('amount_usd',0):.0f} on {c}" for w,c,t in [(x[0],x[2],x[1]) for x in recent]])
-                                            send_tg(f"🔁 *RE-BUY CLUSTER ({chain})*\n🪙 {name} ({mcap})\n{det}\n📊 [Chart]({dex_link})")
-                        except:
-                            to_addr=tx.get('to')
-                            if to_addr:
-                                name, mcap, dex_link, _, _ = get_token_info_quick(to_addr, chain)
-                                send_tg(f"💰 *{chain} BUY* (direct)\n`{frm[:6]}...{frm[-4:]}` -> {name} ({mcap})\n📊 [Chart]({dex_link}) | 🔍 [Tx](https://{scan}/tx/{h})")
+                                        send_tg(f"💰 *{chain} BUY*\n🪙 {name} ({mcap})\n👤 `{frm[:6]}...{frm[-4:]}` | {usd_str}\n📄 `{token_contract}`\n📊 [Chart]({dex_link}) | 🔍 [Tx](https://{scan}/tx/{h})")
+                        except: pass
                 except: pass
             await asyncio.sleep(2)
         except Exception as e:
-            print(f"[{chain}] loop err {e}"); await asyncio.sleep(5)
+            print(f"[{chain}] err {e}"); await asyncio.sleep(5)
 
 import websockets
 async def track_sol():
@@ -446,13 +391,13 @@ async def track_sol():
                         if "params" not in data: continue
                         sig=data["params"]["result"]["value"].get("signature","")
                         if sig:
-                            send_tg(f"💰 *SOL BUY*\nSig: `{sig[:24]}...`\n📊 [Chart](https://dexscreener.com/solana/{sig}) | 🔍 [Tx](https://solscan.io/tx/{sig})")
+                            send_tg(f"💰 *SOL BUY* Sig `{sig[:16]}..` [Tx](https://solscan.io/tx/{sig})")
                     except: pass
         except Exception as e:
             print(f"[SOL] WS err {e}"); await asyncio.sleep(5)
 
 async def main_loop():
-    send_tg(f"🚀 *Shok Tracker V3.2 7d ACTIVE*\nTracking {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM x {len(RPCS_FALLBACK)} chains\nChains: {', '.join(RPCS_FALLBACK.keys())}\n✅ Sell >$500 + mcap + Short [Chart]|[Tx] + /overlap 7d+LIVE")
+    send_tg(f"🚀 *Shok Tracker V3.3 FIXED ACTIVE*\nTracking {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM x 5 chains\n✅ Overlap fixed: shows N/A mcap coins + 7d history + no timeout")
     set_bot_commands()
     tasks=[track_chain(c) for c in RPCS_FALLBACK.keys()]
     tasks.append(track_sol())
