@@ -70,17 +70,14 @@ RPCS_FALLBACK = {
     "ARB": ["https://arbitrum-one-rpc.publicnode.com","https://arbitrum.llamarpc.com","https://rpc.ankr.com/arbitrum"],
     "POLY": ["https://polygon-bor-rpc.publicnode.com","https://polygon.llamarpc.com","https://rpc.ankr.com/polygon"]
 }
-EVM_CHAINS = {k:v[0] for k,v in RPCS_FALLBACK.items()}
 
 def get_w3_with_fallback(chain):
     for url in RPCS_FALLBACK.get(chain, []):
         try:
             w3 = Web3(Web3.HTTPProvider(url, request_kwargs={'timeout':6}))
             if w3.is_connected():
-                _ = w3.eth.block_number
                 return w3
-        except:
-            continue
+        except: continue
     return None
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -88,7 +85,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Shok's Tracker V2.6 - Clickable Links + Sell + Fallback",200
+def home(): return "Shok Tracker V2.7.1 Fixed",200
 @app.route('/health')
 def health(): return "OK",200
 def run_flask():
@@ -110,15 +107,15 @@ def send_tg(text):
 def set_bot_commands():
     if not BOT_TOKEN: return
     cmds=[
-        {"command":"start","description":"🚀 Status & chains"},
-        {"command":"listwallets","description":"📋 List wallets"},
-        {"command":"pnl","description":"📊 PnL board"},
-        {"command":"addsol","description":"➕ Add SOL: /addsol <addr>"},
-        {"command":"addevm","description":"➕ Add EVM: /addevm 0x..."},
-        {"command":"delsol","description":"➖ Del SOL: /delsol <addr>"},
-        {"command":"delevm","description":"➖ Del EVM: /delevm 0x..."},
-        {"command":"history","description":"📜 Current cluster holders"},
-        {"command":"testalert","description":"🧪 Test buy/sell format"},
+        {"command":"start","description":"Status & chains"},
+        {"command":"listwallets","description":"List wallets"},
+        {"command":"pnl","description":"PnL board"},
+        {"command":"addsol","description":"Add SOL: /addsol <addr>"},
+        {"command":"addevm","description":"Add EVM: /addevm 0x..."},
+        {"command":"delsol","description":"Del SOL: /delsol <addr>"},
+        {"command":"delevm","description":"Del EVM: /delevm 0x..."},
+        {"command":"history","description":"Current cluster holders"},
+        {"command":"testalert","description":"Test buy/sell format"},
     ]
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands", json={"commands":cmds}, timeout=10)
@@ -150,7 +147,7 @@ def handle_command(text):
     low=t.lower()
     if low.startswith("/start"):
         chains=", ".join(RPCS_FALLBACK.keys())
-        send_tg(f"🚀 *Shok's Tracker V2.6 ACTIVE*\n\nTracking {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM x {len(RPCS_FALLBACK)} chains\nChains: {chains}\n\n✅ Sell >$500 + mcap\n✅ Short clickable links\n✅ Fallback RPCs\n✅ Add/Del wallets\n✅ History\n\nPress `/` to see commands")
+        send_tg(f"🚀 *Shok Tracker V2.7.1 ACTIVE*\n\nTracking {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM x {len(RPCS_FALLBACK)} chains\nChains: {chains}\n\n✅ Sell >$500 + mcap\n✅ Short clickable [Chart] | [Tx]\n✅ Fallback RPCs\n✅ Add/Del wallets\n✅ History\n\nPress / to see commands")
         set_bot_commands()
     elif low.startswith("/listwallets"):
         sol="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(SOL_WALLETS)])
@@ -165,7 +162,7 @@ def handle_command(text):
             send_tg(msg)
     elif low.startswith("/addsol"):
         parts=t.split()
-        if len(parts)<2: send_tg("Usage: `/addsol <address>`"); return
+        if len(parts)<2: send_tg("Usage: /addsol <address>"); return
         addr=parts[1].strip()
         if addr in SOL_WALLETS: send_tg(f"Already tracking `{addr[:8]}..`")
         else:
@@ -173,7 +170,7 @@ def handle_command(text):
             send_tg(f"✅ Added SOL\n`{addr}`\nTotal SOL: {len(SOL_WALLETS)}")
     elif low.startswith("/addevm"):
         parts=t.split()
-        if len(parts)<2: send_tg("Usage: `/addevm 0x...`"); return
+        if len(parts)<2: send_tg("Usage: /addevm 0x..."); return
         addr=parts[1].strip()
         if addr.lower() in [x.lower() for x in EVM_WALLETS]: send_tg("Already tracking")
         else:
@@ -181,7 +178,7 @@ def handle_command(text):
             send_tg(f"✅ Added EVM (all 5 chains)\n`{addr}`\nTotal EVM: {len(EVM_WALLETS)}")
     elif low.startswith("/delsol"):
         parts=t.split()
-        if len(parts)<2: send_tg("Usage: `/delsol <address>`"); return
+        if len(parts)<2: send_tg("Usage: /delsol <address>"); return
         addr=parts[1].strip()
         if addr in SOL_WALLETS:
             SOL_WALLETS.remove(addr); save_wallets()
@@ -189,7 +186,7 @@ def handle_command(text):
         else: send_tg("Not found")
     elif low.startswith("/delevm"):
         parts=t.split()
-        if len(parts)<2: send_tg("Usage: `/delevm 0x...`"); return
+        if len(parts)<2: send_tg("Usage: /delevm 0x..."); return
         addr=parts[1].strip().lower()
         found=[x for x in EVM_WALLETS if x.lower()==addr]
         if found:
@@ -220,9 +217,112 @@ def handle_command(text):
             msg+="All clustered wallets have sold. No current holders with 2+ wallets holding same coin."
         send_tg(msg[:4000])
     elif low.startswith("/testalert"):
-        send_tg(
-            "💰 *BASE BUY*\n"
-            "🪙 DRIP ($2.10M)\n"
-            "👤 `0x3f2...9a1b` | `$5,200`\n"
-            "📄 Token: `0x1234...5678`\n"
-            "📊 [Chart](https://dexscreener.com/base/0x1234567890abcdef1234567890abcdef12345678) | 🔍 [Tx](https://basescan.org/tx/0xabc123hash)\n
+        test_msg = "💰 *BASE BUY*\n🪙 DRIP ($2.10M)\n👤 `0x3f2...9a1b` | `$5,200`\n📄 Token: `0x1234...5678`\n📊 [Chart](https://dexscreener.com/base/0x1234567890abcdef1234567890abcdef12345678) | 🔍 [Tx](https://basescan.org/tx/0xabc123hash)\n\n🚨 *SELL ALERT* 🚨\n🪙 Coin: *DRIP* ($2.10M)\n💸 `$1,240` sold by `0x3f2...9a1b`\n🔗 Chain: BASE\n👤 Wallet: `0xfd87eda88be6c372453b721da63d58ad1a5b2d94`\n📄 Token: `0x1234...5678`\n📊 [Chart](https://dexscreener.com/base/0x1234567890abcdef1234567890abcdef12345678) | 🔍 [Tx](https://basescan.org/tx/0xabc123hash)"
+        send_tg(test_msg)
+
+async def track_chain(chain):
+    seen=set()
+    scan={"ETH":"etherscan.io","BSC":"bscscan.com","BASE":"basescan.org","ARB":"arbiscan.io","POLY":"polygonscan.com"}[chain]
+    while True:
+        try:
+            w3=get_w3_with_fallback(chain)
+            if not w3:
+                await asyncio.sleep(10); continue
+            bn=w3.eth.block_number
+            for b in range(max(0,bn-2), bn+1):
+                if b in seen: continue
+                seen.add(b)
+                if len(seen)>150: seen=set(list(seen)[-80:])
+                try:
+                    block=w3.eth.get_block(b, full_transactions=True)
+                    for tx in block.transactions:
+                        frm=tx.get('from')
+                        if not frm: continue
+                        if frm.lower() not in [x.lower() for x in EVM_WALLETS]: continue
+                        h=tx.hash.hex() if hasattr(tx.hash,'hex') else tx['hash'].hex()
+                        try:
+                            receipt=w3.eth.get_transaction_receipt(h)
+                            logs=receipt.get('logs',[])
+                            for log in logs:
+                                if len(log.get('topics',[]))!=3: continue
+                                if log['topics'][0].hex()!= 'ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef': continue
+                                from_addr='0x'+log['topics'][1].hex()[-40:]
+                                to_addr_topic='0x'+log['topics'][2].hex()[-40:]
+                                token_contract=log['address']
+                                amount_raw=int(log['data'],16)
+                                name, mcap, dex_link, price = get_token_info_quick(token_contract, chain)
+                                usd_val = (amount_raw/1e18*price) if price>0 else 0
+                                if from_addr.lower() == frm.lower():
+                                    if usd_val!=0 and usd_val <500: continue
+                                    if token_contract in holdings and frm in holdings[token_contract]:
+                                        holdings[token_contract].pop(frm, None)
+                                    usd_str = f"${usd_val:.0f}" if usd_val>0 else "unknown amount"
+                                    send_tg(f"🚨 *SELL ALERT* 🚨\n🪙 Coin: *{name}* ({mcap})\n💸 {usd_str} sold by `{frm[:6]}...{frm[-4:]}`\n🔗 Chain: {chain}\n👤 Wallet: `{frm}`\n📄 Token: `{token_contract}`\n📊 [Chart]({dex_link}) | 🔍 [Tx](https://{scan}/tx/{h})")
+                                else:
+                                    if to_addr_topic.lower() == frm.lower():
+                                        if usd_val>0 and usd_val<1: continue
+                                        cluster_memory[token_contract].append((frm, datetime.now(), chain))
+                                        cluster_memory[token_contract]=[x for x in cluster_memory[token_contract] if datetime.now()-x[1] < timedelta(hours=24)]
+                                        holdings[token_contract][frm]={"amount_usd": usd_val if usd_val>0 else 100, "chain": chain, "token_name": name, "mcap": mcap}
+                                        usd_str = f"${usd_val:.0f}" if usd_val>0 else ""
+                                        send_tg(f"💰 *{chain} BUY*\n🪙 {name} ({mcap})\n👤 `{frm[:6]}...{frm[-4:]}` | {usd_str}\n📄 Token: `{token_contract}`\n📊 [Chart]({dex_link}) | 🔍 [Tx](https://{scan}/tx/{h})")
+                                        if len(cluster_memory[token_contract])>=2:
+                                            recent=cluster_memory[token_contract][-5:]
+                                            det="\n".join([f"- `${w[:6]}..` ${holdings.get(token_contract,{}).get(w,{}).get('amount_usd',0):.0f} on {c}" for w,c,t in [(x[0],x[2],x[1]) for x in recent]])
+                                            send_tg(f"🔁 *RE-BUY CLUSTER ({chain})*\n🪙 {name} ({mcap})\n{det}\n📊 [Chart]({dex_link})")
+                        except:
+                            to_addr=tx.get('to')
+                            if to_addr:
+                                name, mcap, dex_link, _ = get_token_info_quick(to_addr, chain)
+                                send_tg(f"💰 *{chain} BUY* (direct)\n`{frm[:6]}...{frm[-4:]}` -> {name} ({mcap})\n📊 [Chart]({dex_link}) | 🔍 [Tx](https://{scan}/tx/{h})")
+                except: pass
+            await asyncio.sleep(2)
+        except Exception as e:
+            print(f"[{chain}] loop err {e}"); await asyncio.sleep(5)
+
+import websockets
+async def track_sol():
+    uri=f"wss://atlas-mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
+    while True:
+        try:
+            async with websockets.connect(uri) as ws:
+                sub={"jsonrpc":"2.0","id":1,"method":"logsSubscribe","params":[{"mentions": SOL_WALLETS},{"commitment":"confirmed"}]}
+                await ws.send(json.dumps(sub))
+                async for msg in ws:
+                    try:
+                        data=json.loads(msg)
+                        if "params" not in data: continue
+                        sig=data["params"]["result"]["value"].get("signature","")
+                        if sig:
+                            send_tg(f"💰 *SOL BUY*\nSig: `{sig[:24]}...`\n📊 [Chart](https://dexscreener.com/solana/{sig}) | 🔍 [Tx](https://solscan.io/tx/{sig})")
+                    except: pass
+        except Exception as e:
+            print(f"[SOL] WS err {e}"); await asyncio.sleep(5)
+
+async def main_loop():
+    send_tg(f"🚀 *Shok Tracker V2.7.1 ACTIVE*\nTracking {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM x {len(RPCS_FALLBACK)} chains\nChains: {', '.join(RPCS_FALLBACK.keys())}\n✅ Sell >$500 + mcap + Short [Chart]|[Tx] + Fallback + /add /del /history")
+    set_bot_commands()
+    tasks=[track_chain(c) for c in RPCS_FALLBACK.keys()]
+    tasks.append(track_sol())
+    await asyncio.gather(*tasks)
+
+def start_bot():
+    loop=asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(main_loop())
+
+if __name__=="__main__":
+    threading.Thread(target=run_flask, daemon=True).start()
+    def poll_cmd():
+        off=0
+        while True:
+            try:
+                if not BOT_TOKEN: time.sleep(5); continue
+                r=requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={off}&timeout=10", timeout=15).json()
+                for u in r.get("result",[]):
+                    off=u["update_id"]+1
+                    txt=u.get("message",{}).get("text","")
+                    if txt.startswith("/"): handle_command(txt)
+            except: time.sleep(4)
+    threading.Thread(target=poll_cmd, daemon=True).start()
+    start_bot()
