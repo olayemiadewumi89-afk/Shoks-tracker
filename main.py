@@ -1,6 +1,6 @@
 import os, asyncio, threading, time, requests, json
 from flask import Flask
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 from web3 import Web3
 import websockets
@@ -50,6 +50,7 @@ WALLETS_FILE="wallets.json"; MEMORY_FILE="cluster_memory.json"; HOLDINGS_FILE="h
 cluster_memory=defaultdict(list); holdings=defaultdict(dict)
 pnl_tracker=defaultdict(lambda: {"buys":0,"sells":0,"spent":0.0,"realized":0.0})
 seen_sigs=set()
+cluster_alerted={} # token -> last alert time
 STABLES={"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB","So11111111111111111111111111111111111111112"}
 
 def load_wallets():
@@ -108,7 +109,7 @@ def get_w3_with_fallback(chain):
 BOT_TOKEN=os.getenv("BOT_TOKEN"); CHAT_ID=os.getenv("CHAT_ID")
 app=Flask(__name__)
 @app.route('/')
-def home(): return "Shok V3.11.11 CLEAR PNL - NO DUPE",200
+def home(): return "Shok V3.11.12 CLUSTER 1D ALERT",200
 @app.route('/health')
 def health(): return "OK",200
 def run_flask(): app.run(host='0.0.0.0',port=int(os.getenv("PORT",10000)))
@@ -159,6 +160,22 @@ def get_evm_holdings_blockscout(wallet, base_url):
         r=requests.get(f"{base_url}/api/v2/addresses/{wallet}/token-balances",timeout=8).json()
         return r if isinstance(r,list) else []
     except: return []
+
+# --- 1D CLUSTER ALERT YOUR EDGE ---
+def check_cluster_1d(mint, name, mcap, dex_link, chain):
+    now=datetime.now()
+    events=cluster_memory.get(mint,[])
+    recent=[e for e in events if (now-e[1]) <= timedelta(days=1)]
+    uniq_map={}
+    for w,ts,ch in recent: uniq_map[w.lower()]=w
+    uniq_wallets=list(uniq_map.values())
+    if len(uniq_wallets) < 2: return
+    last=cluster_alerted.get(mint.lower())
+    if last and (now-last) <= timedelta(hours=12): return
+    cluster_alerted[mint.lower()]=now
+    wallets_str="\n".join([f"• `{short(w)}` {w[:6]}...{w[-4:]}" for w in uniq_wallets[:6]])
+    msg=f"🔥 *CLUSTER BUY 1D - EDGE!* 🔥\n\n🪙 *{name}* ({mcap}) {chain}\n👥 {len(uniq_wallets)} wallets in 1D:\n{wallets_str}\n\n📈 [Chart]({dex_link})\n💡 Multiple alphas accumulating!"
+    send_tg(msg)
 
 def live_scan_overlap():
     SCAN_MAP={"SOL":"https://solscan.io/account/","BASE":"https://basescan.org/address/","ETH":"https://etherscan.io/address/","BSC":"https://bscscan.com/address/","ARB":"https://arbiscan.io/address/","POLY":"https://polygonscan.com/address/"}
@@ -223,7 +240,7 @@ def live_scan_overlap():
 def handle_command(text):
     t=text.strip(); low=t.lower()
     if low.startswith("/start"):
-        send_tg(f"🚀 *V3.11.11 CLEAR PNL*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ NO DUPE 1/tx\n✅ Clear PnL + /resetpnl\n✅ WS+POLL Dual"); set_bot_commands()
+        send_tg(f"🚀 *V3.11.12 CLUSTER 1D*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n🔥 Auto cluster 1D ON\n✅ Clear PnL + NO DUPE\n✅ WS+POLL Dual"); set_bot_commands()
     elif low.startswith("/listwallets"):
         sol="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(SOL_WALLETS)])
         evm="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(EVM_WALLETS)])
@@ -235,27 +252,21 @@ def handle_command(text):
         pnl_tracker.clear(); save_pnl()
         send_tg("🗑️ *PnL Reset*\nAll stats cleared. Tracking fresh from now.")
     elif low.startswith("/pnl"):
-        if not pnl_tracker: send_tg("📊 *PnL Board*\n\nNo trades tracked yet.\nStart: bot is tracking from now.")
+        if not pnl_tracker: send_tg("📊 *PnL Board*\n\nNo trades tracked yet.")
         else:
             total_spent=sum(d['spent'] for d in pnl_tracker.values())
             total_real=sum(d['realized'] for d in pnl_tracker.values())
             total_pnl=total_real-total_spent
-            msg=f"📊 *PnL Board - Since Bot Started*\n"
-            msg+=f"Total Spent: ${total_spent:,.0f} | Total Realized: ${total_real:,.0f} | Net: ${total_pnl:,.0f} {'🟢' if total_pnl>=0 else '🔴'}\n\n"
-            # sort by net profit
+            msg=f"📊 *PnL Board - Since Bot Started*\nSpent: ${total_spent:,.0f} | Realized: ${total_real:,.0f} | Net: ${total_pnl:,.0f} {'🟢' if total_pnl>=0 else '🔴'}\n\n"
             sorted_wallets=sorted(pnl_tracker.items(), key=lambda x: x[1]['realized']-x[1]['spent'], reverse=True)[:12]
             for w,d in sorted_wallets:
                 net=d['realized']-d['spent']
                 status="🟢 PROFIT" if net>=0 else "🔴 LOSS"
-                # explain B:0 case
                 note=""
                 if d['buys']==0 and d['sells']>0: note=" (sold old bag)"
                 elif d['sells']==0 and d['buys']>0: note=" (holding)"
-                msg+=f"`{w[:6]}...{w[-4:]}` {status}{note}\n"
-                msg+=f" Buys: {d['buys']} | Sells: {d['sells']}\n"
-                msg+=f" Spent: ${d['spent']:.0f} | Got: ${d['realized']:.0f}\n"
-                msg+=f" Net: ${net:+.0f}\n\n"
-            msg+=f"_Note: B:0 S:1 = sold token bought before tracking started_"
+                msg+=f"`{w[:6]}...{w[-4:]}` {status}{note}\n Buys: {d['buys']} | Sells: {d['sells']}\n Spent: ${d['spent']:.0f} | Got: ${d['realized']:.0f}\n Net: ${net:+.0f}\n\n"
+            msg+=f"_B:0 S:1 = sold before tracking_"
             send_tg(msg[:4000])
     elif low.startswith("/addsol"):
         try:
@@ -294,7 +305,7 @@ def handle_command(text):
             if shown>=6: break
         send_tg(msg[:4000] if shown else "All sold")
     elif low.startswith("/testalert"):
-        send_tg("💰 *TEST*\n✅ V3.11.11 CLEAR PNL working")
+        send_tg("💰 *TEST*\n✅ V3.11.12 CLUSTER 1D working")
 
 def get_sol_parsed(sig):
     try:
@@ -329,6 +340,7 @@ def process_sol_tx(wallet_list, tx_obj, sig, source):
         cluster_memory[mint].append((target,datetime.now(),"SOL")); save_memory()
         holdings[mint][target]={"amount_usd":display_usd,"chain":"SOL","token_name":name,"mcap":mcap}; save_holdings()
         send_tg(f"💰 *SOL BUY*\n🪙 {name} ({mcap})\n👤 `{target[:6]}...{target[-4:]}` | ${display_usd:,.2f}\n📊 [Chart]({dex_link}) | [Tx](https://solscan.io/tx/{sig}) [{source}]")
+        threading.Thread(target=lambda: check_cluster_1d(mint,name,mcap,dex_link,"SOL"),daemon=True).start()
     else:
         pnl_tracker[target.lower()]["sells"]+=1; pnl_tracker[target.lower()]["realized"]+= (usd if usd>0 else 50); save_pnl()
         if mint in holdings and target in holdings[mint]: holdings[mint].pop(target,None); save_holdings()
@@ -391,6 +403,7 @@ async def track_chain(chain):
                                     cluster_memory[token_contract].append((frm,datetime.now(),chain)); save_memory()
                                     holdings[token_contract][frm]={"amount_usd": usd_val,"chain":chain,"token_name":name,"mcap":mcap}; save_holdings()
                                     send_tg(f"💰 *{chain} BUY*\n🪙 {name} ({mcap})\n👤 `{frm[:6]}...` | ${usd_val:,.2f}\n📊 [Chart]({dex_link}) | [Tx](https://{scan}/tx/{h})")
+                                    threading.Thread(target=lambda: check_cluster_1d(token_contract,name,mcap,dex_link,chain),daemon=True).start()
                         except: pass
                 except: pass
             await asyncio.sleep(1.5)
@@ -417,7 +430,7 @@ async def track_sol():
         except Exception as e: print(f"[SOL] WS err {e}"); await asyncio.sleep(5)
 
 async def main_loop():
-    send_tg(f"🚀 *V3.11.11 CLEAR PNL ACTIVE*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ Clear PnL format + /resetpnl\n✅ 1 alert per tx\n✅ WS+POLL Dual"); set_bot_commands()
+    send_tg(f"🚀 *V3.11.12 CLUSTER 1D ACTIVE*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n🔥 Auto 1D Cluster Alert ON\n✅ Clear PnL + NO DUPE\n✅ WS+POLL Dual"); set_bot_commands()
     tasks=[track_chain(c) for c in RPCS_FALLBACK.keys()]
     tasks.append(track_sol())
     tasks.append(track_sol_polling())
