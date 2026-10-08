@@ -71,7 +71,9 @@ def load_persistent():
                     cluster_memory[k].append((w,ts,ch))
     except: pass
     try:
-        if os.path.exists(HOLDINGS_FILE): holdings.update(json.load(open(HOLDINGS_FILE)))
+        if os.path.exists(HOLDINGS_FILE):
+            for k,v in json.load(open(HOLDINGS_FILE)).items():
+                holdings[k]=v
     except: pass
     try:
         if os.path.exists(PNL_FILE): pnl_tracker.update(json.load(open(PNL_FILE)))
@@ -115,11 +117,11 @@ def get_w3_with_fallback(chain):
 BOT_TOKEN=os.getenv("BOT_TOKEN"); CHAT_ID=os.getenv("CHAT_ID")
 app=Flask(__name__)
 @app.route('/')
-def home(): return "Shok V3.11.23 FULL COMMANDS + FILTER",200
+def home(): return "Shok V3.12 PRO + PnL% + BubbleMaps",200
 @app.route('/health')
 def health(): return "OK",200
 @app.route('/debug')
-def debug(): return f"SOL:PUBLIC FILTERED $10+ EVM:{len(EVM_WALLETS)} SOL:{len(SOL_WALLETS)} Holdings:{len(holdings)} LastTx:{int((datetime.now()-last_tx_time).total_seconds()/60)}m",200
+def debug(): return f"SOL:PUBLIC PRO V3.12 EVM:{len(EVM_WALLETS)} SOL:{len(SOL_WALLETS)} Holdings:{len(holdings)} LastTx:{int((datetime.now()-last_tx_time).total_seconds()/60)}m",200
 def run_flask(): app.run(host='0.0.0.0',port=int(os.getenv("PORT",10000)))
 def send_tg(text):
     if not BOT_TOKEN or not CHAT_ID: print(text[:200], flush=True); return
@@ -147,7 +149,7 @@ def get_token_info_quick(token_address, chain_hint="SOL"):
             price=float(best.get("priceUsd",0) or 0)
             if price==0: return None
             dex_link=f"https://dexscreener.com/{best.get('chainId','solana')}/{best.get('pairAddress',token_address)}"
-            return name, mcap, dex_link, price, best.get('chainId','SOL').upper(), liq
+            return name, mcap, dex_link, price, best.get('chainId','SOL').upper(), liq, best.get('pairAddress',token_address)
         except:
             if attempt==0: time.sleep(1)
             continue
@@ -162,7 +164,8 @@ def check_cluster_1d(mint, name, mcap, dex_link, chain):
     if last and (now-last) <= timedelta(hours=12): return
     cluster_alerted[mint.lower()]=now
     wallets_str="\n".join([f"• `{short(w)}` {w[:6]}...{w[-4:]}" for w in uniq_wallets[:6]])
-    send_tg(f"🔥 *CLUSTER BUY 1D - EDGE!* 🔥\n\n🪙 *{name}* ({mcap}) {chain}\n👥 {len(uniq_wallets)} wallets in 1D:\n{wallets_str}\n\n📈 [Chart]({dex_link})")
+    bubble=f"https://bubblemaps.io/sol/token/{mint}" if chain=="SOL" else f"https://bubblemaps.io/{chain.lower()}/token/{mint}"
+    send_tg(f"🔥 *CLUSTER BUY 1D - EDGE!* 🔥\n\n🪙 *{name}* ({mcap}) {chain}\n👥 {len(uniq_wallets)} wallets in 1D:\n{wallets_str}\n\n📈 [Chart]({dex_link}) | [Bubble]({bubble})")
 
 def get_tx_parsed_public(sig):
     for _ in range(3):
@@ -212,7 +215,7 @@ def process_sol_tx_public(wallet_list, parsed, sig):
     if not info:
         print(f"SKIP no chart {mint[:6]}", flush=True)
         return
-    name,mcap,dex_link,price,_,liq = info
+    name,mcap,dex_link,price,_,liq,pair = info
     usd=amt*price if price>0 else 0
     if usd < 10:
         print(f"SKIP dust ${usd:.2f} {name}", flush=True)
@@ -220,21 +223,47 @@ def process_sol_tx_public(wallet_list, parsed, sig):
     seen_sigs.add(sig)
     if len(seen_sigs)>800: seen_sigs.clear()
     last_tx_time=datetime.now()
-    print(f"ALERT PUBLIC {name} {'BUY' if is_buy else 'SELL'} ${usd:.2f} Liq ${liq:.0f}", flush=True)
     photon_link=f"https://photon-sol.tinyastro.io/en/lp/{mint}"
+    bubble_link=f"https://bubblemaps.io/sol/token/{mint}"
+    print(f"ALERT PUBLIC {name} {'BUY' if is_buy else 'SELL'} ${usd:.2f} Liq ${liq:.0f}", flush=True)
+
     if is_buy:
+        # cost-basis accumulate
+        prev=holdings.get(mint,{}).get(owner, {"token_amount":0,"cost_usd":0})
+        new_amount=prev.get("token_amount",0)+amt
+        new_cost=prev.get("cost_usd",0)+usd
+        holdings[mint][owner]={"token_amount":new_amount,"cost_usd":new_cost,"avg_price":new_cost/new_amount if new_amount>0 else price,"chain":"SOL","token_name":name,"mcap":mcap}
+        save_holdings()
         pnl_tracker[owner.lower()]["buys"]+=1; pnl_tracker[owner.lower()]["spent"]+=usd; save_pnl()
         cluster_memory[mint].append((owner,datetime.now(),"SOL")); save_memory()
-        holdings[mint][owner]={"amount_usd":usd,"chain":"SOL","token_name":name,"mcap":mcap}; save_holdings()
-        send_tg(f"💰 *SOL BUY*\n🪙 {name} ({mcap}) Liq ${liq:,.0f}\n👤 `{owner[:6]}...{owner[-4:]}` | ${usd:,.2f}\n📊 [Dex]({dex_link}) | [Photon]({photon_link}) | [Tx](https://solscan.io/tx/{sig}) [PUBLIC]")
+        avg=new_cost/new_amount if new_amount>0 else price
+        send_tg(f"💰 *SOL BUY*\n🪙 {name} ({mcap}) Liq ${liq:,.0f}\n👤 `{owner[:6]}...{owner[-4:]}` | ${usd:,.2f} | {amt:,.0f} tokens\n💵 Avg ${avg:.6f} | Now ${price:.6f}\n📊 [Dex]({dex_link}) | [Photon]({photon_link}) | [Bubble]({bubble_link}) | [Tx](https://solscan.io/tx/{sig}) [PRO]")
         threading.Thread(target=lambda: check_cluster_1d(mint,name,mcap,dex_link,"SOL"),daemon=True).start()
     else:
+        prev=holdings.get(mint,{}).get(owner)
+        if prev:
+            held_amt=prev.get("token_amount",0)
+            cost_basis=prev.get("cost_usd",0)
+            avg_price=prev.get("avg_price",price)
+            pct_sold=(amt/held_amt*100) if held_amt>0 else 100
+            cost_of_sale=cost_basis*(amt/held_amt) if held_amt>0 else 0
+            pnl_usd=usd-cost_of_sale
+            pnl_pct=((price-avg_price)/avg_price*100) if avg_price>0 else 0
+            remaining=held_amt-amt
+            if remaining <= 0.0001:
+                holdings[mint].pop(owner,None)
+            else:
+                holdings[mint][owner]["token_amount"]=remaining
+                holdings[mint][owner]["cost_usd"]=cost_basis-cost_of_sale
+            save_holdings()
+            emoji="🟢" if pnl_usd>=0 else "🔴"
+            send_tg(f"🚨 *SOL SELL {emoji}* 🚨\n🪙 {name} ({mcap})\n👤 `{owner[:6]}...{owner[-4:]}` sold {pct_sold:.0f}% ({amt:,.0f} tokens)\n💸 ${usd:,.2f} | Cost ${cost_of_sale:,.2f}\n📈 PnL {emoji} ${pnl_usd:+,.2f} ({pnl_pct:+.1f}%)\nAvg ${avg_price:.6f} → Now ${price:.6f}\n📊 [Dex]({dex_link}) | [Photon]({photon_link}) | [Bubble]({bubble_link}) | [Tx](https://solscan.io/tx/{sig}) [PRO]")
+        else:
+            send_tg(f"🚨 *SOL SELL* 🚨\n🪙 {name} ({mcap})\n💸 ${usd:,.2f} sold by `{owner[:6]}...{owner[-4:]}` (no entry)\n📊 [Dex]({dex_link}) | [Photon]({photon_link}) | [Bubble]({bubble_link}) | [Tx](https://solscan.io/tx/{sig}) [PRO]")
         pnl_tracker[owner.lower()]["sells"]+=1; pnl_tracker[owner.lower()]["realized"]+=usd; save_pnl()
-        if mint in holdings and owner in holdings[mint]: holdings[mint].pop(owner,None); save_holdings()
-        send_tg(f"🚨 *SOL SELL* 🚨\n🪙 {name} ({mcap})\n💸 ${usd:,.2f} sold by `{owner[:6]}...{owner[-4:]}`\n📊 [Dex]({dex_link}) | [Photon]({photon_link}) | [Tx](https://solscan.io/tx/{sig}) [PUBLIC]")
 
 async def track_sol_polling():
-    print("🔵 SOL PUBLIC RPC 5s FILTERED $10+ + EVM", flush=True)
+    print("🔵 SOL PUBLIC RPC 5s PRO V3.12 + PnL% + BubbleMaps", flush=True)
     while True:
         for w in SOL_WALLETS:
             try:
@@ -280,24 +309,41 @@ async def track_chain(chain):
                                 if len(log.get('topics',[]))!=3: continue
                                 if log['topics'][0].hex()!='ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef': continue
                                 from_addr='0x'+log['topics'][1].hex()[-40:]; to_addr='0x'+log['topics'][2].hex()[-40:]
-                                token_contract=log['address']; amount_raw=int(log['data'],16)
+                                token_contract=log['address']; amount_raw=int(log['data'],16); amount_token=amount_raw/1e18
                                 info=get_token_info_quick(token_contract,chain)
                                 if not info: continue
-                                name,mcap,dex_link,price,_,liq = info
-                                usd_val=(amount_raw/1e18*price) if price>0 else 0
+                                name,mcap,dex_link,price,_,liq,pair = info
+                                usd_val=(amount_token*price) if price>0 else 0
                                 if usd_val < 10: continue
                                 last_tx_time=datetime.now()
+                                bubble_link=f"https://bubblemaps.io/{chain.lower()}/token/{token_contract}"
                                 if from_addr.lower()==frm.lower():
+                                    prev=holdings.get(token_contract,{}).get(frm)
+                                    if prev:
+                                        held=prev.get("token_amount",0); cost=prev.get("cost_usd",0); avg=prev.get("avg_price",price)
+                                        pct=(amount_token/held*100) if held>0 else 100
+                                        pnl_usd=usd_val - cost*(amount_token/held) if held>0 else 0
+                                        pnl_pct=((price-avg)/avg*100) if avg>0 else 0
+                                        remaining=held-amount_token
+                                        if remaining<=0.000001: holdings[token_contract].pop(frm,None)
+                                        else:
+                                            holdings[token_contract][frm]["token_amount"]=remaining
+                                            holdings[token_contract][frm]["cost_usd"]=cost - cost*(amount_token/held)
+                                        save_holdings()
+                                        emoji="🟢" if pnl_usd>=0 else "🔴"
+                                        send_tg(f"🚨 *{chain} SELL {emoji}* 🚨\n🪙 {name} ({mcap})\n👤 `{frm[:6]}...{frm[-4:]}` sold {pct:.0f}%\n💸 ${usd_val:,.2f} PnL {emoji} ${pnl_usd:+,.2f} ({pnl_pct:+.1f}%)\n📊 [Chart]({dex_link}) | [Bubble]({bubble_link}) | [Tx](https://{scan}/tx/{h}) [PRO]")
+                                    else:
+                                        send_tg(f"🚨 *{chain} SELL* 🚨\n🪙 {name} ({mcap})\n💸 ${usd_val:,.2f} sold by `{frm[:6]}...{frm[-4:]}`\n📊 [Chart]({dex_link}) | [Bubble]({bubble_link}) | [Tx](https://{scan}/tx/{h}) [PRO]")
                                     pnl_tracker[frm.lower()]["sells"]+=1; pnl_tracker[frm.lower()]["realized"]+=usd_val; save_pnl()
-                                    if token_contract in holdings and frm in holdings[token_contract]: holdings[token_contract].pop(frm,None); save_holdings()
-                                    print(f"ALERT {chain} SELL {name} ${usd_val:.2f}", flush=True)
-                                    send_tg(f"🚨 *{chain} SELL* 🚨\n🪙 {name} ({mcap})\n💸 ${usd_val:,.2f} sold by `{frm[:6]}...{frm[-4:]}`\n📊 [Chart]({dex_link}) | [Tx](https://{scan}/tx/{h})")
                                 elif to_addr.lower()==frm.lower():
+                                    prev=holdings.get(token_contract,{}).get(frm, {"token_amount":0,"cost_usd":0})
+                                    new_amount=prev.get("token_amount",0)+amount_token
+                                    new_cost=prev.get("cost_usd",0)+usd_val
+                                    holdings[token_contract][frm]={"token_amount":new_amount,"cost_usd":new_cost,"avg_price":new_cost/new_amount if new_amount>0 else price,"chain":chain,"token_name":name,"mcap":mcap}
+                                    save_holdings()
                                     pnl_tracker[frm.lower()]["buys"]+=1; pnl_tracker[frm.lower()]["spent"]+=usd_val; save_pnl()
                                     cluster_memory[token_contract].append((frm,datetime.now(),chain)); save_memory()
-                                    holdings[token_contract][frm]={"amount_usd": usd_val,"chain":chain,"token_name":name,"mcap":mcap}; save_holdings()
-                                    print(f"ALERT {chain} BUY {name} ${usd_val:.2f}", flush=True)
-                                    send_tg(f"💰 *{chain} BUY*\n🪙 {name} ({mcap})\n👤 `{frm[:6]}...{frm[-4:]}` | ${usd_val:,.2f}\n📊 [Chart]({dex_link}) | [Tx](https://{scan}/tx/{h})")
+                                    send_tg(f"💰 *{chain} BUY*\n🪙 {name} ({mcap}) Liq ${liq:,.0f}\n👤 `{frm[:6]}...{frm[-4:]}` | ${usd_val:,.2f}\n📊 [Chart]({dex_link}) | [Bubble]({bubble_link}) | [Tx](https://{scan}/tx/{h}) [PRO]")
                                     threading.Thread(target=lambda: check_cluster_1d(token_contract,name,mcap,dex_link,chain),daemon=True).start()
                         except: pass
                 except: pass
@@ -308,7 +354,7 @@ def handle_command(text):
     t=text.strip(); low=t.lower()
     if low.startswith("/start"):
         mins=int((datetime.now()-last_tx_time).total_seconds()/60)
-        send_tg(f"🚀 *V3.11.23 FULL ACTIVE*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ PUBLIC RPC no 429\n✅ Filtered $10+ | Liq $500+\n⏰ Last tx: {mins}m ago\nHoldings: {len(holdings)}\n\n/listwallets - wallets\n/pnl - PnL\n/overlap - find overlaps\n/history - holdings\n/addsol /addevm /delsol /delevm\n/testalert")
+        send_tg(f"🚀 *V3.12 PRO ACTIVE*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ Filter $10+ Liq $500+\n✅ SELL % + PnL $ + %\n✅ BubbleMaps + Photon + Dex\n✅ Cluster 1D EDGE\n⏰ Last tx: {mins}m ago\nHoldings: {len(holdings)}\n\n/listwallets /pnl /overlap /history /testalert")
     elif low.startswith("/listwallets"):
         sol="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(SOL_WALLETS)])
         evm="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(EVM_WALLETS)])
@@ -350,12 +396,14 @@ def handle_command(text):
         else: send_tg("Not found")
     elif low.startswith("/history"):
         if not holdings: send_tg("📜 No holdings"); return
-        msg="📜 *Holdings* (top 10)\n\n"; c=0
+        msg="📜 *Holdings PRO* (top 10)\n\n"; c=0
         for token, wallets_dict in holdings.items():
             if c>=10: break
             if not wallets_dict: continue
             sample=list(wallets_dict.values())[0]
-            msg+=f"*{sample.get('token_name',token[:6])}* - {len(wallets_dict)} wallets ${sample.get('amount_usd',0):.0f}\n"
+            total_amt=sum(v.get("token_amount",0) for v in wallets_dict.values())
+            total_cost=sum(v.get("token_amount",0)*v.get("avg_price",0) for v in wallets_dict.values())
+            msg+=f"*{sample.get('token_name',token[:6])}* - {len(wallets_dict)} wallets | {total_amt:,.0f} tokens ~${total_cost:,.0f}\n"
             c+=1
         send_tg(msg if c>0 else "All sold")
     elif low.startswith("/overlap"):
@@ -369,15 +417,15 @@ def handle_command(text):
                 msg=f"🔍 *Overlap {len(overlaps)}*\n\n"
                 for mint, ws in list(overlaps.items())[:6]:
                     sample=list(holdings[mint].values())[0]
-                    msg+=f"*{sample.get('token_name',mint[:6])}* - {len(ws)} wallets\n"
+                    msg+=f"*{sample.get('token_name',mint[:6])}* - {len(ws)} wallets\n[Bubble](https://bubblemaps.io/sol/token/{mint})\n"
                 send_tg(msg[:4000])
         except Exception as e: send_tg(f"Overlap err {e}")
     elif low.startswith("/testalert"):
-        send_tg("💰 *TEST V3.11.23 FULL WORKING*\nSOL PUBLIC + EVM + All 11 commands back + Filter $10+")
+        send_tg("💰 *TEST V3.12 PRO WORKING*\n✅ SELL % + PnL + BubbleMaps + Filter $10+")
 
 def set_bot_commands():
     cmds=[
-        {"command":"start","description":"Status"},
+        {"command":"start","description":"Status PRO"},
         {"command":"listwallets","description":"List wallets"},
         {"command":"pnl","description":"PnL board"},
         {"command":"resetpnl","description":"Reset PnL"},
@@ -385,9 +433,9 @@ def set_bot_commands():
         {"command":"addevm","description":"Add EVM wallet"},
         {"command":"delsol","description":"Del SOL wallet"},
         {"command":"delevm","description":"Del EVM wallet"},
-        {"command":"history","description":"Holdings"},
-        {"command":"overlap","description":"Overlap scan"},
-        {"command":"testalert","description":"Test alert"}
+        {"command":"history","description":"Holdings PRO"},
+        {"command":"overlap","description":"Overlap + Bubble"},
+        {"command":"testalert","description":"Test PRO"}
     ]
     try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",json={"commands":cmds},timeout=10)
     except: pass
@@ -404,13 +452,13 @@ def heartbeat():
                 try: requests.get(public_url,timeout=8)
                 except: pass
             mins=int((datetime.now()-last_tx_time).total_seconds()/60)
-            print(f"HEARTBEAT {mins}m ago + self-ping", flush=True)
+            print(f"HEARTBEAT PRO {mins}m ago + self-ping", flush=True)
         except: pass
 
 async def main_loop():
-    print(f">>> MAIN LOOP V3.11.23 FULL {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM", flush=True)
+    print(f">>> MAIN LOOP V3.12 PRO {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM", flush=True)
     threading.Thread(target=heartbeat, daemon=True).start()
-    send_tg(f"🚀 *V3.11.23 FULL ACTIVE*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ Min $10 + Liq $500+ = no Token Not Found\n✅ Photon link\n✅ All commands restored\n✅ Self-ping ON (no UptimeRobot needed)"); set_bot_commands()
+    send_tg(f"🚀 *V3.12 PRO ACTIVE*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ Min $10 + Liq $500+\n✅ SELL % + PnL $ + % + Avg Price\n✅ BubbleMaps link\n✅ Photon link\n✅ All commands PRO"); set_bot_commands()
     tasks=[track_chain(c) for c in RPCS_FALLBACK.keys()]
     tasks.append(track_sol_polling())
     await asyncio.gather(*tasks)
