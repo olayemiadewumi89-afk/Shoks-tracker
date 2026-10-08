@@ -115,7 +115,7 @@ def get_w3_with_fallback(chain):
 BOT_TOKEN=os.getenv("BOT_TOKEN"); CHAT_ID=os.getenv("CHAT_ID")
 app=Flask(__name__)
 @app.route('/')
-def home(): return "Shok V3.11.22 SOL PUBLIC + EVM FILTERED",200
+def home(): return "Shok V3.11.23 FULL COMMANDS + FILTER",200
 @app.route('/health')
 def health(): return "OK",200
 @app.route('/debug')
@@ -125,11 +125,9 @@ def send_tg(text):
     if not BOT_TOKEN or not CHAT_ID: print(text[:200], flush=True); return
     try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json={"chat_id":CHAT_ID,"text":text,"parse_mode":"Markdown","disable_web_page_preview":True},timeout=15)
     except: pass
-def set_bot_commands():
-    try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",json={"commands":[{"command":"start","description":"Status"},{"command":"pnl","description":"PnL"},{"command":"testalert","description":"Test"}]},timeout=10)
-    except: pass
 
-# --- FIXED: Filter low liq + dust ---
+def short(a): return f"{a[:4]}...{a[-4:]}" if a else "?"
+
 def get_token_info_quick(token_address, chain_hint="SOL"):
     if token_address in STABLES: return None
     for attempt in range(2):
@@ -137,15 +135,10 @@ def get_token_info_quick(token_address, chain_hint="SOL"):
             r=requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",timeout=5).json()
             pairs=r.get("pairs",[])
             if not pairs: continue
-            # Only keep pairs with real liquidity
             valid=[p for p in pairs if (p.get("liquidity",{}).get("usd",0) or 0) >= 500]
             if not valid:
-                # token too new, skip -> this fixes "Token Not Found"
-                if attempt==0:
-                    time.sleep(1.5)
-                    continue
-                else:
-                    return None
+                if attempt==0: time.sleep(1.5); continue
+                else: return None
             best=sorted(valid, key=lambda x: x.get("liquidity",{}).get("usd",0), reverse=True)[0]
             liq=best.get("liquidity",{}).get("usd",0)
             name=best.get("baseToken",{}).get("symbol", token_address[:6])
@@ -160,7 +153,6 @@ def get_token_info_quick(token_address, chain_hint="SOL"):
             continue
     return None
 
-def short(a): return f"{a[:4]}...{a[-4:]}" if a else "?"
 def check_cluster_1d(mint, name, mcap, dex_link, chain):
     now=datetime.now(); events=cluster_memory.get(mint,[]); recent=[e for e in events if (now-e[1]) <= timedelta(days=1)]
     uniq_map={}; [uniq_map.__setitem__(w.lower(),w) for w,_,_ in recent]
@@ -222,7 +214,7 @@ def process_sol_tx_public(wallet_list, parsed, sig):
         return
     name,mcap,dex_link,price,_,liq = info
     usd=amt*price if price>0 else 0
-    if usd < 10: # FIX dust filter
+    if usd < 10:
         print(f"SKIP dust ${usd:.2f} {name}", flush=True)
         return
     seen_sigs.add(sig)
@@ -312,18 +304,115 @@ async def track_chain(chain):
             await asyncio.sleep(5)
         except Exception as e: print(f"[{chain}] err {e}", flush=True); await asyncio.sleep(5)
 
+# --- FULL COMMANDS RESTORED ---
+def handle_command(text):
+    t=text.strip(); low=t.lower()
+    if low.startswith("/start"):
+        mins=int((datetime.now()-last_tx_time).total_seconds()/60)
+        send_tg(f"🚀 *V3.11.23 FULL ACTIVE*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ PUBLIC RPC no 429\n✅ Filtered $10+ | Liq $500+\n⏰ Last tx: {mins}m ago\nHoldings: {len(holdings)}\n\n/listwallets - wallets\n/pnl - PnL\n/overlap - find overlaps\n/history - holdings\n/addsol /addevm /delsol /delevm\n/testalert")
+    elif low.startswith("/listwallets"):
+        sol="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(SOL_WALLETS)])
+        evm="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(EVM_WALLETS)])
+        send_tg((f"*SOL ({len(SOL_WALLETS)}):*\n{sol}\n\n*EVM ({len(EVM_WALLETS)}):*\n{evm}")[:4000])
+    elif low.startswith("/pnl"):
+        if not pnl_tracker: send_tg("📊 *PnL Board*\n\nNo trades yet.")
+        else:
+            total_spent=sum(d['spent'] for d in pnl_tracker.values()); total_real=sum(d['realized'] for d in pnl_tracker.values()); total_pnl=total_real-total_spent
+            msg=f"📊 *PnL* Net: ${total_pnl:,.0f} {'🟢' if total_pnl>=0 else '🔴'}\nSpent: ${total_spent:,.0f} Realized: ${total_real:,.0f}\n\n"
+            for w,d in sorted(pnl_tracker.items(), key=lambda x: x[1]['realized']-x[1]['spent'], reverse=True)[:15]:
+                net=d['realized']-d['spent']; msg+=f"`{w[:6]}...` Net: ${net:+.0f} B:{d['buys']} S:{d['sells']}\n"
+            send_tg(msg[:4000])
+    elif low.startswith("/resetpnl"):
+        pnl_tracker.clear(); save_pnl(); send_tg("🗑️ *PnL Reset done*")
+    elif low.startswith("/addsol"):
+        parts=t.split()
+        if len(parts)<2: send_tg("Usage: /addsol <addr>"); return
+        addr=parts[1].strip()
+        if addr not in SOL_WALLETS: SOL_WALLETS.append(addr); save_wallets(); send_tg(f"✅ Added SOL Total: {len(SOL_WALLETS)}")
+        else: send_tg("Already exists")
+    elif low.startswith("/addevm"):
+        parts=t.split()
+        if len(parts)<2: send_tg("Usage: /addevm 0x..."); return
+        addr=parts[1].strip()
+        if addr.lower() not in [x.lower() for x in EVM_WALLETS]: EVM_WALLETS.append(addr); save_wallets(); send_tg(f"✅ Added EVM Total: {len(EVM_WALLETS)}")
+        else: send_tg("Already exists")
+    elif low.startswith("/delsol"):
+        parts=t.split()
+        if len(parts)<2: send_tg("Usage: /delsol <addr>"); return
+        addr=parts[1].strip()
+        if addr in SOL_WALLETS: SOL_WALLETS.remove(addr); save_wallets(); send_tg(f"🗑️ Removed SOL Left: {len(SOL_WALLETS)}")
+        else: send_tg("Not found")
+    elif low.startswith("/delevm"):
+        parts=t.split()
+        if len(parts)<2: send_tg("Usage: /delevm 0x..."); return
+        addr=parts[1].strip().lower()
+        found=[x for x in EVM_WALLETS if x.lower()==addr]
+        if found: EVM_WALLETS.remove(found[0]); save_wallets(); send_tg(f"🗑️ Removed EVM Left: {len(EVM_WALLETS)}")
+        else: send_tg("Not found")
+    elif low.startswith("/history"):
+        if not holdings: send_tg("📜 No holdings"); return
+        msg="📜 *Holdings* (top 10)\n\n"; c=0
+        for token, wallets_dict in holdings.items():
+            if c>=10: break
+            if not wallets_dict: continue
+            sample=list(wallets_dict.values())[0]
+            msg+=f"*{sample.get('token_name',token[:6])}* - {len(wallets_dict)} wallets ${sample.get('amount_usd',0):.0f}\n"
+            c+=1
+        send_tg(msg if c>0 else "All sold")
+    elif low.startswith("/overlap"):
+        try:
+            counts=defaultdict(list)
+            for mint, ws in holdings.items():
+                for w in ws.keys(): counts[mint].append(w)
+            overlaps={k:v for k,v in counts.items() if len(v)>=2}
+            if not overlaps: send_tg("📊 No overlaps currently held")
+            else:
+                msg=f"🔍 *Overlap {len(overlaps)}*\n\n"
+                for mint, ws in list(overlaps.items())[:6]:
+                    sample=list(holdings[mint].values())[0]
+                    msg+=f"*{sample.get('token_name',mint[:6])}* - {len(ws)} wallets\n"
+                send_tg(msg[:4000])
+        except Exception as e: send_tg(f"Overlap err {e}")
+    elif low.startswith("/testalert"):
+        send_tg("💰 *TEST V3.11.23 FULL WORKING*\nSOL PUBLIC + EVM + All 11 commands back + Filter $10+")
+
+def set_bot_commands():
+    cmds=[
+        {"command":"start","description":"Status"},
+        {"command":"listwallets","description":"List wallets"},
+        {"command":"pnl","description":"PnL board"},
+        {"command":"resetpnl","description":"Reset PnL"},
+        {"command":"addsol","description":"Add SOL wallet"},
+        {"command":"addevm","description":"Add EVM wallet"},
+        {"command":"delsol","description":"Del SOL wallet"},
+        {"command":"delevm","description":"Del EVM wallet"},
+        {"command":"history","description":"Holdings"},
+        {"command":"overlap","description":"Overlap scan"},
+        {"command":"testalert","description":"Test alert"}
+    ]
+    try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",json={"commands":cmds},timeout=10)
+    except: pass
+
+# --- FIX FOR UPTIMEROBOT DOWN - self-ping ---
 def heartbeat():
     while True:
-        time.sleep(300)
+        time.sleep(120)
         try:
-            requests.get(f"http://127.0.0.1:{int(os.getenv('PORT',10000))}/health",timeout=5)
-            print(f"HEARTBEAT {int((datetime.now()-last_tx_time).total_seconds()/60)}m ago", flush=True)
+            port=int(os.getenv("PORT",10000))
+            try: requests.get(f"http://127.0.0.1:{port}/health",timeout=5)
+            except: pass
+            public_url=os.getenv("RENDER_EXTERNAL_URL","")
+            if public_url:
+                try: requests.get(public_url,timeout=8)
+                except: pass
+            mins=int((datetime.now()-last_tx_time).total_seconds()/60)
+            print(f"HEARTBEAT {mins}m ago + self-ping", flush=True)
         except: pass
 
 async def main_loop():
-    print(f">>> MAIN LOOP V3.11.22 FILTERED {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM", flush=True)
+    print(f">>> MAIN LOOP V3.11.23 FULL {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM", flush=True)
     threading.Thread(target=heartbeat, daemon=True).start()
-    send_tg(f"🚀 *V3.11.22 FILTERED ACTIVE*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ Min $10 + Liq $500+ = no Token Not Found\n✅ Photon link for new tokens"); set_bot_commands()
+    send_tg(f"🚀 *V3.11.23 FULL ACTIVE*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ Min $10 + Liq $500+ = no Token Not Found\n✅ Photon link\n✅ All commands restored\n✅ Self-ping ON (no UptimeRobot needed)"); set_bot_commands()
     tasks=[track_chain(c) for c in RPCS_FALLBACK.keys()]
     tasks.append(track_sol_polling())
     await asyncio.gather(*tasks)
@@ -343,10 +432,11 @@ if __name__=="__main__":
                 if not BOT_TOKEN: time.sleep(5); continue
                 r=requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={off}&timeout=10",timeout=15).json()
                 for u in r.get("result",[]):
-                    off=u["update_id"]+1; txt=u.get("message",{}).get("text","")
-                    if txt.startswith("/start") or txt.startswith("/testalert"):
-                        mins=int((datetime.now()-last_tx_time).total_seconds()/60)
-                        send_tg(f"🚀 *V3.11.22 ACTIVE*\nFiltered $10+ trades only\nLast tx: {mins}m ago\nHoldings: {len(holdings)}")
+                    off=u["update_id"]+1
+                    msg=u.get("message",{})
+                    txt=msg.get("text","")
+                    if txt.startswith("/"):
+                        handle_command(txt)
             except: time.sleep(4)
     threading.Thread(target=poll_cmd,daemon=True).start()
     time.sleep(1); start_bot()
