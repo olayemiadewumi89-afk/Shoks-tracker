@@ -91,10 +91,12 @@ def load_persistent():
             for k,v in json.load(open(HOLDINGS_FILE)).items(): holdings[k]=v
     except: pass
     try:
-        if os.path.exists(PNL_FILE): pnl_tracker.update(json.load(open(PNL_FILE)))
+        if os.path.exists(PNL_FILE):
+            pnl_tracker.update(json.load(open(PNL_FILE)))
     except: pass
 
 load_wallets(); load_persistent()
+
 def mark_active(wallet):
     try:
         last_active[wallet.lower()]=datetime.now().isoformat()
@@ -134,7 +136,7 @@ def prune_inactive():
                 new_children.discard(w.lower()); last_active.pop(w.lower(),None)
             if removed>0:
                 save_wallets(); save_new_children(); save_last_active()
-                send_tg(f"🧹 *Auto-cleaned {removed} dead wallets* >30d inactive\nSOL: {len(SOL_WALLETS)} EVM: {len(EVM_WALLETS)} remaining\n✅ Funder/Splitter kept safe")
+                send_tg(f"Auto-cleaned {removed} dead wallets >30d inactive\nSOL: {len(SOL_WALLETS)} EVM: {len(EVM_WALLETS)} remaining - Funder/Splitter kept safe")
             else:
                 save_last_active()
         except Exception as e: print(f"prune err {e}", flush=True)
@@ -167,11 +169,11 @@ def get_w3_with_fallback(chain):
 BOT_TOKEN=os.getenv("BOT_TOKEN"); CHAT_ID=os.getenv("CHAT_ID")
 app=Flask(__name__)
 @app.route('/')
-def home(): return "Shok V3.18 FINAL PRUNE 30D",200
+def home(): return "Shok V3.18 FIXED PRUNE 30D",200
 @app.route('/health')
 def health(): return "OK",200
 @app.route('/debug')
-def debug(): return f"V3.18 EVM:{len(EVM_WALLETS)} SOL:{len(SOL_WALLETS)} Spl:{len(known_splitters)} New:{len(new_children)} Active:{len(last_active)} Last:{int((datetime.now()-last_tx_time).total_seconds()/60)}m",200
+def debug(): return f"V3.18 FIX EVM:{len(EVM_WALLETS)} SOL:{len(SOL_WALLETS)} Spl:{len(known_splitters)} New:{len(new_children)} Active:{len(last_active)} Last:{int((datetime.now()-last_tx_time).total_seconds()/60)}m",200
 def run_flask(): app.run(host='0.0.0.0',port=int(os.getenv("PORT",10000)))
 
 def send_tg_worker():
@@ -179,18 +181,31 @@ def send_tg_worker():
         try:
             if tg_queue:
                 text=tg_queue.popleft()
-                if not BOT_TOKEN or not CHAT_ID: print(text[:200], flush=True)
+                if not BOT_TOKEN or not CHAT_ID:
+                    print(text[:500], flush=True)
                 else:
-                    try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json={"chat_id":CHAT_ID,"text":text,"parse_mode":"Markdown","disable_web_page_preview":True},timeout=15)
-                    except: pass
+                    # Try Markdown first, fallback to plain if Telegram rejects it
+                    try:
+                        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json={"chat_id":CHAT_ID,"text":text,"parse_mode":"Markdown","disable_web_page_preview":True},timeout=15)
+                        if r.status_code!= 200 or not r.json().get("ok"):
+                            # fallback plain
+                            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json={"chat_id":CHAT_ID,"text":text,"disable_web_page_preview":True},timeout=15)
+                    except:
+                        try:
+                            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json={"chat_id":CHAT_ID,"text":text,"disable_web_page_preview":True},timeout=15)
+                        except: pass
                 time.sleep(1.2)
             else: time.sleep(0.5)
         except: time.sleep(1)
 threading.Thread(target=send_tg_worker, daemon=True).start()
+
 def send_tg(text):
-    if len(tg_queue)>20: tg_queue.clear()
+    if len(tg_queue)>30: tg_queue.clear()
     tg_queue.append(text)
-def short(a): return f"{a[:4]}...{a[-4:]}" if a else "?"
+
+def short(a):
+    try: return f"{a[:4]}...{a[-4:]}" if a and len(a)>8 else a
+    except: return "?"
 
 def get_token_info_quick(token_address, chain_hint="SOL"):
     if token_address in STABLES: return None
@@ -239,7 +254,7 @@ def get_sol_transfers_cached(sig):
 
 def analyze_wallet_bundle(wallet):
     wallet=wallet.strip()
-    send_tg(f"🔍 *Scanning SOL wallet* `{short(wallet)}`...")
+    send_tg(f"Scanning SOL wallet {short(wallet)}...")
     try:
         rpc_url=get_public_rpc()
         payload={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress","params":[wallet, {"limit":15}]}
@@ -252,7 +267,7 @@ def analyze_wallet_bundle(wallet):
                 if to==wallet and amt>=0.05:
                     if frm not in [f[0] for f in funders]: funders.append((frm, amt, sig))
         if not funders:
-            send_tg(f"❌ No funder found for `{short(wallet)}`"); return
+            send_tg(f"No funder found for {short(wallet)}"); return
         main_funder, amt, _ = funders[0]; siblings=[]; children=[]
         payload2={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress","params":[main_funder, {"limit":20}]}
         r2=requests.post(get_public_rpc(), json=payload2, timeout=12).json()
@@ -279,12 +294,12 @@ def analyze_wallet_bundle(wallet):
                     if to==main_funder and amt4>=0.2: grandparent=(frm, amt4); break
                 if grandparent: break
         except: pass
-        msg=f"📦 *BUNDLE TREE SOL for* `{short(wallet)}`\n\n"
-        if grandparent: msg+=f"👑 FUNDER: `{short(grandparent[0])}` {grandparent[1]:.2f} SOL\n`{grandparent[0]}`\n\n"
-        msg+=f"🔀 SPLITTER: `{short(main_funder)}` → you {amt:.3f} SOL\n`{main_funder}`\n\n ├─ YOU: `{short(wallet)}`\n"
-        if siblings: msg+=f" ├─ SIBLINGS ({len(siblings)}):\n" + "".join([f" │ • `{short(s)}` {a:.2f} SOL\n" for s,a in siblings[:5]])
-        if children: msg+=f" └─ CHILDREN ({len(children)}):\n" + "".join([f" • `{short(c)}` {a:.2f} SOL\n" for c,a in children[:5]])
-        msg+=f"\n🔗 [Solscan](https://solscan.io/account/{main_funder})"
+        msg=f"📦 BUNDLE TREE SOL for {short(wallet)}\n\n"
+        if grandparent: msg+=f"FUNDER: {short(grandparent[0])} {grandparent[1]:.2f} SOL\n{grandparent[0]}\n\n"
+        msg+=f"SPLITTER: {short(main_funder)} -> you {amt:.3f} SOL\n{main_funder}\n\n YOU: {short(wallet)}\n"
+        if siblings: msg+=f" SIBLINGS ({len(siblings)}):\n" + "".join([f" - {short(s)} {a:.2f} SOL\n" for s,a in siblings[:5]])
+        if children: msg+=f" CHILDREN ({len(children)}):\n" + "".join([f" - {short(c)} {a:.2f} SOL\n" for c,a in children[:5]])
+        msg+=f"\nSolscan: https://solscan.io/account/{main_funder}"
         added=0; to_add=[]
         if main_funder not in SOL_WALLETS: to_add.append(main_funder)
         if grandparent and grandparent[0] not in SOL_WALLETS: to_add.append(grandparent[0])
@@ -298,7 +313,7 @@ def analyze_wallet_bundle(wallet):
             SOL_WALLETS.append(addr); added+=1; known_splitters.add(main_funder)
             if grandparent: known_funders.add(grandparent[0])
             if addr!=main_funder and (not grandparent or addr!=grandparent[0]): new_children.add(addr.lower()); mark_active(addr)
-        if added>0: save_wallets(); save_funders(); save_new_children(); save_last_active(); msg+=f"\n\n✅ Auto-added {added} (ALL tracked, 30d prune active)"
+        if added>0: save_wallets(); save_funders(); save_new_children(); save_last_active(); msg+=f"\n\nAuto-added {added} (ALL tracked, 30d prune active)"
         send_tg(msg[:4000])
     except Exception as e: send_tg(f"Bundle error: {e}")
 
@@ -322,10 +337,10 @@ def get_evm_funder(chain, wallet):
     return None
 
 def analyze_evm_bundle(chain, wallet):
-    send_tg(f"🔍 *Scanning EVM {chain} wallet* `{short(wallet)}`...")
+    send_tg(f"Scanning EVM {chain} wallet {short(wallet)}...")
     try:
         funder=get_evm_funder(chain, wallet)
-        if not funder: send_tg(f"❌ No EVM funder found for `{short(wallet)}` on {chain}"); return
+        if not funder: send_tg(f"No EVM funder found for {short(wallet)} on {chain}"); return
         funder_addr, amt = funder; w3=get_w3_with_fallback(chain); siblings=[]
         try:
             latest=w3.eth.block_number
@@ -340,8 +355,8 @@ def analyze_evm_bundle(chain, wallet):
                                 if to_addr.lower() not in [s[0].lower() for s in siblings]: siblings.append((to_addr, val))
                 if len(siblings)>=10: break
         except: pass
-        msg=f"📦 *BUNDLE TREE {chain} for* `{short(wallet)}`\n\n👑 FUNDER: `{short(funder_addr)}` {amt:.4f}\n`{funder_addr}`\n\n ├─ YOU: `{short(wallet)}`\n"
-        if siblings: msg+=f" ├─ SIBLINGS ({len(siblings)}):\n" + "".join([f" │ • `{short(s)}` {a:.4f}\n" for s,a in siblings[:5]])
+        msg=f"📦 BUNDLE TREE {chain} for {short(wallet)}\n\nFUNDER: {short(funder_addr)} {amt:.4f}\n{funder_addr}\n\n YOU: {short(wallet)}\n"
+        if siblings: msg+=f" SIBLINGS ({len(siblings)}):\n" + "".join([f" - {short(s)} {a:.4f}\n" for s,a in siblings[:5]])
         added=0; to_add=[]
         if funder_addr.lower() not in [x.lower() for x in EVM_WALLETS]: to_add.append(funder_addr)
         for sib,_ in siblings[:5]:
@@ -352,7 +367,7 @@ def analyze_evm_bundle(chain, wallet):
             try: EVM_WALLETS.append(Web3.to_checksum_address(addr))
             except: EVM_WALLETS.append(addr)
             added+=1; new_children.add(addr.lower()); known_splitters.add(funder_addr); mark_active(addr)
-        if added>0: save_wallets(); save_funders(); save_new_children(); save_last_active(); msg+=f"\n\n✅ Auto-added {added} EVM wallets (30d prune active)"
+        if added>0: save_wallets(); save_funders(); save_new_children(); save_last_active(); msg+=f"\n\nAuto-added {added} EVM wallets (30d prune active)"
         send_tg(msg[:4000])
     except Exception as e: send_tg(f"EVM bundle error: {e}")
 
@@ -364,9 +379,9 @@ def check_cluster_1d(mint, name, mcap, dex_link, chain):
     last=cluster_alerted.get(mint.lower())
     if last and (now-last) <= timedelta(hours=12): return
     cluster_alerted[mint.lower()]=now
-    wallets_str="\n".join([f"• `{short(w)}`" for w in uniq_wallets[:6]])
+    wallets_str="\n".join([f"- {short(w)}" for w in uniq_wallets[:6]])
     bubble=f"https://bubblemaps.io/sol/token/{mint}" if chain=="SOL" else f"https://bubblemaps.io/{chain.lower()}/token/{mint}"
-    send_tg(f"🔥 *CLUSTER BUY 1D* 🔥\n\n🪙 *{name}* ({mcap}) {chain}\n👥 {len(uniq_wallets)} wallets:\n{wallets_str}\n\n[Chart]({dex_link}) | [Bubble]({bubble})")
+    send_tg(f"CLUSTER BUY 1D\n\n{name} ({mcap}) {chain}\n{len(uniq_wallets)} wallets:\n{wallets_str}\n\nChart: {dex_link}\nBubble: {bubble}")
 
 def get_tx_parsed_public(sig):
     for _ in range(2):
@@ -419,9 +434,9 @@ def process_sol_tx_public(wallet_list, parsed, sig):
         save_holdings(); pnl_tracker[owner.lower()]["buys"]+=1; pnl_tracker[owner.lower()]["spent"]+=usd; save_pnl()
         cluster_memory[mint].append((owner,datetime.now(),"SOL")); save_memory()
         if is_new_child:
-            send_tg(f"🔥🔥🔥 *NEW CHILD FIRST BUY!* 🌱🚀\n\n🪙 {name} ({mcap}) Liq ${liq:,.0f}\n👶 `{short(owner)}` fresh funded wallet!\n💰 First buy ${usd:,.2f} | {amt:,.0f} tokens\n💡 Early! [Dex]({dex_link}) | [Photon]({photon_link}) | [Bubble]({bubble_link}) | [Tx](https://solscan.io/tx/{sig})")
+            send_tg(f"NEW CHILD FIRST BUY!\n\n{name} ({mcap}) Liq ${liq:,.0f}\n{short(owner)} fresh wallet!\nFirst buy ${usd:,.2f} | {amt:,.0f} tokens\nEarly! Dex: {dex_link}\nTx: https://solscan.io/tx/{sig}")
         else:
-            send_tg(f"💰 *SOL BUY $10+*\n🪙 {name} ({mcap})\n👤 `{short(owner)}` | ${usd:,.2f}\n[Dex]({dex_link}) | [Bubble]({bubble_link}) | [Tx](https://solscan.io/tx/{sig})")
+            send_tg(f"SOL BUY $10+\n{name} ({mcap})\n{short(owner)} | ${usd:,.2f}\nDex: {dex_link} | Bubble: {bubble_link} | Tx: https://solscan.io/tx/{sig}")
         threading.Thread(target=lambda: check_cluster_1d(mint,name,mcap,dex_link,"SOL"),daemon=True).start()
     else:
         prev=holdings.get(mint,{}).get(owner)
@@ -434,13 +449,13 @@ def process_sol_tx_public(wallet_list, parsed, sig):
             else: holdings[mint][owner]["token_amount"]=remaining; holdings[mint][owner]["cost_usd"]=cost_basis-cost_of_sale
             save_holdings()
             emoji="🟢" if pnl_usd>=0 else "🔴"
-            send_tg(f"🚨 *SOL SELL {emoji} $10+* 🚨\n🪙 {name} ({mcap})\n👤 `{short(owner)}` sold {pct_sold:.0f}% | ${usd:,.2f} PnL {pnl_pct:+.1f}%\n[Dex]({dex_link}) | [Bubble]({bubble_link})")
+            send_tg(f"SOL SELL {emoji} $10+\n{name} ({mcap})\n{short(owner)} sold {pct_sold:.0f}% | ${usd:,.2f} PnL {pnl_pct:+.1f}%\nDex: {dex_link}")
         else:
-            send_tg(f"🚨 *SOL SELL $10+* 🚨\n🪙 {name} ({mcap}) ${usd:,.2f}\n[Dex]({dex_link}) | [Bubble]({bubble_link})")
+            send_tg(f"SOL SELL $10+\n{name} ({mcap}) ${usd:,.2f}\nDex: {dex_link}")
         pnl_tracker[owner.lower()]["sells"]+=1; pnl_tracker[owner.lower()]["realized"]+=usd; save_pnl()
 
 async def track_sol_polling():
-    print("🔵 SOL V3.18 CLEAN $10+", flush=True)
+    print("SOL V3.18 FIXED CLEAN $10+", flush=True)
     while True:
         for w in SOL_WALLETS[-60:]:
             try:
@@ -504,13 +519,13 @@ async def track_chain(chain):
                                 bubble_link=f"https://bubblemaps.io/{chain.lower()}/token/{token_contract}"
                                 is_new = frm.lower() in new_children
                                 if is_sell:
-                                    send_tg(f"🚨 *{chain} SELL $10+* 🚨\n🪙 {name} ({mcap}) ${usd_val:,.2f}\n[Chart]({dex_link}) | [Bubble]({bubble_link}) | [Tx](https://{scan}/tx/{h})")
+                                    send_tg(f"{chain} SELL $10+\n{name} ({mcap}) ${usd_val:,.2f}\nChart: {dex_link} | Tx: https://{scan}/tx/{h}")
                                 else:
                                     cluster_memory[token_contract].append((frm,datetime.now(),chain)); save_memory()
                                     if is_new:
-                                        send_tg(f"🔥🔥🔥 *NEW EVM CHILD FIRST BUY {chain}!* 🌱🚀\n🪙 {name} ({mcap}) ${usd_val:,.2f}\n👶 `{short(frm)}` fresh funded first buy! Early!\n[Chart]({dex_link}) | [Bubble]({bubble_link}) | [Tx](https://{scan}/tx/{h})")
+                                        send_tg(f"NEW EVM CHILD FIRST BUY {chain}!\n{name} ({mcap}) ${usd_val:,.2f}\n{short(frm)} fresh first buy! Early!\nChart: {dex_link} | Tx: https://{scan}/tx/{h}")
                                     else:
-                                        send_tg(f"💰 *{chain} BUY $10+*\n🪙 {name} ({mcap}) ${usd_val:,.2f}\n[Chart]({dex_link}) | [Bubble]({bubble_link}) | [Tx](https://{scan}/tx/{h})")
+                                        send_tg(f"{chain} BUY $10+\n{name} ({mcap}) ${usd_val:,.2f}\nChart: {dex_link} | Tx: https://{scan}/tx/{h}")
                                     threading.Thread(target=lambda: check_cluster_1d(token_contract,name,mcap,dex_link,chain),daemon=True).start()
                         except: pass
                 except: pass
@@ -518,7 +533,7 @@ async def track_chain(chain):
         except Exception as e: print(f"[{chain}] err {e}", flush=True); await asyncio.sleep(5)
 
 def track_funders_polling():
-    print("👁️ Funder watcher SAFE 45s", flush=True)
+    print("Funder watcher SAFE 45s", flush=True)
     while True:
         time.sleep(45)
         try:
@@ -535,7 +550,7 @@ def track_funders_polling():
                         for frm,to,amt,_ in get_sol_transfers_cached(sig):
                             if frm==funder and amt>=0.1 and to not in SOL_WALLETS:
                                 SOL_WALLETS.append(to); new_children.add(to.lower()); mark_active(to); save_wallets(); save_new_children(); save_last_active()
-                                send_tg(f"🆕 *NEW CHILD FUNDED!* 🌱\n\n👑 Splitter `{short(funder)}` funded:\n`{to}` {amt:.2f} SOL\n✅ Auto-added (Total {len(SOL_WALLETS)})\n⏳ Watching FIRST BUY...\n[Solscan](https://solscan.io/account/{to})")
+                                send_tg(f"NEW CHILD FUNDED!\nSplitter {short(funder)} funded:\n{to} {amt:.2f} SOL\nAuto-added (Total {len(SOL_WALLETS)})\nWatching FIRST BUY...\nhttps://solscan.io/account/{to}")
                                 time.sleep(1)
                 except: continue
         except: pass
@@ -559,77 +574,107 @@ def track_funders_polling():
                                         try: EVM_WALLETS.append(Web3.to_checksum_address(to_addr))
                                         except: EVM_WALLETS.append(to_addr)
                                         new_children.add(to_addr.lower()); mark_active(to_addr); save_wallets(); save_new_children(); save_last_active()
-                                        send_tg(f"🆕 *NEW EVM CHILD FUNDED {chain}!* 🌱\n👑 Funder `{short(funder)}` → `{short(to_addr)}` {val:.4f}\n✅ Auto-added EVM (Total {len(EVM_WALLETS)})")
+                                        send_tg(f"NEW EVM CHILD FUNDED {chain}!\nFunder {short(funder)} -> {short(to_addr)} {val:.4f}\nAuto-added EVM (Total {len(EVM_WALLETS)})")
                     except: continue
         except: pass
 
 def handle_command(text):
-    t=text.strip(); low=t.lower()
-    if low.startswith("/start"):
+    # Robust parsing - handles /start, /start@botname, /START etc
+    t=text.strip()
+    if not t.startswith("/"): return
+    # remove @botname
+    cmd_part = t.split()[0].lower().split('@')[0] # e.g. /start@shoks_bot -> /start
+    low = cmd_part
+    args = t.split()
+
+    if low == "/start":
         mins=int((datetime.now()-last_tx_time).total_seconds()/60)
-        send_tg(f"🚀 *V3.18 PRUNE 30D FINAL*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ $10+ CLEAN\n✅ Funder→Splitter→Children ALL tracked\n✅ VIP NEW CHILD FIRST BUY 🌱🚀\n✅ Auto-prune dead >30d (Funder/Splitter kept)\n⏰ Last: {mins}m\nSpl:{len(known_splitters)} Fund:{len(known_funders)} New:{len(new_children)} Active:{len(last_active)}\n\n/bundle /track_funders /listwallets /pnl /help")
-    elif low.startswith("/bundle"):
-        parts=t.split()
-        if len(parts)<2: send_tg("Usage: /bundle <addr> [chain]")
+        msg = f"V3.18 FIXED PRUNE 30D LIVE\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n$10+ CLEAN\nFunder->Splitter->Children ALL tracked\nVIP NEW CHILD FIRST BUY\nAuto-prune dead >30d (Funder/Splitter kept)\nLast tx: {mins}m ago\nSplitters: {len(known_splitters)} Funders: {len(known_funders)} New: {len(new_children)} Active: {len(last_active)}\n\nCommands:\n/bundle <addr> [chain]\n/track_funders\n/listwallets /listevm\n/addsol /addevm\n/removesol /removeevm\n/holdings /clusters /pnl\n/testalert /help"
+        send_tg(msg)
+    elif low == "/bundle":
+        if len(args)<2: send_tg("Usage: /bundle <addr> [chain]\nEx: /bundle 2Yso... or /bundle 0xfd87... BASE")
         else:
-            addr=parts[1].strip(); chain=parts[2].upper() if len(parts)>2 else ("SOL" if not addr.startswith("0x") else "BASE")
+            addr=args[1].strip(); chain=args[2].upper() if len(args)>2 else ("SOL" if not addr.startswith("0x") else "BASE")
             if addr.startswith("0x"): threading.Thread(target=analyze_evm_bundle, args=(chain, addr), daemon=True).start()
             else: threading.Thread(target=analyze_wallet_bundle, args=(addr,), daemon=True).start()
-    elif low.startswith("/track_funders"):
-        msg=f"👁️ *Splitters ({len(known_splitters)})*\n"
-        for s in list(known_splitters)[-10:]: msg+=f"• `{short(s)}`\n"
-        msg+=f"\n*Funders ({len(known_funders)})*\n"
-        for f in list(known_funders)[-10:]: msg+=f"• `{short(f)}`\n"
-        msg+=f"\n*New Children ({len(new_children)})*\n" + "\n".join([f"• `{short(n)}`" for n in list(new_children)[-8:]])
-        send_tg(msg[:4000] if msg else "No splitters — use /bundle")
-    elif low.startswith("/listwallets"):
-        sol="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(SOL_WALLETS[-30:])])
-        send_tg((f"*Last 30 SOL ({len(SOL_WALLETS)}):*\n{sol}")[:4000])
-    elif low.startswith("/listevm"):
-        evm="\n".join([f"{i+1}. `{w}`" for i,w in enumerate(EVM_WALLETS[-25:])])
-        send_tg((f"*Last 25 EVM ({len(EVM_WALLETS)}):*\n{evm}")[:4000])
-    elif low.startswith("/addsol"):
-        parts=t.split()
-        if len(parts)>=2:
-            addr=parts[1].strip()
-            if addr not in SOL_WALLETS: SOL_WALLETS.append(addr); mark_active(addr); save_wallets(); save_last_active(); send_tg(f"✅ Added SOL `{short(addr)}`")
-    elif low.startswith("/addevm"):
-        parts=t.split()
-        if len(parts)>=2:
-            addr=parts[1].strip()
+    elif low == "/track_funders":
+        msg=f"Splitters ({len(known_splitters)})\n"
+        for s in list(known_splitters)[-10:]: msg+=f"- {short(s)} {s}\n"
+        msg+=f"\nFunders ({len(known_funders)})\n"
+        for f in list(known_funders)[-10:]: msg+=f"- {short(f)} {f}\n"
+        msg+=f"\nNew Children ({len(new_children)})\n" + "\n".join([f"- {short(n)}" for n in list(new_children)[-8:]])
+        if not known_splitters: msg="No splitters yet - use /bundle <wallet> to seed"
+        send_tg(msg[:4000])
+    elif low == "/listwallets":
+        sol="\n".join([f"{i+1}. {w}" for i,w in enumerate(SOL_WALLETS[-30:])])
+        send_tg((f"Last 30 SOL ({len(SOL_WALLETS)} total):\n{sol}")[:4000])
+    elif low == "/listevm":
+        evm="\n".join([f"{i+1}. {w}" for i,w in enumerate(EVM_WALLETS[-25:])])
+        send_tg((f"Last 25 EVM ({len(EVM_WALLETS)} total):\n{evm}")[:4000])
+    elif low == "/addsol":
+        if len(args)>=2:
+            addr=args[1].strip()
+            if addr not in SOL_WALLETS: SOL_WALLETS.append(addr); mark_active(addr); save_wallets(); save_last_active(); send_tg(f"Added SOL {short(addr)} Total {len(SOL_WALLETS)}")
+            else: send_tg("Already tracked")
+    elif low == "/addevm":
+        if len(args)>=2:
+            addr=args[1].strip()
             try: addr=Web3.to_checksum_address(addr)
             except: pass
-            if addr.lower() not in [x.lower() for x in EVM_WALLETS]: EVM_WALLETS.append(addr); mark_active(addr); save_wallets(); save_last_active(); send_tg(f"✅ Added EVM `{short(addr)}`")
-    elif low.startswith("/removesol"):
-        parts=t.split()
-        if len(parts)>=2:
-            addr=parts[1].strip()
-            if addr in SOL_WALLETS: SOL_WALLETS.remove(addr); save_wallets(); send_tg(f"🗑️ Removed SOL")
-    elif low.startswith("/removeevm"):
-        parts=t.split()
-        if len(parts)>=2:
-            addr=parts[1].strip()
-            EVM_WALLETS=[x for x in EVM_WALLETS if x.lower()!=addr.lower()]; save_wallets(); send_tg(f"🗑️ Removed EVM")
-    elif low.startswith("/pnl"):
+            if addr.lower() not in [x.lower() for x in EVM_WALLETS]: EVM_WALLETS.append(addr); mark_active(addr); save_wallets(); save_last_active(); send_tg(f"Added EVM {short(addr)} Total {len(EVM_WALLETS)}")
+            else: send_tg("Already tracked")
+    elif low == "/removesol":
+        if len(args)>=2:
+            addr=args[1].strip()
+            if addr in SOL_WALLETS: SOL_WALLETS.remove(addr); save_wallets(); send_tg(f"Removed SOL {short(addr)}")
+            else: send_tg("Not found")
+    elif low == "/removeevm":
+        if len(args)>=2:
+            addr=args[1].strip()
+            before=len(EVM_WALLETS)
+            EVM_WALLETS=[x for x in EVM_WALLETS if x.lower()!=addr.lower()]; save_wallets()
+            send_tg(f"Removed EVM {short(addr)}" if len(EVM_WALLETS)<before else "Not found")
+    elif low == "/pnl":
         if not pnl_tracker: send_tg("No trades yet.")
         else:
             total_spent=sum(d['spent'] for d in pnl_tracker.values()); total_real=sum(d['realized'] for d in pnl_tracker.values()); total_pnl=total_real-total_spent
-            msg=f"📊 Net: ${total_pnl:,.0f}\n" + "\n".join([f"`{w[:6]}...` ${d['realized']-d['spent']:+.0f}" for w,d in sorted(pnl_tracker.items(), key=lambda x: x[1]['realized']-x[1]['spent'], reverse=True)[:10]])
+            msg=f"PnL Net: ${total_pnl:,.0f}\n" + "\n".join([f"{w[:6]}... ${d['realized']-d['spent']:+.0f}" for w,d in sorted(pnl_tracker.items(), key=lambda x: x[1]['realized']-x[1]['spent'], reverse=True)[:15]])
             send_tg(msg[:4000])
-    elif low.startswith("/holdings"):
+    elif low == "/holdings":
         if not holdings: send_tg("No holdings.")
         else:
-            msg="💼 *Holdings:*\n"
-            for mint,wallets in list(holdings.items())[:10]:
-                for owner,data in list(wallets.items())[:2]: msg+=f"{data.get('token_name','?')} `{short(owner)}` {data.get('token_amount',0):.0f}\n"
+            msg="Holdings:\n"
+            for mint,wallets in list(holdings.items())[:15]:
+                for owner,data in list(wallets.items())[:2]: msg+=f"{data.get('token_name','?')} {short(owner)} {data.get('token_amount',0):.0f}\n"
             send_tg(msg[:4000])
-    elif low.startswith("/help"):
-        send_tg("📋 /start /bundle <addr> [chain] /track_funders /listwallets /listevm /addsol /addevm /removesol /removeevm /holdings /pnl /testalert")
-    elif low.startswith("/testalert"):
-        send_tg("✅ V3.18 SAFE $10+ EVM+SOL + VIP NEW CHILD + 30D PRUNE WORKING")
+    elif low == "/clusters":
+        if not cluster_memory: send_tg("No clusters yet.")
+        else:
+            msg="Recent clusters:\n"
+            for mint,ev in list(cluster_memory.items())[-10:]: msg+=f"{mint[:8]}... {len(ev)} buys\n"
+            send_tg(msg[:4000])
+    elif low == "/help":
+        send_tg("Commands:\n/start status\n/bundle <addr> [chain]\n/track_funders\n/listwallets /listevm\n/addsol <addr>\n/addevm <addr>\n/removesol <addr>\n/removeevm <addr>\n/holdings\n/clusters\n/pnl\n/testalert")
+    elif low == "/testalert":
+        send_tg(f"V3.18 FIXED WORKING\n{len(SOL_WALLETS)} SOL {len(EVM_WALLETS)} EVM\nPrune 30d active\nBuy/sell $10+ active\nCluster 1D 12h active")
 
 def set_bot_commands():
-    cmds=[{"command":"start","description":"Status V3.18"},{"command":"bundle","description":"Bundle tree"},{"command":"track_funders","description":"List funders"},{"command":"listwallets","description":"List SOL"},{"command":"listevm","description":"List EVM"},{"command":"pnl","description":"PnL"},{"command":"testalert","description":"Test"}]
+    cmds=[
+        {"command":"start","description":"Status V3.18 FIXED"},
+        {"command":"bundle","description":"Bundle tree Funder->Splitter"},
+        {"command":"track_funders","description":"List funders/splitters"},
+        {"command":"listwallets","description":"List SOL wallets"},
+        {"command":"listevm","description":"List EVM wallets"},
+        {"command":"addsol","description":"Add SOL wallet"},
+        {"command":"addevm","description":"Add EVM wallet"},
+        {"command":"removesol","description":"Remove SOL wallet"},
+        {"command":"removeevm","description":"Remove EVM wallet"},
+        {"command":"holdings","description":"Holdings history"},
+        {"command":"clusters","description":"Cluster history"},
+        {"command":"pnl","description":"PnL history"},
+        {"command":"testalert","description":"Test bot"},
+        {"command":"help","description":"All commands"}
+    ]
     try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",json={"commands":cmds},timeout=10)
     except: pass
 
@@ -641,15 +686,15 @@ def heartbeat():
             try: requests.get(f"http://127.0.0.1:{port}/health",timeout=5)
             except: pass
             mins=int((datetime.now()-last_tx_time).total_seconds()/60)
-            print(f"HEARTBEAT V3.18 {mins}m q:{len(tg_queue)} SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} active:{len(last_active)}", flush=True)
+            print(f"HEARTBEAT V3.18 FIX {mins}m q:{len(tg_queue)} SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} active:{len(last_active)}", flush=True)
         except: pass
 
 async def main_loop():
-    print(f">>> V3.18 PRUNE {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM", flush=True)
+    print(f">>> V3.18 FIXED PRUNE {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM", flush=True)
     threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=track_funders_polling, daemon=True).start()
     threading.Thread(target=prune_inactive, daemon=True).start()
-    send_tg(f"🚀 *V3.18 DEPLOYED — PRUNE 30D*\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n✅ $10+ CLEAN\n✅ Funder→Splitter→Children ALL tracked\n✅ VIP NEW CHILD FIRST BUY 🌱🚀\n✅ Auto-delete dead >30d (Funder/Splitter safe)\nUse /bundle <wallet> to seed"); set_bot_commands()
+    send_tg(f"V3.18 FIXED DEPLOYED - PRUNE 30D\n{len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM\n$10+ CLEAN\nFunder->Splitter->Children ALL tracked\nVIP NEW CHILD FIRST BUY\nAuto-delete dead >30d (Funder/Splitter safe)\n/start now fixed"); set_bot_commands()
     tasks=[track_chain(c) for c in RPCS_FALLBACK.keys()]
     tasks.append(track_sol_polling())
     await asyncio.gather(*tasks)
@@ -671,7 +716,11 @@ if __name__=="__main__":
                 for u in r.get("result",[]):
                     off=u["update_id"]+1
                     txt=u.get("message",{}).get("text","")
-                    if txt.startswith("/"): handle_command(txt)
-            except: time.sleep(4)
+                    if txt and txt.startswith("/"):
+                        print(f"CMD RECEIVED: {txt}", flush=True)
+                        handle_command(txt)
+            except Exception as e:
+                print(f"poll err {e}", flush=True)
+                time.sleep(4)
     threading.Thread(target=poll_cmd,daemon=True).start()
     time.sleep(1); start_bot()
