@@ -4,6 +4,10 @@ from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from web3 import Web3
 
+# === PERSISTENT PATH FIX ===
+DATA_DIR = "/data" if os.path.exists("/data") else "."
+def p(f): return os.path.join(DATA_DIR, f)
+
 SOL_WALLETS = [
 "Beqv6dzTcjV2eodo8RRXCiCcnSYrS1vkQKhfqwHXqeit","5t8FA8z7SFiEpjau2nTBYKN8jd5CGo8Ttcgt1m73C7d",
 "6xmMW5JPSEfeRuNdkxixHWsm4Sf57SdXybA3BdwZzrM1","2Ysos2B2S6rb9FBNYUB7Yrk54Xv2nNbr8eBHs1sX8M6m",
@@ -16,6 +20,8 @@ SOL_WALLETS = [
 "6My97BBVoJz3j7mQWFVz5pykFxMsCs44gjhaqmczcAND","D9tPQeij7vSTZwkxzxZibso4GFuRW8aBMpCg5QhCSfVL",
 "59mWSDjx5VFQz15FGJio8BJzupKorK5SVHSbaJaZGAxC",
 "3zs5nZyqTZmjvvaNTRnfNZyhNzuu7WW9BrJL31gGyPVY",
+# ADD YOUR NEW FOUNDERS HERE AFTER /listwallets so they survive even without disk
+"C2UdM2JiKg9xFETQpXBxynACovJuFYer9SKVm2",
 ]
 EVM_WALLETS = [
 "0xfd87eda88be6c372453b721da63d58ad1a5b2d94","0x2a17e1e796dd7bd3b27efe2cda72d4b909baaacf",
@@ -27,9 +33,10 @@ EVM_WALLETS = [
 "0xb02208d1b27811480cf6171bccc2b7af9513cddb","0x06de9c48b1e639ed5c13ec8fbd4080a38e39f2d1",
 "0x1890e719822bc704c4f117aa4109401c2bab6f79","0xd4cf04bc9d7c80b49c6c30a633f7b9bd5370b4d6",
 "0x7f6e4e1e59be05dc717c8e5429154a7408609ee2",
+"0x0819955F989A720B76E41Da601e38CD4556eF8ed",
 ]
 
-WALLETS_FILE="wallets.json"; MEMORY_FILE="cluster_memory.json"; FUNDERS_FILE="funders.json"; NEW_CHILDREN_FILE="new_children.json"; LAST_ACTIVE_FILE="last_active.json"; LABELS_FILE="labels.json"; GROUPS_FILE="groups.json"
+WALLETS_FILE=p("wallets.json"); MEMORY_FILE=p("cluster_memory.json"); FUNDERS_FILE=p("funders.json"); NEW_CHILDREN_FILE=p("new_children.json"); LAST_ACTIVE_FILE=p("last_active.json"); LABELS_FILE=p("labels.json"); GROUPS_FILE=p("groups.json")
 cluster_memory=defaultdict(list)
 seen_sigs=set(); cluster_alerted={}; funder_cache={}; tg_queue=deque()
 STABLES={"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB","So11111111111111111111111111111111111111112"}
@@ -44,7 +51,13 @@ def load_wallets():
     global SOL_WALLETS, EVM_WALLETS, known_splitters, known_funders, new_children, last_active, wallet_labels, wallet_groups
     try:
         if os.path.exists(WALLETS_FILE):
-            d=json.load(open(WALLETS_FILE)); SOL_WALLETS=d.get("sol",SOL_WALLETS); EVM_WALLETS=d.get("evm",EVM_WALLETS)
+            d=json.load(open(WALLETS_FILE));
+            # MERGE - not overwrite, so new bundles survive
+            saved_sol=d.get("sol",[]); saved_evm=d.get("evm",[])
+            for w in saved_sol:
+                if w not in SOL_WALLETS: SOL_WALLETS.append(w)
+            for w in saved_evm:
+                if w.lower() not in [x.lower() for x in EVM_WALLETS]: EVM_WALLETS.append(w)
     except: pass
     try:
         if os.path.exists(FUNDERS_FILE):
@@ -62,6 +75,7 @@ def load_wallets():
     try:
         if os.path.exists(GROUPS_FILE): wallet_groups=json.load(open(GROUPS_FILE))
     except: pass
+
 def save_wallets():
     try: json.dump({"sol":SOL_WALLETS,"evm":EVM_WALLETS}, open(WALLETS_FILE,"w"))
     except: pass
@@ -106,17 +120,13 @@ def get_label(addr):
     lbl = wallet_labels.get(addr.lower(), wallet_labels.get(addr, ""))
     if lbl: return lbl
     return wallet_groups.get(addr.lower(), "")
-
-# CLEAN DISPLAY
 def short(a):
     try: return f"{a[:4]}..{a[-4:]}" if len(a)>8 else a
     except: return "?"
 def format_wallet(addr, is_new_child=False, parent_addr=None):
     lbl = wallet_labels.get(addr.lower(), wallet_groups.get(addr.lower(),""))
     sh = short(addr)
-    # compact code tag
-    if is_new_child:
-        return f"<code>{sh}</code>"
+    if is_new_child: return f"<code>{sh}</code>"
     if lbl: return f"{lbl} <code>{sh}</code>"
     return f"<code>{sh}</code>"
 
@@ -148,7 +158,7 @@ def prune_inactive():
                 new_children.discard(w.lower()); last_active.pop(w.lower(),None)
             if removed>0:
                 save_wallets(); save_new_children(); save_last_active()
-                send_tg(f"🧹 Auto-cleaned {removed} dead &gt;30d")
+                send_tg(f"🧹 Auto-cleaned {removed}")
         except Exception as e: print(f"prune err {e}", flush=True)
 
 SOLANA_PUB_RPCS=["https://api.mainnet-beta.solana.com","https://solana-rpc.publicnode.com"]
@@ -179,14 +189,14 @@ except: pass
 
 app=Flask(__name__)
 @app.route('/')
-def home(): return "Shok V4.9 CLEAN",200
+def home(): return "Shok V4.9.1 PERSIST",200
 @app.route('/health')
 def health(): return "OK",200
 @app.route('/debug')
 def debug():
     try:
         groups_len = len(set(wallet_groups.values())) if wallet_groups else 0
-        return f"V4.9 CLEAN SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} Groups:{groups_len} Last:{int((datetime.now()-last_tx_time).total_seconds()/60)}m",200
+        return f"V4.9.1 SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} Groups:{groups_len} Last:{int((datetime.now()-last_tx_time).total_seconds()/60)}m DIR:{DATA_DIR}",200
     except Exception as e:
         return f"DEBUG ERR {e}",200
 def run_flask(): app.run(host='0.0.0.0',port=int(os.getenv("PORT",10000)))
@@ -258,8 +268,7 @@ def get_sol_transfers_cached(sig):
 def analyze_wallet_bundle(wallet):
     global last_bundle, pending_label, bundle_in_progress
     if bundle_in_progress:
-        send_tg("⏳ Bundle busy, wait 20s...")
-        return
+        send_tg("⏳ Bundle busy..."); return
     bundle_in_progress=True
     wallet=wallet.strip()
     send_tg(f"🔍 Scanning <code>{short(wallet)}</code> (deep 100)...")
@@ -306,7 +315,7 @@ def analyze_wallet_bundle(wallet):
             save_wallets(); save_new_children(); known_splitters.add(wallet); known_funders.add(wallet); save_funders()
             last_bundle={"addresses":all_group,"funder":wallet,"root":wallet,"time":datetime.now().isoformat()}
             pending_label=True
-            msg=f"<b>ROOT</b> <code>{short(wallet)}</code>\nFunded {len(children)} children:\n" + "\n".join([f"• <code>{short(c)}</code> {a:.3f} SOL" for c,a in children[:10]])
+            msg=f"<b>ROOT</b> <code>{short(wallet)}</code>\nFunded {len(children)} children:\n" + "\n".join([f"• <code>{short(c)}</code> {a:.3f}" for c,a in children[:10]])
             msg+=f"\n\n✅ +{added} added → /labelgroup &lt;name&gt; or /skip"
             send_tg(msg)
         else:
@@ -353,14 +362,11 @@ def analyze_evm_bundle(chain, wallet):
                                 if val>=0.001:
                                     funder=(tx.get("from"), val); break
                         except: continue
-        except Exception as e:
-            print(f"blockscout err {e}", flush=True)
-
+        except: pass
         if not funder:
             w3=get_w3_with_fallback(chain)
             if w3:
-                latest=w3.eth.block_number
-                start=time.time()
+                latest=w3.eth.block_number; start=time.time()
                 for bn in range(latest, max(latest-8000,0), -1):
                     if time.time()-start>20: break
                     try:
@@ -372,16 +378,14 @@ def analyze_evm_bundle(chain, wallet):
                                     funder=(tx.get('from'), val); break
                         if funder: break
                     except: continue
-
         if not funder:
-            send_tg(f"💤 <b>ROOT EVM</b> {chain} <code>{short(wallet)}</code>\nNo funder - CEX funded")
+            send_tg(f"💤 <b>ROOT EVM</b> {chain} <code>{short(wallet)}</code>\nNo funder - CEX")
             if wallet.lower() not in [x.lower() for x in EVM_WALLETS]:
                 EVM_WALLETS.append(wallet_chk); save_wallets()
                 last_bundle={"addresses":[wallet],"funder":wallet,"root":wallet,"time":datetime.now().isoformat()}
                 pending_label=True
                 send_tg(f"Added ROOT: <code>{short(wallet)}</code>\n/labelgroup &lt;name&gt; or /skip")
             bundle_in_progress=False; return
-
         funder_addr, amt = funder
         try:
             if chain=="BASE":
@@ -398,10 +402,8 @@ def analyze_evm_bundle(chain, wallet):
                                     siblings.append((to_addr, val))
                         except: continue
         except: pass
-
         msg=f"<b>BUNDLE</b> {chain} <code>{short(wallet)}</code>\nFunder <code>{short(funder_addr)}</code> {amt:.4f}\n"
         if siblings: msg+=f"<b>{len(siblings)} sibs:</b>\n" + "\n".join([f"• <code>{short(s)}</code> {a:.4f}" for s,a in siblings[:8]])
-        else: msg+="No siblings\n"
         added=0; all_group=[wallet, funder_addr]
         if funder_addr.lower() not in [x.lower() for x in EVM_WALLETS]:
             try: EVM_WALLETS.append(Web3.to_checksum_address(funder_addr))
@@ -492,7 +494,7 @@ def process_sol_tx_public(wallet_list, parsed, sig):
         send_tg(f"🔴 <b>SELL</b> <b>{name}</b> {mcap}\n💰 ${usd:,.2f}\n👤 {label_str}\n{dex_short} | {tx_short}")
 
 async def track_sol_polling():
-    print("SOL V4.9 CLEAN $10+", flush=True)
+    print(f"SOL V4.9.1 PERSIST $10+ DIR:{DATA_DIR}", flush=True)
     while True:
         for w in SOL_WALLETS[-50:]:
             try:
@@ -571,7 +573,7 @@ async def track_chain(chain):
         except Exception as e: print(f"[{chain}] err {e}", flush=True); await asyncio.sleep(5)
 
 def track_funders_polling():
-    print("Funder watcher V4.9 CLEAN 60s", flush=True)
+    print(f"Funder watcher V4.9.1 DIR:{DATA_DIR}", flush=True)
     while True:
         time.sleep(60)
         try:
@@ -603,7 +605,7 @@ def track_funders_polling():
                                 time.sleep(0.8)
                     if len(splitter_child_count[funder])>=2 and funder not in known_splitters:
                         known_splitters.add(funder); save_funders()
-                        send_tg(f"⬆️ <b>PROMOTE SPLITTER</b>\n<code>{short(funder)}</code> funded {len(splitter_child_count[funder])} → SPLITTER")
+                        send_tg(f"⬆️ <b>PROMOTE</b> <code>{short(funder)}</code> → SPLITTER")
                 except: continue
         except Exception as e: print(f"recursive SOL err {e}", flush=True)
         time.sleep(10)
@@ -682,7 +684,7 @@ def handle_command(text):
                 for k in list(d.keys()):
                     if k.lower()==addr.lower(): del d[k]; removed=True
             save_labels(); save_groups()
-            send_tg(f"Removed <code>{short(addr)}</code>" if removed else f"No label for <code>{short(addr)}</code>")
+            send_tg(f"Removed <code>{short(addr)}</code>" if removed else f"No label")
             return
         elif cmd=="/labels":
             if not wallet_groups and not wallet_labels:
@@ -697,7 +699,7 @@ def handle_command(text):
         if cmd=="/start":
             groups_count=len(set(wallet_groups.values())) if wallet_groups else 0
             mins=int((datetime.now()-last_tx_time).total_seconds()/60)
-            send_tg(f"<b>V4.9 CLEAN LIVE</b>\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)}\nGroups:{groups_count} Last:{mins}m\n/bundle → /labelgroup")
+            send_tg(f"<b>V4.9.1 PERSIST LIVE</b>\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)}\nGroups:{groups_count} Last:{mins}m DIR:{DATA_DIR}")
         elif cmd=="/bundle":
             if len(args)<2: send_tg("Usage: /bundle &lt;addr&gt; [BASE/BSC]")
             else:
@@ -717,20 +719,20 @@ def handle_command(text):
         elif cmd=="/listevm":
             evm="\n".join([f"{i+1}. {format_wallet(w)}" for i,w in enumerate(EVM_WALLETS[-20:])])
             send_tg(f"<b>EVM {len(EVM_WALLETS)}:</b>\n{evm}")
-        elif cmd=="/testalert": send_tg(f"✅ V4.9 CLEAN WORKING")
+        elif cmd=="/testalert": send_tg(f"✅ V4.9.1 PERSIST WORKING DIR:{DATA_DIR}")
         elif cmd=="/help": send_tg("/bundle &lt;addr&gt; [BASE/BSC]\n/labelgroup &lt;name&gt;\n/labels\n/skip")
     except Exception as e:
         print(f"cmd err {e}",flush=True)
 
 def set_bot_commands():
     cmds=[
-        {"command":"start","description":"V4.9 status"},
+        {"command":"start","description":"V4.9.1 status"},
         {"command":"bundle","description":"Bundle deep"},
         {"command":"labelgroup","description":"Label bundle"},
         {"command":"skip","description":"Skip"},
         {"command":"label","description":"Label wallet"},
         {"command":"labels","description":"List groups"},
-        {"command":"unlabel","description":"Remove label"},
+        {"command":"unlabel","description":"Remove"},
         {"command":"track_funders","description":"Splitters"},
         {"command":"listwallets","description":"List SOL"},
         {"command":"listevm","description":"List EVM"},
@@ -745,15 +747,15 @@ def heartbeat():
         time.sleep(120)
         try:
             mins=int((datetime.now()-last_tx_time).total_seconds()/60)
-            print(f"HEARTBEAT V4.9 CLEAN {mins}m SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)}", flush=True)
+            print(f"HEARTBEAT V4.9.1 {mins}m SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} DIR:{DATA_DIR}", flush=True)
         except: pass
 
 async def main_loop():
-    print(f">>> V4.9 CLEAN {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM", flush=True)
+    print(f">>> V4.9.1 PERSIST {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM DIR:{DATA_DIR}", flush=True)
     threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=track_funders_polling, daemon=True).start()
     threading.Thread(target=prune_inactive, daemon=True).start()
-    send_tg(f"<b>V4.9 CLEAN DEPLOYED</b>\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)}\nClean Chart|Tx links\n/bundle → /labelgroup"); set_bot_commands()
+    send_tg(f"<b>V4.9.1 PERSIST DEPLOYED</b>\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)}\nDIR:{DATA_DIR}\nClean links + Deep scan"); set_bot_commands()
     tasks=[track_chain("BASE"), track_chain("BSC"), track_sol_polling()]
     await asyncio.gather(*tasks)
 
