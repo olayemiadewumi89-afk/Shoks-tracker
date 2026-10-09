@@ -101,8 +101,7 @@ def mark_active(wallet):
         last_active[wallet.lower()]=datetime.now().isoformat()
         if len(last_active)%30==0: save_last_active()
     except: pass
-def get_group(addr):
-    return wallet_groups.get(addr.lower(), "")
+def get_group(addr): return wallet_groups.get(addr.lower(), "")
 def get_label(addr):
     lbl = wallet_labels.get(addr.lower(), wallet_labels.get(addr, ""))
     if lbl: return lbl
@@ -158,7 +157,7 @@ rpc_idx=0
 def get_public_rpc():
     global rpc_idx, last_rpc_call
     now=time.time()
-    if now-last_rpc_call<0.6: time.sleep(0.6-(now-last_rpc_call))
+    if now-last_rpc_call<0.5: time.sleep(0.5-(now-last_rpc_call))
     last_rpc_call=time.time()
     url=SOLANA_PUB_RPCS[rpc_idx % len(SOLANA_PUB_RPCS)]; rpc_idx+=1
     return url
@@ -181,18 +180,16 @@ except: pass
 
 app=Flask(__name__)
 @app.route('/')
-def home(): return "Shok V4.6 MERGED FIXED",200
+def home(): return "Shok V4.7 INNER FIX",200
 @app.route('/health')
 def health(): return "OK",200
 @app.route('/debug')
 def debug():
     try:
         groups_len = len(set(wallet_groups.values())) if wallet_groups else 0
-        labels_len = len(wallet_labels)
-        mins = int((datetime.now() - last_tx_time).total_seconds() / 60)
-        return f"V4.6 SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} Groups:{groups_len} Labels:{labels_len} Last:{mins}m Busy:{bundle_in_progress}", 200
+        return f"V4.7 SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} Groups:{groups_len} Last:{int((datetime.now()-last_tx_time).total_seconds()/60)}m Busy:{bundle_in_progress}",200
     except Exception as e:
-        return f"DEBUG ERR {e}", 200
+        return f"DEBUG ERR {e}",200
 def run_flask(): app.run(host='0.0.0.0',port=int(os.getenv("PORT",10000)))
 
 def send_tg_worker():
@@ -230,6 +227,7 @@ def get_token_info_quick(token_address, chain_hint="SOL"):
         return name, mcap, dex_link, price, best.get('chainId','SOL').upper(), liq, best.get('pairAddress',token_address)
     except: return None
 
+# V4.7 FIXED - CATCHES INNER INSTRUCTIONS (your HsQV bug)
 def get_sol_transfers_cached(sig):
     if sig in funder_cache and (datetime.now()-funder_cache[sig][0]).total_seconds()<300:
         return funder_cache[sig][1]
@@ -239,117 +237,99 @@ def get_sol_transfers_cached(sig):
         payload={"jsonrpc":"2.0","id":1,"method":"getTransaction","params":[sig, {"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]}
         r=requests.post(rpc_url, json=payload, timeout=12)
         res=r.json().get("result")
-        if not res: funder_cache[sig]=(datetime.now(),[]); return []
+        if not res:
+            funder_cache[sig]=(datetime.now(),[]); return []
+        # outer
         for instr in res.get("transaction",{}).get("message",{}).get("instructions",[]):
             try:
                 if instr.get("program")=="system" and instr.get("parsed",{}).get("type")=="transfer":
-                    info=instr["parsed"]["info"]; lamports=info.get("lamports",0)
-                    transfers.append((info["source"], info["destination"], lamports/1e9, sig))
+                    info=instr["parsed"]["info"]
+                    transfers.append((info["source"], info["destination"], float(info.get("lamports",0))/1e9, sig))
             except: continue
+        # inner - THIS IS THE KEY FIX for HsQV wallet
+        for inner in res.get("meta",{}).get("innerInstructions",[]) or []:
+            for instr in inner.get("instructions",[]) or []:
+                try:
+                    if instr.get("program")=="system" and instr.get("parsed",{}).get("type")=="transfer":
+                        info=instr["parsed"]["info"]
+                        transfers.append((info["source"], info["destination"], float(info.get("lamports",0))/1e9, sig))
+                except: continue
     except: pass
     funder_cache[sig]=(datetime.now(),transfers)
     if len(funder_cache)>500: funder_cache.clear()
     return transfers
 
-# V4.6 FIXED SOL BUNDLE - BI-DIRECTIONAL (fixes your D9tP... no funder bug)
 def analyze_wallet_bundle(wallet):
     global last_bundle, pending_label, bundle_in_progress
     if bundle_in_progress:
-        send_tg("Bundle already running, wait 20s...")
+        send_tg("Bundle busy, wait 20s...")
         return
     bundle_in_progress=True
     wallet=wallet.strip()
     send_tg(f"Scanning SOL {format_wallet(wallet)}...")
     try:
-        rpc_url=get_public_rpc()
-        payload={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress","params":[wallet, {"limit":20}]}
-        r=requests.post(rpc_url, json=payload, timeout=12).json()
+        payload={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress","params":[wallet, {"limit":30}]}
+        r=requests.post(get_public_rpc(), json=payload, timeout=15).json()
         sigs=r.get("result",[]); funders=[]; children=[]
-        for item in sigs[:15]:
+        for item in sigs[:25]:
             sig=item.get("signature")
             if not sig: continue
             for frm,to,amt,_ in get_sol_transfers_cached(sig):
-                if to==wallet and amt>=0.01:
+                if to==wallet and amt>=0.008:
                     if frm not in [f[0] for f in funders]: funders.append((frm, amt, sig))
-                if frm==wallet and amt>=0.01 and to!=wallet:
+                if frm==wallet and amt>=0.008 and to!=wallet:
                     if to not in [c[0] for c in children]: children.append((to, amt))
         if funders:
             main_funder, amt, _ = funders[0]; siblings=[]
-            payload2={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress","params":[main_funder, {"limit":20}]}
-            r2=requests.post(get_public_rpc(), json=payload2, timeout=12).json()
-            for item in r2.get("result",[])[:15]:
+            payload2={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress","params":[main_funder, {"limit":30}]}
+            r2=requests.post(get_public_rpc(), json=payload2, timeout=15).json()
+            for item in r2.get("result",[])[:20]:
                 s=item.get("signature")
                 if not s: continue
                 for frm,to,amt2,_ in get_sol_transfers_cached(s):
-                    if frm==main_funder and amt2>=0.01 and to!=wallet:
+                    if frm==main_funder and amt2>=0.008 and to!=wallet:
                         if to not in [x[0] for x in siblings]: siblings.append((to, amt2))
-            grandparent=None
-            try:
-                payload3={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress","params":[main_funder, {"limit":10}]}
-                r3=requests.post(get_public_rpc(), json=payload3, timeout=12).json()
-                for item in r3.get("result",[])[:8]:
-                    s=item.get("signature")
-                    if not s: continue
-                    for frm,to,amt4,_ in get_sol_transfers_cached(s):
-                        if to==main_funder and amt4>=0.1: grandparent=(frm, amt4); break
-                    if grandparent: break
-            except: pass
-            msg=f"BUNDLE SOL {format_wallet(wallet)}\n"
-            if grandparent: msg+=f"FUNDER: {format_wallet(grandparent[0])} {grandparent[1]:.2f} SOL\n"
-            msg+=f"SPLITTER: {format_wallet(main_funder)} -> you {amt:.3f} SOL\n\n"
-            if siblings: msg+=f"SIBLINGS {len(siblings)}:\n" + "".join([f" - {format_wallet(s)} {a:.2f}\n" for s,a in siblings[:6]])
-            all_group=[wallet, main_funder] + [s for s,_ in siblings[:6]]
-            if grandparent: all_group.append(grandparent[0])
-            added=0; to_add=[]
-            for addr in all_group:
-                if addr==wallet: continue
-                if addr not in SOL_WALLETS and addr not in to_add: to_add.append(addr)
-            for addr in to_add[:12]:
-                if len(SOL_WALLETS)>=150: break
-                if addr not in SOL_WALLETS: SOL_WALLETS.append(addr); added+=1
-                known_splitters.add(main_funder)
-                if grandparent: known_funders.add(grandparent[0])
-                new_children.add(addr.lower()); mark_active(addr)
-            if added>0: save_wallets(); save_funders(); save_new_children(); save_last_active()
+            all_group=[wallet, main_funder] + [s for s,_ in siblings[:8]]
+            added=0
+            for addr in [a for a in all_group if a!=wallet]:
+                if addr not in SOL_WALLETS and len(SOL_WALLETS)<150:
+                    SOL_WALLETS.append(addr); added+=1; new_children.add(addr.lower()); mark_active(addr)
+            if added>0: save_wallets(); save_new_children(); save_last_active()
+            known_splitters.add(main_funder); save_funders()
             last_bundle={"addresses":all_group,"funder":main_funder,"root":wallet,"time":datetime.now().isoformat()}
             pending_label=True
-            msg+=f"\nAuto-added {added} wallets\nLABELLING:\nBundle {len(all_group)} wallets\nReply:\n/labelgroup <name>\n/skip"
+            msg=f"BUNDLE SOL {format_wallet(wallet)}\nSPLITTER {format_wallet(main_funder)} {amt:.3f}\nSIBLINGS {len(siblings)}\n" + "".join([f" - {format_wallet(s)} {a:.3f}\n" for s,a in siblings[:6]])
+            msg+=f"\nAuto-added {added} - /labelgroup <name> or /skip"
             send_tg(msg[:3500])
         elif children:
-            all_group=[wallet] + [c for c,_ in children[:10]]
-            msg=f"BUNDLE SOL ROOT {format_wallet(wallet)}\nThis is a FUNDER - funded {len(children)} wallets:\n"
-            msg+="".join([f" - {format_wallet(c)} {a:.2f} SOL\n" for c,_ in children[:8]])
-            known_funders.add(wallet); known_splitters.add(wallet)
+            all_group=[wallet] + [c for c,_ in children[:12]]
             added=0
-            for c, amt in children[:10]:
-                if c not in SOL_WALLETS:
-                    SOL_WALLETS.append(c); added+=1
-                    new_children.add(c.lower()); mark_active(c)
-            save_wallets(); save_funders(); save_new_children()
+            for c, _ in children[:12]:
+                if c not in SOL_WALLETS and len(SOL_WALLETS)<150:
+                    SOL_WALLETS.append(c); added+=1; new_children.add(c.lower()); mark_active(c)
+            save_wallets(); save_new_children(); save_funders()
+            known_splitters.add(wallet); known_funders.add(wallet); save_funders()
             last_bundle={"addresses":all_group,"funder":wallet,"root":wallet,"time":datetime.now().isoformat()}
             pending_label=True
-            msg+=f"\nAuto-added {added} CHILD wallets (ROOT FUNDER)\nLABELLING:\nBundle {len(all_group)} wallets\nReply:\n/labelgroup <name>\n/skip"
+            msg=f"BUNDLE SOL ROOT {format_wallet(wallet)}\nFunded {len(children)} children (inner scan):\n" + "".join([f" - {format_wallet(c)} {a:.3f} SOL\n" for c,a in children[:10]])
+            msg+=f"\nAuto-added {added} CHILDREN\n/labellgroup <name> or /skip".replace("labellgroup","labelgroup")
             send_tg(msg[:3500])
         else:
-            send_tg(f"No funder for {format_wallet(wallet)} - CEX funded solo. Use it as funder label.")
+            send_tg(f"No transfers found for {format_wallet(wallet)} in last 25 txs (checked inner too). Wallet may be dormant. Check solscan.io/tx history")
     except Exception as e: send_tg(f"Bundle err {e}")
     finally: bundle_in_progress=False
 
-# V4.6 FIXED EVM BUNDLE - TIMEOUT 15s NEVER HANGS
 def analyze_evm_bundle(chain, wallet):
     global last_bundle, pending_label, bundle_in_progress
     if bundle_in_progress:
-        send_tg("Bundle already running, wait 20s...")
+        send_tg("Bundle busy, wait 20s...")
         return
     bundle_in_progress=True
     send_tg(f"Scanning EVM {chain} {format_wallet(wallet)}...")
     try:
         w3=get_w3_with_fallback(chain)
-        if not w3: send_tg(f"{chain} RPC down - try {'BSC' if chain=='BASE' else 'BASE'}"); bundle_in_progress=False; return
-        wallet_chk=Web3.to_checksum_address(wallet)
-        latest=w3.eth.block_number
-        funder=None
-        start_time=time.time()
+        if not w3: send_tg(f"{chain} RPC down"); bundle_in_progress=False; return
+        wallet_chk=Web3.to_checksum_address(wallet); latest=w3.eth.block_number; funder=None; start_time=time.time()
         for bn in range(latest, max(latest-1500,0), -1):
             if time.time()-start_time>15: break
             try:
@@ -358,21 +338,18 @@ def analyze_evm_bundle(chain, wallet):
                     if tx.get('to','') and tx.get('to','').lower()==wallet_chk.lower() and int(tx.get('value',0))>0:
                         val=float(w3.from_wei(tx['value'],'ether'))
                         if val>=0.005:
-                            funder=(tx.get('from'), val)
-                            break
+                            funder=(tx.get('from'), val); break
                 if funder: break
             except: continue
         if not funder:
-            send_tg(f"No funder in last 1500 blocks {chain} for {format_wallet(wallet)}\nAdding as single")
+            send_tg(f"No funder in last 1500 blocks {chain} for {format_wallet(wallet)}\nAdding single")
             if wallet.lower() not in [x.lower() for x in EVM_WALLETS]:
                 EVM_WALLETS.append(wallet_chk); save_wallets()
                 last_bundle={"addresses":[wallet],"funder":"","root":wallet,"time":datetime.now().isoformat()}
                 pending_label=True
                 send_tg(f"Added single: {format_wallet(wallet)}\n/labelgroup <name> or /skip")
-            bundle_in_progress=False
-            return
-        funder_addr, amt = funder; siblings=[]
-        start_time=time.time()
+            bundle_in_progress=False; return
+        funder_addr, amt = funder; siblings=[]; start_time=time.time()
         try:
             latest=w3.eth.block_number
             for bn in range(latest, max(latest-1000,0), -1):
@@ -385,8 +362,8 @@ def analyze_evm_bundle(chain, wallet):
                             to_addr=tx.get('to','')
                             if to_addr.lower()!=wallet.lower():
                                 val=float(w3.from_wei(tx['value'],'ether'))
-                                if val>=0.005:
-                                    if to_addr.lower() not in [s[0].lower() for s in siblings]: siblings.append((to_addr, val))
+                                if val>=0.005 and to_addr.lower() not in [s[0].lower() for s in siblings]:
+                                    siblings.append((to_addr, val))
                 except: continue
         except: pass
         msg=f"BUNDLE {chain} {format_wallet(wallet)}\nFUNDER {format_wallet(funder_addr)} {amt:.4f}\n\n"
@@ -400,17 +377,14 @@ def analyze_evm_bundle(chain, wallet):
             if sib.lower() not in [x.lower() for x in EVM_WALLETS]:
                 try: EVM_WALLETS.append(Web3.to_checksum_address(sib))
                 except: EVM_WALLETS.append(sib)
-                added+=1; new_children.add(sib.lower()); mark_active(sib)
-                all_group.append(sib)
+                added+=1; new_children.add(sib.lower()); mark_active(sib); all_group.append(sib)
         if added>0: save_wallets(); save_funders(); save_new_children(); save_last_active()
         last_bundle={"addresses":all_group,"funder":funder_addr,"root":wallet,"time":datetime.now().isoformat()}
         pending_label=True
-        msg+=f"\nAuto-added {added} EVM\nLABELLING:\nBundle {len(all_group)} wallets\nReply:\n/labelgroup <name>\n/skip"
+        msg+=f"\nAuto-added {added} EVM\n/labellgroup <name> or /skip".replace("labellgroup","labelgroup")
         send_tg(msg[:3500])
-    except Exception as e:
-        send_tg(f"EVM bundle err {e}")
-    finally:
-        bundle_in_progress=False
+    except Exception as e: send_tg(f"EVM bundle err {e}")
+    finally: bundle_in_progress=False
 
 def check_cluster_1d(mint, name, mcap, dex_link, chain):
     now=datetime.now(); events=cluster_memory.get(mint,[]); recent=[e for e in events if (now-e[1])<=timedelta(days=1)]
@@ -480,7 +454,7 @@ def process_sol_tx_public(wallet_list, parsed, sig):
         send_tg(f"SOL SELL $10+\n{name} ({mcap})\nWallet: {label_str} ${usd:,.2f}\n{dex_link}")
 
 async def track_sol_polling():
-    print("SOL V4.6 MERGED $10+", flush=True)
+    print("SOL V4.7 INNER $10+", flush=True)
     while True:
         for w in SOL_WALLETS[-50:]:
             try:
@@ -560,7 +534,7 @@ async def track_chain(chain):
         except Exception as e: print(f"[{chain}] err {e}", flush=True); await asyncio.sleep(5)
 
 def track_funders_polling():
-    print("Funder watcher V4.6 60s", flush=True)
+    print("Funder watcher V4.7 60s", flush=True)
     while True:
         time.sleep(60)
         try:
@@ -580,7 +554,7 @@ def track_funders_polling():
                         sig=item.get("signature")
                         if not sig: continue
                         for frm,to,amt,_ in get_sol_transfers_cached(sig):
-                            if frm==funder and amt>=0.05 and to not in SOL_WALLETS:
+                            if frm==funder and amt>=0.02 and to not in SOL_WALLETS:
                                 parent_group = get_group(frm) or wallet_labels.get(frm.lower(),"")
                                 if parent_group:
                                     wallet_groups[to.lower()]=parent_group
@@ -588,7 +562,7 @@ def track_funders_polling():
                                 SOL_WALLETS.append(to); new_children.add(to.lower()); mark_active(to)
                                 splitter_child_count[funder].add(to.lower())
                                 save_wallets(); save_new_children(); save_last_active()
-                                send_tg(f"NEW CHILD FUNDED! RECURSIVE\nParent {format_wallet(funder)} -> {format_wallet(to, is_new_child=True, parent_addr=funder)} {amt:.2f} SOL\nGroup: {parent_group or 'No group'}\nTotal SOL:{len(SOL_WALLETS)}")
+                                send_tg(f"NEW CHILD FUNDED! RECURSIVE\nParent {format_wallet(funder)} -> {format_wallet(to, is_new_child=True, parent_addr=funder)} {amt:.3f} SOL\nGroup: {parent_group or 'No group'}")
                                 time.sleep(0.8)
                     if len(splitter_child_count[funder])>=2 and funder not in known_splitters:
                         known_splitters.add(funder); save_funders()
@@ -614,7 +588,7 @@ def track_funders_polling():
                                 to_addr=tx.get('to','')
                                 if to_addr and to_addr.lower() not in [x.lower() for x in EVM_WALLETS]:
                                     val=float(w3.from_wei(tx['value'],'ether'))
-                                    if val>=0.02:
+                                    if val>=0.005:
                                         parent_group = get_group(funder) or wallet_labels.get(funder.lower(),"")
                                         if parent_group:
                                             wallet_groups[to_addr.lower()]=parent_group
@@ -655,13 +629,10 @@ def handle_command(text):
             for addr in last_bundle["addresses"]:
                 if not addr: continue
                 wallet_groups[addr.lower()]=group_name
-                if addr.lower()==last_bundle.get("root","").lower() or addr.lower()==last_bundle.get("funder","").lower():
-                    if addr.lower() not in wallet_labels:
-                        wallet_labels[addr.lower()]=group_name
                 count+=1
             save_groups(); save_labels()
             pending_label=False
-            send_tg(f"Group '{group_name}' -> {count} wallets\nFuture children = '{group_name} -> NEW CHILD'")
+            send_tg(f"Group '{group_name}' -> {count} wallets\nFuture children auto-labeled")
             return
         if cmd=="/label":
             if len(args)<3:
@@ -670,7 +641,6 @@ def handle_command(text):
             addr=args[1].strip()
             label_name=" ".join(args[2:]).strip()[:30]
             wallet_labels[addr.lower()]=label_name
-            wallet_labels[addr]=label_name
             wallet_groups[addr.lower()]=label_name
             save_labels(); save_groups()
             send_tg(f"Labeled {short(addr)} as '{label_name}'")
@@ -687,22 +657,19 @@ def handle_command(text):
             return
         elif cmd=="/labels":
             if not wallet_groups and not wallet_labels:
-                send_tg("No labels yet.")
-                return
+                send_tg("No labels yet."); return
             groups=defaultdict(list)
-            for addr, grp in wallet_groups.items():
-                groups[grp].append(addr)
+            for addr, grp in wallet_groups.items(): groups[grp].append(addr)
             msg=f"Groups {len(groups)}:\n"
             for grp, addrs in list(groups.items())[:10]:
                 msg+=f"\n'{grp}' {len(addrs)}:\n" + "\n".join([f" - {short(a)} {a}" for a in addrs[:3]])
-                if len(addrs)>3: msg+=f"\n +{len(addrs)-3} more"
-                msg+="\n"
+                if len(addrs)>3: msg+=f"\n +{len(addrs)-3} more\n"
             send_tg(msg[:3500])
             return
         if cmd=="/start":
             groups_count=len(set(wallet_groups.values())) if wallet_groups else 0
             mins=int((datetime.now()-last_tx_time).total_seconds()/60)
-            send_tg(f"V4.6 MERGED FIXED LIVE\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} BASE+BSC\nGroups:{groups_count} Labels:{len(wallet_labels)}\nRECURSIVE+LABELS+NO HANG\nLast:{mins}m Spl:{len(known_splitters)} New:{len(new_children)}\n\n/bundle -> /labelgroup <name> or /skip")
+            send_tg(f"V4.7 INNER FIX LIVE\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)}\nGroups:{groups_count} Labels:{len(wallet_labels)}\nLast:{mins}m Spl:{len(known_splitters)}\n/bundle -> /labelgroup <name>")
         elif cmd=="/bundle":
             if len(args)<2: send_tg("Usage: /bundle <addr> [BASE/BSC]")
             else:
@@ -712,9 +679,9 @@ def handle_command(text):
                     threading.Thread(target=analyze_evm_bundle, args=(chain, addr), daemon=True).start()
                 else: threading.Thread(target=analyze_wallet_bundle, args=(addr,), daemon=True).start()
         elif cmd=="/track_funders":
-            if not known_splitters: send_tg("No splitters - /bundle to seed")
+            if not known_splitters: send_tg("No splitters")
             else:
-                msg=f"Splitters {len(known_splitters)}\n" + "\n".join([f"- {format_wallet(s)} ({len(splitter_child_count[s])} children)" for s in list(known_splitters)[-10:]])
+                msg=f"Splitters {len(known_splitters)}\n" + "\n".join([f"- {format_wallet(s)} ({len(splitter_child_count[s])})" for s in list(known_splitters)[-10:]])
                 send_tg(msg[:3500])
         elif cmd=="/listwallets":
             sol="\n".join([f"{i+1}. {format_wallet(w)} {w}" for i,w in enumerate(SOL_WALLETS[-20:])])
@@ -723,16 +690,16 @@ def handle_command(text):
             evm="\n".join([f"{i+1}. {format_wallet(w)} {w}" for i,w in enumerate(EVM_WALLETS[-20:])])
             send_tg((f"EVM {len(EVM_WALLETS)}:\n{evm}")[:3500])
         elif cmd=="/testalert":
-            send_tg(f"V4.6 FIXED WORKING Groups:{len(set(wallet_groups.values())) if wallet_groups else 0}")
+            send_tg(f"V4.7 WORKING")
         elif cmd=="/help":
-            send_tg("V4.6 FINAL:\n/bundle <addr>\n/labelgroup <name> or /skip\n/label <addr> <name>\n/labels /unlabel\n/track_funders /listwallets /listevm")
+            send_tg("/bundle <addr>\n/labelgroup <name> or /skip\n/label <addr> <name>\n/labels /unlabel")
     except Exception as e:
         print(f"cmd err {e}",flush=True)
 
 def set_bot_commands():
     cmds=[
-        {"command":"start","description":"V4.6 status"},
-        {"command":"bundle","description":"Bundle tree - then labelgroup"},
+        {"command":"start","description":"V4.7 status"},
+        {"command":"bundle","description":"Bundle tree"},
         {"command":"labelgroup","description":"Label last bundle"},
         {"command":"skip","description":"Skip labeling"},
         {"command":"label","description":"Label wallet"},
@@ -752,15 +719,15 @@ def heartbeat():
         time.sleep(120)
         try:
             mins=int((datetime.now()-last_tx_time).total_seconds()/60)
-            print(f"HEARTBEAT V4.6 MERGED {mins}m SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} Busy:{bundle_in_progress}", flush=True)
+            print(f"HEARTBEAT V4.7 INNER {mins}m SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} Busy:{bundle_in_progress}", flush=True)
         except: pass
 
 async def main_loop():
-    print(f">>> V4.6 MERGED FIXED {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM", flush=True)
+    print(f">>> V4.7 INNER FIX {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM", flush=True)
     threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=track_funders_polling, daemon=True).start()
     threading.Thread(target=prune_inactive, daemon=True).start()
-    send_tg(f"V4.6 MERGED FIXED DEPLOYED\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} BASE+BSC\nROOT+CHILD+BUNDLE+NO HANG\n/bundle -> /labelgroup <name>"); set_bot_commands()
+    send_tg(f"V4.7 INNER FIX DEPLOYED\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)}\nINNER SCAN FIX FOR HsQV\n/bundle -> /labelgroup"); set_bot_commands()
     tasks=[track_chain("BASE"), track_chain("BSC"), track_sol_polling()]
     await asyncio.gather(*tasks)
 
