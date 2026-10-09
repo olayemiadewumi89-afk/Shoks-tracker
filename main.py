@@ -102,12 +102,10 @@ def mark_active(wallet):
 
 def get_group(addr):
     return wallet_groups.get(addr.lower(), "")
-
 def get_label(addr):
     lbl = wallet_labels.get(addr.lower(), wallet_labels.get(addr, ""))
     if lbl: return lbl
     return wallet_groups.get(addr.lower(), "")
-
 def format_wallet(addr, is_new_child=False, parent_addr=None):
     lbl = wallet_labels.get(addr.lower(), wallet_labels.get(addr, ""))
     grp = wallet_groups.get(addr.lower(), "")
@@ -176,11 +174,21 @@ except: pass
 
 app=Flask(__name__)
 @app.route('/')
-def home(): return "Shok V4.3 FINAL MERGED SOL+BASE+BSC GROUP+RECURSIVE",200
+def home(): return "Shok V4.3 FINAL FIXED SOL+BASE+BSC",200
 @app.route('/health')
 def health(): return "OK",200
 @app.route('/debug')
-def debug(): return f"FINAL SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} Groups:{len(set(wallet_groups.values())))} Labels:{len(wallet_labels)} Last:{int((datetime.now()-last_tx_time).total_seconds()/60)}m",200
+def debug():
+    try:
+        groups_len = len(set(wallet_groups.values())) if wallet_groups else 0
+        labels_len = len(wallet_labels)
+        mins = int((datetime.now() - last_tx_time).total_seconds() / 60)
+        sol_len = len(SOL_WALLETS)
+        evm_len = len(EVM_WALLETS)
+        return f"FINAL SOL:{sol_len} EVM:{evm_len} Groups:{groups_len} Labels:{labels_len} Last:{mins}m", 200
+    except Exception as e:
+        return f"DEBUG ERR {e}", 200
+
 def run_flask(): app.run(host='0.0.0.0',port=int(os.getenv("PORT",10000)))
 
 def send_tg_worker():
@@ -282,8 +290,7 @@ def analyze_wallet_bundle(wallet):
         if grandparent: msg+=f"FUNDER: {format_wallet(grandparent[0])} {grandparent[1]:.2f} SOL\n"
         msg+=f"SPLITTER: {format_wallet(main_funder)} -> you {amt:.3f} SOL\n\n"
         if siblings: msg+=f"SIBLINGS {len(siblings)}:\n" + "".join([f" - {format_wallet(s)} {a:.2f}\n" for s,a in siblings[:6]])
-        added=0; to_add=[]
-        all_group=[wallet]
+        added=0; to_add=[]; all_group=[wallet]
         if main_funder not in SOL_WALLETS: to_add.append(main_funder); all_group.append(main_funder)
         if grandparent and grandparent[0] not in SOL_WALLETS: to_add.append(grandparent[0]); all_group.append(grandparent[0])
         for sib,_ in siblings[:6]:
@@ -297,7 +304,7 @@ def analyze_wallet_bundle(wallet):
         if added>0: save_wallets(); save_funders(); save_new_children(); save_last_active()
         last_bundle={"addresses":all_group,"funder":main_funder,"root":wallet,"time":datetime.now().isoformat()}
         pending_label=True
-        msg+=f"\nAuto-added {added} wallets - RECURSIVE ON\n\nLABELLING:\nBundle {len(all_group)} wallets from {format_wallet(main_funder)}\nReply:\n/labelgroup <name> (e.g. /labelgroup Michael)\n/skip to skip\nIf you label as Michael, future children = 'Michael -> NEW CHILD'"
+        msg+=f"\nAuto-added {added} wallets - RECURSIVE ON\n\nLABELLING:\nBundle {len(all_group)} wallets from {format_wallet(main_funder)}\nReply:\n/labelgroup <name> (e.g. /labelgroup Michael)\n/skip"
         send_tg(msg[:3500])
     except Exception as e: send_tg(f"Bundle err {e}")
 
@@ -420,7 +427,7 @@ def process_sol_tx_public(wallet_list, parsed, sig):
         send_tg(f"SOL SELL $10+\n{name} ({mcap})\nWallet: {label_str} ${usd:,.2f}\n{dex_link}")
 
 async def track_sol_polling():
-    print("SOL V4.3 FINAL $10+", flush=True)
+    print("SOL V4.3 FIXED $10+", flush=True)
     while True:
         for w in SOL_WALLETS[-50:]:
             try:
@@ -501,7 +508,7 @@ async def track_chain(chain):
         except Exception as e: print(f"[{chain}] err {e}", flush=True); await asyncio.sleep(5)
 
 def track_funders_polling():
-    print("Funder watcher FINAL RECURSIVE+GROUP 60s", flush=True)
+    print("Funder watcher FIXED 60s", flush=True)
     while True:
         time.sleep(60)
         try:
@@ -533,7 +540,7 @@ def track_funders_polling():
                                 time.sleep(0.8)
                     if len(splitter_child_count[funder])>=2 and funder not in known_splitters:
                         known_splitters.add(funder); save_funders()
-                        send_tg(f"RECURSIVE PROMOTE\n{format_wallet(funder)} funded {len(splitter_child_count[funder])} wallets -> SPLITTER\nGroup: {get_group(funder) or 'No group'}")
+                        send_tg(f"RECURSIVE PROMOTE\n{format_wallet(funder)} funded {len(splitter_child_count[funder])} wallets -> SPLITTER")
                 except: continue
         except Exception as e: print(f"recursive SOL err {e}", flush=True)
         time.sleep(10)
@@ -565,7 +572,7 @@ def track_funders_polling():
                                         new_children.add(to_addr.lower()); mark_active(to_addr)
                                         splitter_child_count[funder].add(to_addr.lower())
                                         save_wallets(); save_new_children(); save_last_active()
-                                        send_tg(f"NEW EVM CHILD FUNDED RECURSIVE {chain}!\nParent {format_wallet(funder)} -> {format_wallet(to_addr, is_new_child=True, parent_addr=funder)} {val:.4f}\nGroup: {parent_group or 'No group'}")
+                                        send_tg(f"NEW EVM CHILD FUNDED RECURSIVE {chain}!\nParent {format_wallet(funder)} -> {format_wallet(to_addr, is_new_child=True, parent_addr=funder)} {val:.4f}")
                     except: continue
         except Exception as e: print(f"recursive EVM err {e}", flush=True)
 
@@ -576,23 +583,21 @@ def handle_command(text):
         if not t.startswith("/"): return
         cmd = t.split()[0].lower().split('@')[0]
         args = t.split()
-
         if cmd=="/skip":
             if pending_label:
                 pending_label=False
                 last_bundle={"addresses":[],"funder":"","root":"","time":None}
-                send_tg("Skipped labeling. Tracking without group.")
+                send_tg("Skipped labeling.")
             else:
-                send_tg("No pending bundle to skip.")
+                send_tg("No pending bundle.")
             return
-
         if cmd=="/labelgroup":
             if len(args)<2:
-                send_tg("Usage: /labelgroup <name>\nEx: /labelgroup Michael")
+                send_tg("Usage: /labelgroup <name>")
                 return
             group_name=" ".join(args[1:]).strip()[:30]
             if not last_bundle or not last_bundle.get("addresses"):
-                send_tg("No recent bundle found. First do /bundle <address>")
+                send_tg("No recent bundle. First /bundle <addr>")
                 return
             count=0
             for addr in last_bundle["addresses"]:
@@ -604,12 +609,11 @@ def handle_command(text):
                 count+=1
             save_groups(); save_labels()
             pending_label=False
-            send_tg(f"Group labeled '{group_name}' -> {count} wallets\nFuture children will show as:\n'{group_name} -> NEW CHILD (xxxx)'\n\n/labels to see groups")
+            send_tg(f"Group '{group_name}' -> {count} wallets\nFuture children = '{group_name} -> NEW CHILD'")
             return
-
         if cmd=="/label":
             if len(args)<3:
-                send_tg("Usage: /label <address> <name>\nEx: /label 7aoGo... Michael")
+                send_tg("Usage: /label <addr> <name>")
                 return
             addr=args[1].strip()
             label_name=" ".join(args[2:]).strip()[:30]
@@ -617,39 +621,38 @@ def handle_command(text):
             wallet_labels[addr]=label_name
             wallet_groups[addr.lower()]=label_name
             save_labels(); save_groups()
-            send_tg(f"Labeled {short(addr)} as '{label_name}'\nGroup set to '{label_name}'\nFuture children inherit '{label_name}'")
+            send_tg(f"Labeled {short(addr)} as '{label_name}'")
             return
         elif cmd=="/unlabel":
-            if len(args)<2: send_tg("Usage: /unlabel <address>"); return
+            if len(args)<2: send_tg("Usage: /unlabel <addr>"); return
             addr=args[1].strip()
             removed=False
             for d in [wallet_labels, wallet_groups]:
                 for k in list(d.keys()):
                     if k.lower()==addr.lower(): del d[k]; removed=True
             save_labels(); save_groups()
-            send_tg(f"Removed label/group for {short(addr)}" if removed else f"No label for {short(addr)}")
+            send_tg(f"Removed label for {short(addr)}" if removed else f"No label for {short(addr)}")
             return
         elif cmd=="/labels":
             if not wallet_groups and not wallet_labels:
-                send_tg("No labels/groups yet.\n/bundle <addr> then /labelgroup <name>")
+                send_tg("No labels yet.")
                 return
             groups=defaultdict(list)
             for addr, grp in wallet_groups.items():
                 groups[grp].append(addr)
             msg=f"Groups {len(groups)}:\n"
             for grp, addrs in list(groups.items())[:10]:
-                msg+=f"\n'{grp}' {len(addrs)} wallets:\n" + "\n".join([f" - {short(a)} {a}" for a in addrs[:3]])
+                msg+=f"\n'{grp}' {len(addrs)}:\n" + "\n".join([f" - {short(a)} {a}" for a in addrs[:3]])
                 if len(addrs)>3: msg+=f"\n +{len(addrs)-3} more"
                 msg+="\n"
             send_tg(msg[:3500])
             return
-
         if cmd=="/start":
+            groups_count=len(set(wallet_groups.values())) if wallet_groups else 0
             mins=int((datetime.now()-last_tx_time).total_seconds()/60)
-            groups_count=len(set(wallet_groups.values()))
-            send_tg(f"V4.3 FINAL MERGED LIVE\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} BASE+BSC\nGroups:{groups_count} Labels:{len(wallet_labels)}\nRECURSIVE + INHERITANCE + LIGHT\n$10+ BUY/SELL + NEW CHILD VIP + CLUSTER 1D + PRUNE 30d\nLast:{mins}m Spl:{len(known_splitters)} New:{len(new_children)}\n\nFlow:\n/bundle <addr> -> /labelgroup <name> or /skip\n/label <addr> <name> /labels /unlabel")
+            send_tg(f"V4.3 FIXED LIVE\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} BASE+BSC\nGroups:{groups_count} Labels:{len(wallet_labels)}\nRECURSIVE+LABELS\nLast:{mins}m Spl:{len(known_splitters)} New:{len(new_children)}\n\n/bundle -> /labelgroup <name> or /skip")
         elif cmd=="/bundle":
-            if len(args)<2: send_tg("Usage: /bundle <addr> [BASE/BSC]\nThen /labelgroup <name> or /skip")
+            if len(args)<2: send_tg("Usage: /bundle <addr> [BASE/BSC]")
             else:
                 addr=args[1].strip(); chain=args[2].upper() if len(args)>2 else ("SOL" if not addr.startswith("0x") else "BASE")
                 if addr.startswith("0x"):
@@ -659,38 +662,18 @@ def handle_command(text):
         elif cmd=="/track_funders":
             if not known_splitters: send_tg("No splitters - /bundle to seed")
             else:
-                msg=f"Splitters {len(known_splitters)} RECURSIVE\n" + "\n".join([f"- {format_wallet(s)} ({len(splitter_child_count[s])} children) Group:{get_group(s) or 'no group'}" for s in list(known_splitters)[-10:]])
+                msg=f"Splitters {len(known_splitters)}\n" + "\n".join([f"- {format_wallet(s)} ({len(splitter_child_count[s])} children)" for s in list(known_splitters)[-10:]])
                 send_tg(msg[:3500])
         elif cmd=="/listwallets":
             sol="\n".join([f"{i+1}. {format_wallet(w)} {w}" for i,w in enumerate(SOL_WALLETS[-20:])])
             send_tg((f"SOL {len(SOL_WALLETS)}:\n{sol}")[:3500])
         elif cmd=="/listevm":
             evm="\n".join([f"{i+1}. {format_wallet(w)} {w}" for i,w in enumerate(EVM_WALLETS[-20:])])
-            send_tg((f"EVM {len(EVM_WALLETS)} BASE+BSC:\n{evm}")[:3500])
-        elif cmd=="/addsol":
-            if len(args)>=2:
-                addr=args[1].strip()
-                if addr not in SOL_WALLETS: SOL_WALLETS.append(addr); mark_active(addr); save_wallets(); save_last_active(); send_tg(f"Added SOL {format_wallet(addr)} Total {len(SOL_WALLETS)}")
-        elif cmd=="/addevm":
-            if len(args)>=2:
-                addr=args[1].strip()
-                try: addr_chk=Web3.to_checksum_address(addr)
-                except: addr_chk=addr
-                if addr_chk.lower() not in [x.lower() for x in EVM_WALLETS]: EVM_WALLETS.append(addr_chk); mark_active(addr_chk); save_wallets(); save_last_active(); send_tg(f"Added EVM {format_wallet(addr_chk)} Total {len(EVM_WALLETS)}")
-        elif cmd=="/removesol":
-            if len(args)>=2:
-                addr=args[1].strip()
-                if addr in SOL_WALLETS: SOL_WALLETS.remove(addr); save_wallets(); send_tg(f"Removed SOL {short(addr)}")
-        elif cmd=="/removeevm":
-            if len(args)>=2:
-                addr=args[1].strip()
-                before=len(EVM_WALLETS)
-                EVM_WALLETS=[x for x in EVM_WALLETS if x.lower()!=addr.lower()]; save_wallets()
-                send_tg(f"Removed EVM" if len(EVM_WALLETS)<before else "Not found")
+            send_tg((f"EVM {len(EVM_WALLETS)}:\n{evm}")[:3500])
         elif cmd=="/testalert":
-            send_tg(f"V4.3 FINAL WORKING\nGroups:{len(set(wallet_groups.values()))} Labels:{len(wallet_labels)}\nFlow: /bundle <addr> -> /labelgroup Michael -> children = Michael -> NEW CHILD")
+            send_tg(f"V4.3 FIXED WORKING Groups:{len(set(wallet_groups.values())) if wallet_groups else 0}")
         elif cmd=="/help":
-            send_tg("FINAL V4.3:\n/bundle <addr> - finds funder/splitter/children\nThen /labelgroup <name> or /skip\n/label <addr> <name>\n/labels /unlabel\n/track_funders /listwallets /listevm\n/addsol /addevm /removesol /removeevm\n/testalert\n\nNew children auto inherit parent group: 'Michael -> NEW CHILD'")
+            send_tg("FINAL FIXED:\n/bundle <addr>\n/labelgroup <name> or /skip\n/label <addr> <name>\n/labels /unlabel\n/track_funders /listwallets /listevm")
     except Exception as e:
         print(f"cmd err {e}",flush=True)
 
@@ -698,14 +681,14 @@ def set_bot_commands():
     cmds=[
         {"command":"start","description":"FINAL status"},
         {"command":"bundle","description":"Bundle tree - then labelgroup"},
-        {"command":"labelgroup","description":"Label last bundle: /labelgroup Michael"},
-        {"command":"skip","description":"Skip labeling last bundle"},
-        {"command":"label","description":"Label single wallet"},
+        {"command":"labelgroup","description":"Label last bundle"},
+        {"command":"skip","description":"Skip labeling"},
+        {"command":"label","description":"Label wallet"},
         {"command":"labels","description":"List groups"},
         {"command":"unlabel","description":"Remove label"},
-        {"command":"track_funders","description":"List funders with groups"},
-        {"command":"listwallets","description":"List SOL with groups"},
-        {"command":"listevm","description":"List EVM with groups"},
+        {"command":"track_funders","description":"List funders"},
+        {"command":"listwallets","description":"List SOL"},
+        {"command":"listevm","description":"List EVM"},
         {"command":"testalert","description":"Test"},
         {"command":"help","description":"Help"}
     ]
@@ -717,15 +700,15 @@ def heartbeat():
         time.sleep(120)
         try:
             mins=int((datetime.now()-last_tx_time).total_seconds()/60)
-            print(f"HEARTBEAT FINAL {mins}m q:{len(tg_queue)} SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} Groups:{len(set(wallet_groups.values()))}", flush=True)
+            print(f"HEARTBEAT FINAL FIXED {mins}m SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)}", flush=True)
         except: pass
 
 async def main_loop():
-    print(f">>> V4.3 FINAL MERGED {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM", flush=True)
+    print(f">>> FINAL FIXED {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM", flush=True)
     threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=track_funders_polling, daemon=True).start()
     threading.Thread(target=prune_inactive, daemon=True).start()
-    send_tg(f"V4.3 FINAL MERGED DEPLOYED\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} BASE+BSC only\n\nFEATURES:\n- $10+ BUY/SELL\n- Funder->Splitter->Children\n- Recursive auto-add & auto-promote\n- /bundle then /labelgroup <name> or /skip\n- Labels inherit: Michael -> NEW CHILD\n- VIP FIRST BUY + CLUSTER 1D + 30D prune\n/start instant"); set_bot_commands()
+    send_tg(f"V4.3 FINAL FIXED DEPLOYED\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} BASE+BSC\nRECURSIVE+GROUP LABELS\n/bundle -> /labelgroup <name>"); set_bot_commands()
     tasks=[track_chain("BASE"), track_chain("BSC"), track_sol_polling()]
     await asyncio.gather(*tasks)
 
