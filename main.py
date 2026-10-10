@@ -128,6 +128,53 @@ def format_wallet(addr, is_new_child=False, parent_addr=None):
     if lbl: return f"{lbl} <code>{sh}</code>"
     return f"<code>{sh}</code>"
 
+# === NEW: DELETE LABEL + ALL ADDRESSES ===
+def delete_label_and_addresses(label_name):
+    global SOL_WALLETS, EVM_WALLETS
+    label_name = label_name.strip()
+    to_delete = []
+    for addr, grp in list(wallet_groups.items()):
+        if grp == label_name:
+            to_delete.append(addr)
+    for addr, lbl in list(wallet_labels.items()):
+        if lbl == label_name and addr not in to_delete:
+            to_delete.append(addr)
+
+    deleted = 0
+    for addr in to_delete:
+        low = addr.lower()
+        # remove from wallets
+        before_sol = len(SOL_WALLETS)
+        SOL_WALLETS = [w for w in SOL_WALLETS if w.lower()!= low]
+        if len(SOL_WALLETS) < before_sol: deleted+=1
+        before_evm = len(EVM_WALLETS)
+        EVM_WALLETS = [w for w in EVM_WALLETS if w.lower()!= low]
+        if len(EVM_WALLETS) < before_evm: deleted+=1
+        # clean other maps
+        wallet_labels.pop(low, None)
+        wallet_labels.pop(addr, None)
+        wallet_groups.pop(low, None)
+        wallet_groups.pop(addr, None)
+        new_children.discard(low)
+        last_active.pop(low, None)
+
+    # If label exists but no addresses matched (empty group), still clean
+    if not to_delete:
+        # also delete any keys where value == label but address not in list anymore
+        pass
+
+    save_wallets(); save_labels(); save_groups(); save_new_children(); save_last_active()
+    return deleted, len(to_delete)
+
+def get_all_labels_with_counts():
+    groups=defaultdict(list)
+    for addr, grp in wallet_groups.items():
+        if grp: groups[grp].append(addr)
+    for addr, lbl in wallet_labels.items():
+        if lbl and lbl not in groups: groups[lbl].append(addr)
+        elif lbl and addr not in groups[lbl]: groups[lbl].append(addr)
+    return groups
+
 def prune_inactive():
     while True:
         time.sleep(3600*6)
@@ -187,14 +234,14 @@ except: pass
 
 app=Flask(__name__)
 @app.route('/')
-def home(): return "Shok V4.9.3 FULL CLICKABLE",200
+def home(): return "Shok V4.9.4 FULL CLICKABLE + DELETE LABELS",200
 @app.route('/health')
 def health(): return "OK",200
 @app.route('/debug')
 def debug():
     try:
         groups_len = len(set(wallet_groups.values())) if wallet_groups else 0
-        return f"V4.9.3 SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} Groups:{groups_len} Last:{int((datetime.now()-last_tx_time).total_seconds()/60)}m DIR:{DATA_DIR}",200
+        return f"V4.9.4 SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} Groups:{groups_len} Last:{int((datetime.now()-last_tx_time).total_seconds()/60)}m DIR:{DATA_DIR}",200
     except Exception as e:
         return f"DEBUG ERR {e}",200
 def run_flask(): app.run(host='0.0.0.0',port=int(os.getenv("PORT",10000)))
@@ -203,10 +250,14 @@ def send_tg_worker():
     while True:
         try:
             if tg_queue:
-                text=tg_queue.popleft()
+                item=tg_queue.popleft()
+                text, markup = item if isinstance(item, tuple) else (item, None)
                 if not BOT_TOKEN or not CHAT_ID: print(text[:500], flush=True)
                 else:
-                    try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json={"chat_id":CHAT_ID,"text":text,"disable_web_page_preview":True,"parse_mode":"HTML"},timeout=15)
+                    try:
+                        payload={"chat_id":CHAT_ID,"text":text,"disable_web_page_preview":True,"parse_mode":"HTML"}
+                        if markup: payload["reply_markup"]=markup
+                        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json=payload,timeout=15)
                     except: pass
                 time.sleep(1.0)
             else: time.sleep(0.4)
@@ -215,6 +266,9 @@ threading.Thread(target=send_tg_worker, daemon=True).start()
 def send_tg(text):
     if len(tg_queue)>20: tg_queue.clear()
     tg_queue.append(text)
+def send_tg_markup(text, markup):
+    if len(tg_queue)>20: tg_queue.clear()
+    tg_queue.append((text, markup))
 
 def get_token_info_quick(token_address, chain_hint="SOL"):
     if token_address in STABLES: return None
@@ -492,7 +546,7 @@ def process_sol_tx_public(wallet_list, parsed, sig):
         send_tg(f"🔴 <b>SELL</b> <b>{name}</b> {mcap}\n💰 ${usd:,.2f}\n👤 {label_str}\n{dex_short} | {tx_short}")
 
 async def track_sol_polling():
-    print(f"SOL V4.9.3 FULL $10+ DIR:{DATA_DIR}", flush=True)
+    print(f"SOL V4.9.4 FULL $10+ DIR:{DATA_DIR}", flush=True)
     while True:
         for w in SOL_WALLETS[-50:]:
             try:
@@ -571,7 +625,7 @@ async def track_chain(chain):
         except Exception as e: print(f"[{chain}] err {e}", flush=True); await asyncio.sleep(5)
 
 def track_funders_polling():
-    print(f"Funder watcher V4.9.3 DIR:{DATA_DIR}", flush=True)
+    print(f"Funder watcher V4.9.4 DIR:{DATA_DIR}", flush=True)
     while True:
         time.sleep(60)
         try:
@@ -639,6 +693,7 @@ def track_funders_polling():
                     except: continue
         except Exception as e: print(f"recursive EVM err {e}", flush=True)
 
+# === COMMAND HANDLER + NEW DELETE LABELS ===
 def handle_command(text):
     global SOL_WALLETS, EVM_WALLETS, wallet_labels, wallet_groups, last_bundle, pending_label, new_children, last_active
     try:
@@ -654,6 +709,35 @@ def handle_command(text):
                 send_tg("Skipped.")
             else:
                 send_tg("No pending bundle.")
+            return
+
+        # === NEW COMMANDS: /deletelabels, /deletelabel, /removelabel ===
+        if cmd in ["/deletelabels", "/deletelabel", "/removelabel"]:
+            if len(args)>=2:
+                # direct: /deletelabel <name>
+                label_name = " ".join(args[1:]).strip()
+                del_count, total_found = delete_label_and_addresses(label_name)
+                if total_found==0:
+                    send_tg(f"❌ Label not found: <b>{label_name}</b>")
+                else:
+                    send_tg(f"✅ Deleted label <b>{label_name}</b> + {del_count} wallets (found {total_found})")
+                return
+            # no args -> show list with inline buttons
+            groups = get_all_labels_with_counts()
+            if not groups:
+                send_tg("No labels/groups to delete.")
+                return
+            keyboard = []
+            for label, addrs in groups.items():
+                # callback_data max 64 bytes, label max 30
+                safe_label = label[:30]
+                keyboard.append([{"text": f"🗑️ {safe_label} ({len(addrs)})", "callback_data": f"dellbl_ask:{safe_label}"}])
+            keyboard.append([{"text": "❌ Cancel", "callback_data": "dellbl_cancel"}])
+            markup = {"inline_keyboard": keyboard}
+            msg = f"<b>🗑️ DELETE LABELS</b> — {len(groups)} found\n\nTap to delete label + ALL its wallets:\n"
+            for lbl, adrs in list(groups.items())[:15]:
+                msg+=f"• <b>{lbl}</b>: {len(adrs)} wallets\n"
+            send_tg_markup(msg, markup)
             return
 
         if cmd in ["/remove", "/delete", "/rm", "/delwallet", "/untrack"]:
@@ -739,11 +823,12 @@ def handle_command(text):
             for grp, addrs in list(groups.items())[:10]:
                 msg+=f"\n<b>'{grp}'</b> {len(addrs)}:\n" + "\n".join([f"• <code>{short(a)}</code>" for a in addrs[:3]])
                 if len(addrs)>3: msg+=f"\n +{len(addrs)-3} more\n"
+            msg+="\nUse /deletelabels to delete"
             send_tg(msg); return
         if cmd=="/start":
             groups_count=len(set(wallet_groups.values())) if wallet_groups else 0
             mins=int((datetime.now()-last_tx_time).total_seconds()/60)
-            send_tg(f"<b>V4.9.3 CLICKABLE LIVE</b>\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)}\nGroups:{groups_count} Last:{mins}m DIR:{DATA_DIR}\n\nTap /listwallets to see full + delete")
+            send_tg(f"<b>V4.9.4 CLICKABLE LIVE + DELETE</b>\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)}\nGroups:{groups_count} Last:{mins}m DIR:{DATA_DIR}\n\n/deletelabels - delete label + wallets")
         elif cmd=="/bundle":
             if len(args)<2: send_tg("Usage: /bundle &lt;addr&gt; [BASE/BSC]")
             else:
@@ -785,19 +870,73 @@ def handle_command(text):
                 send_tg(msg)
                 time.sleep(0.6)
             return
-        elif cmd=="/testalert": send_tg(f"✅ V4.9.3 FULL WORKING DIR:{DATA_DIR}")
-        elif cmd=="/help": send_tg("/bundle <addr> [BASE/BSC]\n/labelgroup <name>\n/remove <addr> - DELETE wallet\n/listwallets - full clickable\n/listevm - full clickable\n/labels\n/skip")
+        elif cmd=="/testalert": send_tg(f"✅ V4.9.4 WORKING DIR:{DATA_DIR}")
+        elif cmd=="/help": send_tg("/bundle <addr> [BASE/BSC]\n/labelgroup <name>\n/remove <addr>\n/deletelabels - list + delete labels with all wallets\n/deletelabel <name> - delete directly\n/listwallets\n/lisevm")
     except Exception as e:
         print(f"cmd err {e}",flush=True)
 
+def handle_callback_query(cb):
+    try:
+        data = cb.get("data","")
+        cb_id = cb.get("id")
+        msg = cb.get("message",{})
+        chat_id = msg.get("chat",{}).get("id") or CHAT_ID
+        msg_id = msg.get("message_id")
+
+        # answer callback to remove loading
+        try:
+            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id}, timeout=5)
+        except: pass
+
+        if data.startswith("dellbl_ask:"):
+            label = data.split(":",1)[1]
+            groups = get_all_labels_with_counts()
+            count = len(groups.get(label, []))
+            keyboard = [
+                [{"text": f"✅ YES DELETE {label} + {count} wallets", "callback_data": f"dellbl_confirm:{label}"}],
+                [{"text": "❌ Cancel", "callback_data": "dellbl_cancel"}]
+            ]
+            text = f"⚠️ Delete <b>{label}</b>?\n\nThis will delete the label AND all <b>{count}</b> addresses linked to it.\nCannot be undone."
+            # edit message
+            try:
+                requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText", json={
+                    "chat_id": chat_id, "message_id": msg_id, "text": text, "parse_mode": "HTML",
+                    "reply_markup": {"inline_keyboard": keyboard}
+                }, timeout=10)
+            except:
+                send_tg_markup(text, {"inline_keyboard": keyboard})
+
+        elif data.startswith("dellbl_confirm:"):
+            label = data.split(":",1)[1]
+            del_count, total_found = delete_label_and_addresses(label)
+            text = f"✅ Deleted <b>{label}</b>\nRemoved {del_count} wallets (found {total_found})." if total_found else f"❌ Label {label} not found."
+            try:
+                requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText", json={
+                    "chat_id": chat_id, "message_id": msg_id, "text": text, "parse_mode": "HTML"
+                }, timeout=10)
+            except:
+                send_tg(text)
+
+        elif data == "dellbl_cancel":
+            try:
+                requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText", json={
+                    "chat_id": chat_id, "message_id": msg_id, "text": "Cancelled.", "parse_mode": "HTML"
+                }, timeout=10)
+            except:
+                send_tg("Cancelled.")
+    except Exception as e:
+        print(f"callback err {e}", flush=True)
+
 def set_bot_commands():
     cmds=[
-        {"command":"start","description":"V4.9.3 status"},
+        {"command":"start","description":"V4.9.4 status"},
         {"command":"bundle","description":"Bundle deep"},
         {"command":"labelgroup","description":"Label bundle"},
         {"command":"skip","description":"Skip"},
         {"command":"label","description":"Label wallet"},
         {"command":"labels","description":"List groups"},
+        {"command":"deletelabels","description":"DELETE labels + wallets with buttons"},
+        {"command":"deletelabel","description":"DELETE label directly"},
         {"command":"unlabel","description":"Remove label only"},
         {"command":"remove","description":"DELETE wallet SOL/EVM"},
         {"command":"listwallets","description":"List SOL FULL clickable"},
@@ -814,15 +953,15 @@ def heartbeat():
         time.sleep(120)
         try:
             mins=int((datetime.now()-last_tx_time).total_seconds()/60)
-            print(f"HEARTBEAT V4.9.3 {mins}m SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} DIR:{DATA_DIR}", flush=True)
+            print(f"HEARTBEAT V4.9.4 {mins}m SOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)} DIR:{DATA_DIR}", flush=True)
         except: pass
 
 async def main_loop():
-    print(f">>> V4.9.3 CLICKABLE {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM DIR:{DATA_DIR}", flush=True)
+    print(f">>> V4.9.4 CLICKABLE + DELETE {len(SOL_WALLETS)} SOL + {len(EVM_WALLETS)} EVM DIR:{DATA_DIR}", flush=True)
     threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=track_funders_polling, daemon=True).start()
     threading.Thread(target=prune_inactive, daemon=True).start()
-    send_tg(f"<b>V4.9.3 CLICKABLE DEPLOYED</b>\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)}\nDIR:{DATA_DIR}\nFull addresses + /remove tap ✅"); set_bot_commands()
+    send_tg(f"<b>V4.9.4 DELETE LABELS DEPLOYED</b>\nSOL:{len(SOL_WALLETS)} EVM:{len(EVM_WALLETS)}\nDIR:{DATA_DIR}\n/deletelabels to delete label + wallets ✅"); set_bot_commands()
     tasks=[track_chain("BASE"), track_chain("BSC"), track_sol_polling()]
     await asyncio.gather(*tasks)
 
@@ -842,10 +981,15 @@ if __name__=="__main__":
                 r=requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={off}&timeout=10",timeout=15).json()
                 for u in r.get("result",[]):
                     off=u["update_id"]+1
+                    # message commands
                     txt=u.get("message",{}).get("text","")
                     if txt and txt.startswith("/"):
                         print(f"CMD {txt}", flush=True)
                         handle_command(txt)
+                    # callback queries for delete labels
+                    if "callback_query" in u:
+                        print(f"CALLBACK {u['callback_query'].get('data')}", flush=True)
+                        handle_callback_query(u["callback_query"])
             except Exception as e:
                 print(f"poll err {e}", flush=True); time.sleep(3)
     threading.Thread(target=poll_cmd,daemon=True).start()
