@@ -4,36 +4,11 @@ from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from web3 import Web3
 
-# === PERSISTENT PATH FIX ===
 DATA_DIR = "/data" if os.path.exists("/data") else "."
 def p(f): return os.path.join(DATA_DIR, f)
 
-SOL_WALLETS = [
-"Beqv6dzTcjV2eodo8RRXCiCcnSYrS1vkQKhfqwHXqeit","5t8FA8z7SFiEpjau2nTBYKN8jd5CGo8Ttcgt1m73C7d",
-"6xmMW5JPSEfeRuNdkxixHWsm4Sf57SdXybA3BdwZzrM1","2Ysos2B2S6rb9FBNYUB7Yrk54Xv2nNbr8eBHs1sX8M6m",
-"Agt534WQKGXuVt9UFamcgqH9djySF9PmxqNS5caiMCAV","Ab25e8CyZ6119HSY6r4wdKpBPxY3UBLWfrZ7PEBvHD4F",
-"4ugDhHJ8XDXAeABmrNmGffFaLbJb9BkPyiFGVSV9ocwo","9BMzTpSo4URse1oN666pmexhdjpU1vA5p7LtroCFQdLU",
-"498g1rVnFcnjBjpfw1xyqA1WvgQXUU8RWuELjxkjAayQ","8f39XhhZoRD8sYb6K5K9N7iSHXkL7BDmFFQNDF3TtsEr",
-"83b2LMf12aLec92kur3duRA8VvUkLaXUtML31aCcZNCM","7aoGoRSexZu1DE4vC24CVo4SqWrBDeoJ34qLRGUsL9ha",
-"2yXwy5Dsa1XtEXcsrkFVRJeyuWD3qKkMN3pP3p5VTW3V","7iPPqPyrqcmfenRs4xZ72ab4pyuUofXB5YaQB83WJmT9",
-"H2QSGECp13sFLJgdTsDtayX3dk18Dm6sQMSQKcew7Xzk","DCeH3aCsstGUSxQqS72VBZwTydoor1nQ6dWaxrgGQk39",
-"6My97BBVoJz3j7mQWFVz5pykFxMsCs44gjhaqmczcAND","D9tPQeij7vSTZwkxzxZibso4GFuRW8aBMpCg5QhCSfVL",
-"59mWSDjx5VFQz15FGJio8BJzupKorK5SVHSbaJaZGAxC",
-"3zs5nZyqTZmjvvaNTRnfNZyhNzuu7WW9BrJL31gGyPVY",
-"C2UdM2JiKg9xFETQpXBxynACovJuFYer9SKVm2",
-]
-EVM_WALLETS = [
-"0xfd87eda88be6c372453b721da63d58ad1a5b2d94","0x2a17e1e796dd7bd3b27efe2cda72d4b909baaacf",
-"0x4bc1782fafb967834e0e75947ba15113e48fc70e","0x5a08728a6704d99468d8919ba0adc2e1d2733083",
-"0xae97104fde93a82797afec819ac0e09b8d544907","0xabf122e41ce873a3c6a71fbf1c6419ca5df07f17",
-"0xd1c77a04b87393e98a1220532e72e8f7d0a31c5a","0x0c175c6a0065ee05f871a68783d2de432a1e6cbe",
-"0x696d1265c8fc4f14797abebfae3c43ebfa9d8e28","0x0121525f755c9e7bbc525bba6672716ab46ced57",
-"0x27d6a5a1d9a5e89bfce0239f08d9c95cf2256ebb","0xb8f305f27ccc406373de0082cc06cb1d065504ea",
-"0xb02208d1b27811480cf6171bccc2b7af9513cddb","0x06de9c48b1e639ed5c13ec8fbd4080a38e39f2d1",
-"0x1890e719822bc704c4f117aa4109401c2bab6f79","0xd4cf04bc9d7c80b49c6c30a633f7b9bd5370b4d6",
-"0x7f6e4e1e59be05dc717c8e5429154a7408609ee2",
-"0x0819955F989A720B76E41Da601e38CD4556eF8ed",
-]
+SOL_WALLETS = []
+EVM_WALLETS = []
 
 WALLETS_FILE=p("wallets.json"); MEMORY_FILE=p("cluster_memory.json"); FUNDERS_FILE=p("funders.json"); NEW_CHILDREN_FILE=p("new_children.json"); LAST_ACTIVE_FILE=p("last_active.json"); LABELS_FILE=p("labels.json"); GROUPS_FILE=p("groups.json")
 cluster_memory=defaultdict(list)
@@ -128,7 +103,6 @@ def format_wallet(addr, is_new_child=False, parent_addr=None):
     if lbl: return f"{lbl} <code>{sh}</code>"
     return f"<code>{sh}</code>"
 
-# === NEW: DELETE LABEL + ALL ADDRESSES ===
 def delete_label_and_addresses(label_name):
     global SOL_WALLETS, EVM_WALLETS
     label_name = label_name.strip()
@@ -139,30 +113,21 @@ def delete_label_and_addresses(label_name):
     for addr, lbl in list(wallet_labels.items()):
         if lbl == label_name and addr not in to_delete:
             to_delete.append(addr)
-
     deleted = 0
     for addr in to_delete:
         low = addr.lower()
-        # remove from wallets
         before_sol = len(SOL_WALLETS)
         SOL_WALLETS = [w for w in SOL_WALLETS if w.lower()!= low]
         if len(SOL_WALLETS) < before_sol: deleted+=1
         before_evm = len(EVM_WALLETS)
         EVM_WALLETS = [w for w in EVM_WALLETS if w.lower()!= low]
         if len(EVM_WALLETS) < before_evm: deleted+=1
-        # clean other maps
         wallet_labels.pop(low, None)
         wallet_labels.pop(addr, None)
         wallet_groups.pop(low, None)
         wallet_groups.pop(addr, None)
         new_children.discard(low)
         last_active.pop(low, None)
-
-    # If label exists but no addresses matched (empty group), still clean
-    if not to_delete:
-        # also delete any keys where value == label but address not in list anymore
-        pass
-
     save_wallets(); save_labels(); save_groups(); save_new_children(); save_last_active()
     return deleted, len(to_delete)
 
@@ -174,6 +139,23 @@ def get_all_labels_with_counts():
         if lbl and lbl not in groups: groups[lbl].append(addr)
         elif lbl and addr not in groups[lbl]: groups[lbl].append(addr)
     return groups
+
+# === FIX FOR YOUR COMPLAINT ===
+def find_existing_group_for_address(addr):
+    low = addr.lower()
+    grp = wallet_groups.get(low) or wallet_labels.get(low)
+    if not grp:
+        grp = wallet_groups.get(addr) or wallet_labels.get(addr)
+    if not grp:
+        return None
+    all_addrs = []
+    for a,g in wallet_groups.items():
+        if g == grp:
+            all_addrs.append(a)
+    for a,l in wallet_labels.items():
+        if l == grp and a not in all_addrs:
+            all_addrs.append(a)
+    return grp, all_addrs
 
 def prune_inactive():
     while True:
@@ -323,6 +305,18 @@ def analyze_wallet_bundle(wallet):
         send_tg("⏳ Bundle busy..."); return
     bundle_in_progress=True
     wallet=wallet.strip()
+    try:
+        existing = find_existing_group_for_address(wallet)
+        if existing:
+            grp_name, all_addrs = existing
+            display_list = "\n".join([f"• <code>{short(a)}</code>" for a in all_addrs[:8]])
+            if len(all_addrs) > 8:
+                display_list += f"\n +{len(all_addrs)-8} more"
+            send_tg(f"⚠️ <b>Already saved — This is {grp_name}</b> ({len(all_addrs)} wallets):\n{display_list}")
+            bundle_in_progress=False
+            return
+    except Exception as e:
+        print(f"duplicate check err {e}", flush=True)
     send_tg(f"🔍 Scanning <code>{short(wallet)}</code> (deep 100)...")
     try:
         payload={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress","params":[wallet, {"limit":100}]}
@@ -385,6 +379,18 @@ def analyze_evm_bundle(chain, wallet):
     if bundle_in_progress:
         send_tg("⏳ Bundle busy..."); return
     bundle_in_progress=True
+    try:
+        existing = find_existing_group_for_address(wallet)
+        if existing:
+            grp_name, all_addrs = existing
+            display_list = "\n".join([f"• <code>{short(a)}</code>" for a in all_addrs[:8]])
+            if len(all_addrs) > 8:
+                display_list += f"\n +{len(all_addrs)-8} more"
+            send_tg(f"⚠️ <b>Already saved — This is {grp_name}</b> ({len(all_addrs)} wallets) {chain}:\n{display_list}")
+            bundle_in_progress=False
+            return
+    except Exception as e:
+        print(f"duplicate check EVM err {e}", flush=True)
     send_tg(f"🔍 Scanning <code>{short(wallet)}</code> {chain} (full)...")
     try:
         wallet_chk=Web3.to_checksum_address(wallet)
@@ -693,7 +699,6 @@ def track_funders_polling():
                     except: continue
         except Exception as e: print(f"recursive EVM err {e}", flush=True)
 
-# === COMMAND HANDLER + NEW DELETE LABELS ===
 def handle_command(text):
     global SOL_WALLETS, EVM_WALLETS, wallet_labels, wallet_groups, last_bundle, pending_label, new_children, last_active
     try:
@@ -701,7 +706,6 @@ def handle_command(text):
         if not t.startswith("/"): return
         cmd = t.split()[0].lower().split('@')[0]
         args = t.split()
-
         if cmd=="/skip":
             if pending_label:
                 pending_label=False
@@ -710,11 +714,8 @@ def handle_command(text):
             else:
                 send_tg("No pending bundle.")
             return
-
-        # === NEW COMMANDS: /deletelabels, /deletelabel, /removelabel ===
         if cmd in ["/deletelabels", "/deletelabel", "/removelabel"]:
             if len(args)>=2:
-                # direct: /deletelabel <name>
                 label_name = " ".join(args[1:]).strip()
                 del_count, total_found = delete_label_and_addresses(label_name)
                 if total_found==0:
@@ -722,14 +723,12 @@ def handle_command(text):
                 else:
                     send_tg(f"✅ Deleted label <b>{label_name}</b> + {del_count} wallets (found {total_found})")
                 return
-            # no args -> show list with inline buttons
             groups = get_all_labels_with_counts()
             if not groups:
                 send_tg("No labels/groups to delete.")
                 return
             keyboard = []
             for label, addrs in groups.items():
-                # callback_data max 64 bytes, label max 30
                 safe_label = label[:30]
                 keyboard.append([{"text": f"🗑️ {safe_label} ({len(addrs)})", "callback_data": f"dellbl_ask:{safe_label}"}])
             keyboard.append([{"text": "❌ Cancel", "callback_data": "dellbl_cancel"}])
@@ -739,14 +738,12 @@ def handle_command(text):
                 msg+=f"• <b>{lbl}</b>: {len(adrs)} wallets\n"
             send_tg_markup(msg, markup)
             return
-
         if cmd in ["/remove", "/delete", "/rm", "/delwallet", "/untrack"]:
             if len(args)<2:
                 send_tg("Usage: /remove &lt;addr&gt;\nExample: /remove 0xfd87... or /remove Beqv6...\nBulk: /remove all_sol /remove all_evm /remove all")
                 return
             target = args[1].strip()
             target_lower = target.lower()
-
             if target_lower in ["all", "all_sol", "all_evm"]:
                 if target_lower == "all_sol":
                     c = len(SOL_WALLETS); SOL_WALLETS.clear()
@@ -760,15 +757,12 @@ def handle_command(text):
                     send_tg(f"✅ Removed all {c1} SOL + {c2} EVM wallets")
                 save_wallets(); save_new_children(); save_last_active()
                 return
-
             before_sol=len(SOL_WALLETS)
             SOL_WALLETS=[w for w in SOL_WALLETS if w.lower()!=target_lower]
             found_sol = len(SOL_WALLETS) < before_sol
-
             before_evm=len(EVM_WALLETS)
             EVM_WALLETS=[w for w in EVM_WALLETS if w.lower()!=target_lower]
             found_evm = len(EVM_WALLETS) < before_evm
-
             new_children.discard(target_lower)
             last_active.pop(target_lower, None)
             removed_label=False
@@ -776,14 +770,12 @@ def handle_command(text):
                 for k in list(d.keys()):
                     if k.lower()==target_lower:
                         del d[k]; removed_label=True
-
             if found_sol or found_evm or removed_label:
                 save_wallets(); save_new_children(); save_last_active(); save_labels(); save_groups()
                 send_tg(f"✅ Removed <code>{short(target)}</code> — stopped tracking SOL & EVM")
             else:
                 send_tg(f"❌ Not found: <code>{short(target)}</code>\nUse /listwallets or /listevm to see addresses")
             return
-
         if cmd=="/labelgroup":
             if len(args)<2:
                 send_tg("Usage: /labelgroup &lt;name&gt;"); return
@@ -882,12 +874,9 @@ def handle_callback_query(cb):
         msg = cb.get("message",{})
         chat_id = msg.get("chat",{}).get("id") or CHAT_ID
         msg_id = msg.get("message_id")
-
-        # answer callback to remove loading
         try:
             requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id}, timeout=5)
         except: pass
-
         if data.startswith("dellbl_ask:"):
             label = data.split(":",1)[1]
             groups = get_all_labels_with_counts()
@@ -897,7 +886,6 @@ def handle_callback_query(cb):
                 [{"text": "❌ Cancel", "callback_data": "dellbl_cancel"}]
             ]
             text = f"⚠️ Delete <b>{label}</b>?\n\nThis will delete the label AND all <b>{count}</b> addresses linked to it.\nCannot be undone."
-            # edit message
             try:
                 requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText", json={
                     "chat_id": chat_id, "message_id": msg_id, "text": text, "parse_mode": "HTML",
@@ -905,7 +893,6 @@ def handle_callback_query(cb):
                 }, timeout=10)
             except:
                 send_tg_markup(text, {"inline_keyboard": keyboard})
-
         elif data.startswith("dellbl_confirm:"):
             label = data.split(":",1)[1]
             del_count, total_found = delete_label_and_addresses(label)
@@ -916,7 +903,6 @@ def handle_callback_query(cb):
                 }, timeout=10)
             except:
                 send_tg(text)
-
         elif data == "dellbl_cancel":
             try:
                 requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText", json={
@@ -981,12 +967,10 @@ if __name__=="__main__":
                 r=requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={off}&timeout=10",timeout=15).json()
                 for u in r.get("result",[]):
                     off=u["update_id"]+1
-                    # message commands
                     txt=u.get("message",{}).get("text","")
                     if txt and txt.startswith("/"):
                         print(f"CMD {txt}", flush=True)
                         handle_command(txt)
-                    # callback queries for delete labels
                     if "callback_query" in u:
                         print(f"CALLBACK {u['callback_query'].get('data')}", flush=True)
                         handle_callback_query(u["callback_query"])
