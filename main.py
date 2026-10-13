@@ -14,13 +14,14 @@ GROUPS = {}
 LABELS = {}
 seen_sigs = set()
 recent_children = defaultdict(list)
-recent_token_buys = defaultdict(list) # NEW: mint -> [(wallet, usd, time, group)]
+recent_token_buys = defaultdict(list)
 sniper_marked = {}
 tg_queue = deque()
 funder_cache = {}
 last_tx_time = datetime.now()
 last_bundled = None
 last_activity = {}
+last_dist_alert = {} # NEW: dedup -> (funder,mint) -> (time, count)
 
 SOLANA_PUB_RPCS = [
     "https://api.mainnet-beta.solana.com",
@@ -161,7 +162,6 @@ load_all()
 
 BLACKLIST_MINTS=["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB","So11111111111111111111111111111111111111112"]
 
-# === NEW: TOKEN INFO WITH VOLUME ===
 def get_token_info(token_address):
     if token_address in BLACKLIST_MINTS: return None
     try:
@@ -182,7 +182,6 @@ def get_token_info(token_address):
             pc=best.get("pairCreatedAt")
             if pc: age_min=int((time.time()*1000-pc)/60000)
         except: pass
-        # NEW FIELDS
         vol24 = float(best.get("volume",{}).get("h24",0) or 0)
         vol5 = float(best.get("volume",{}).get("m5",0) or 0)
         liq = float(best.get("liquidity",{}).get("usd",0) or 0)
@@ -325,25 +324,47 @@ def handle_bundle(wallet):
         send_tg(f"📦 Bundled `{short(wallet)}` ⛓️ {chain.upper()}\nParent `{short(main_funder)}` G:{display_group(main_funder)}\n✅ +{added} sibs | Total {len(SOL_WALLETS)}\nFORWARD ON\n`/labelgroup FOMOFARMER`")
     except Exception as e: send_tg(f"❌ Bundle error: {e}")
 
+# === FIXED PREP / DIST WITH DEDUP ===
 def alert_prep(funder):
     now=datetime.now()
     recent=[x for x in recent_children[funder] if (now-x[2]).total_seconds()<=300]
     recent_children[funder]=recent
     save_recent()
     if not recent: return
+
     sol_only=[x for x in recent if not x[3]]
     token_only=[x for x in recent if x[3]]
     gl=display_group(funder)
     chain=get_wallet_chain(funder).upper()
+
     if token_only:
-        mint=token_only[0][4] if len(token_only[0])>4 else "token"
-        info=get_token_info(mint) if mint!="token" and mint else None
-        name=info["name"] if info else short(mint)
+        mint=token_only[-1][4] if len(token_only[-1])>4 else "token"
+        count=len(token_only)
+        # DEDUP: if same funder+mint alerted <120s ago and count not grew by >=3, skip
+        key=(funder, mint)
+        last = last_dist_alert.get(key)
+        if last and (now-last[0]).total_seconds() < 120 and count <= last[1]+2:
+            return
+        last_dist_alert[key]=(now, count)
+
+        info=get_token_info(mint) if mint and mint!="token" else None
+        name=info["name"] if info else short(mint) if mint else "token"
         mcap=info["mcap_str"] if info else ""
-        child_list="\n".join([f"• `{short(c[0])}` {c[1]:.0f} {name} +0.01 gas" for c in token_only[:5]])
+        # FIX Total 0 - show last 5 with actual amounts
+        child_list="\n".join([f"• `{short(c[0])}` {c[1]:.2f} {name} +0.01 gas" if c[1]>=0.01 else f"• `{short(c[0])}` {c[1]:.0f} {name}" for c in token_only[-5:]])
         total=sum(c[1] for c in token_only)
-        send_tg(f"🔴🔴🔴 DIST {len(token_only)}w ABOUT TO SELL 🔴🔴🔴\nG:{gl} `{short(funder)}` ⛓️ {chain}\nToken {name} {mcap}\n{child_list}\nTotal {total:.0f}\n[SC](https://solscan.io/account/{funder})"); return
+        total_str = f"\nTotal {total:.0f}" if total>=1 else ""
+        send_tg(f"🔴🔴🔴 DIST {count}w ABOUT TO SELL 🔴🔴🔴\nG:{gl} `{short(funder)}` ⛓️ {chain}\nToken {name} {mcap}\n{child_list}{total_str}\n[SC](https://solscan.io/account/{funder})")
+        return
+
     if len(sol_only)>=1:
+        count=len(sol_only)
+        key=(funder, "SOL_PREP")
+        last = last_dist_alert.get(key)
+        if last and (now-last[0]).total_seconds() < 90 and count <= last[1]+1:
+            return
+        last_dist_alert[key]=(now, count)
+
         biggest=max(sol_only, key=lambda x: x[1])
         biggest_amt=biggest[1]; biggest_child=biggest[0]
         if biggest_amt>=0.08:
@@ -353,17 +374,12 @@ def alert_prep(funder):
         cluster=f"\nCluster {len(sol_only)}w bundled same coin" if len(sol_only)>=2 else ""
         send_tg(f"⚠️ PREP {len(sol_only)}w 5m ⛓️ {chain}{cluster}\nG:{gl}\n{childs_str}{sniper_str}\n[SC](https://solscan.io/account/{funder})")
 
-# === NEW: CLASSIFY LOGIC ===
 def should_alert(mint, usd, info, wallet_group):
-    # Clean old buys 5m window
     now = datetime.now()
     recent = [x for x in recent_token_buys[mint] if (now - x[2]).total_seconds() <= 300]
     recent_token_buys[mint] = recent
-
-    # Add current buy
     recent.append((wallet_group, usd, now))
     recent_token_buys[mint] = recent
-
     total_5m = sum(x[1] for x in recent)
     wallets_5m = len(set(x[0] for x in recent))
     age_min = info["age_min"]
@@ -372,59 +388,40 @@ def should_alert(mint, usd, info, wallet_group):
     vol24 = info["vol24"]
     liq = info["liq"]
     chg5 = info["chg5"]
-
-    # BLOCK dust liquidity
-    if liq < 5000:
-        return None
-
-    # DEAD coin filter with REVIVAL check
-    is_old = age_min > 14400 # >10 days
+    if liq < 5000: return None
+    is_old = age_min > 14400
     is_dead_volume = vol24 < 2000 and vol5 < 500
     if is_old and is_dead_volume:
-        # REVIVAL? needs volume spike + price spike + liquidity
         if not (vol5 > 5000 and chg5 > 15 and liq > 15000):
-            return None # block dead like BTCX $31k ghost
-
-    # 1. PROBE $20-$200 fresh
+            return None
     if 20 <= usd <= 200:
         if mcap < 150000 and age_min < 120 and vol5 > 800:
             return f"🟢 PROBE: 1w test BUY ${usd:.0f} at {info['mcap_str']} MC | {age_min}m old | vol5m ${vol5:.0f} | {info['name']}"
-        else:
-            return None # block $46 at $666k 1mo old
-
-    # 2. SWARM aggregate $500-$5000 in 5m
+        else: return None
     if 500 <= total_5m <= 8000:
         if mcap < 600000 and wallets_5m >= 2:
             if is_old:
-                # revival swarm needs higher vol
                 if vol5 > 8000 and chg5 > 20:
                     return f"♻️🟡 REVIVAL SWARM: {wallets_5m}w total ${total_5m:.0f} in 5m at {info['mcap_str']} | age {age_min//1440}d | vol5m ${vol5:.0f} +{chg5:.0f}% | {info['name']}"
-                else:
-                    return None
+                else: return None
             else:
                 return f"🟡 SWARM: {wallets_5m}w total ${total_5m:.0f} in 5m at {info['mcap_str']} | {age_min}m | vol24 ${vol24:.0f} | {info['name']}"
-
-    # 3. WHALE >$1000 single
     if usd >= 1000:
         if is_old and is_dead_volume:
             if vol5 > 5000 and liq > 10000:
                 return f"♻️🔵 REVIVAL WHALE: 1w BUY ${usd:.0f} at {info['mcap_str']} | {age_min//1440}d old but vol spike ${vol5:.0f} | {info['name']}"
-            else:
-                return None
+            else: return None
         return f"🔵 WHALE: 1w BUY ${usd:.0f} at {info['mcap_str']} | {age_min}m | liq ${liq:.0f} | {info['name']}"
-
     return None
 
 async def track_sol_polling():
     while True:
         try:
-            # KEEP 50 MOST ACTIVE TO AVOID CRASH (your request)
             if last_activity:
                 sorted_w = sorted(SOL_WALLETS, key=lambda wdict: last_activity.get(wdict["addr"] if isinstance(wdict, dict) else wdict, datetime.min), reverse=True)
                 active_list = sorted_w[:50]
             else:
                 active_list = SOL_WALLETS[-40:]
-
             for wdict in active_list:
                 w=wdict["addr"] if isinstance(wdict,dict) else wdict
                 chain=wdict.get("chain","sol") if isinstance(wdict,dict) else "sol"
@@ -441,17 +438,15 @@ async def track_sol_polling():
                             usd=amt*info["price"]
                             if usd<15: continue
                             seen_sigs.add(sig); save_seen()
-                            global last_tx_time; last_tx_time=datetime.now()
+                            last_tx_time=datetime.now()
                             last_activity[w]=datetime.now()
                             is_sniper=w in sniper_marked
                             gl=display_group(w)
                             ds=info["dex_link"]; ph=info["photon"]; txl=f"https://solscan.io/tx/{sig}"
-
                             alert_text = should_alert(mint, usd, info, w)
                             if alert_text:
                                 sniper_tag = " 👑 SNIPER" if is_sniper else ""
                                 send_tg(f"{alert_text}\n👤 `{short(w)}` G:{gl}{sniper_tag}\nCA: `{mint}`\nVol24 ${info['vol24']:.0f} Vol5m ${info['vol5']:.0f} Liq ${info['liq']:.0f} {info['chg5']:.0f}% 5m\n[DS]({ds}) [PH]({ph}) [TX]({txl})")
-                            # SELL still alert always
                         elif owner==w and amt>0 and not is_buy:
                             info=get_token_info(mint)
                             if not info: continue
@@ -539,11 +534,10 @@ def handle_command(text):
     global last_bundled
     t=text.strip(); low=t.lower()
     if low.startswith("/start"):
-        mins=int((datetime.now()-last_tx_time).total_seconds()/60)
         uniq=len(set(GROUPS.values()))
         sol_c=sum(1 for w in SOL_WALLETS if isinstance(w,dict) and w.get("chain")=="sol")
         evm_c=len(SOL_WALLETS)-sol_c
-        send_tg(f"🚀 V7 FIX 3-LEVEL + REVIVAL\n{len(SOL_WALLETS)}w (SOL:{sol_c} EVM:{evm_c}) | {uniq} groups\nTracking: 50 most active (no crash)\nLevels: PROBE $20-200 <150kMC<2hr\nSWARM $500-8k 5m 2+ wallets\nWHALE >$1k\nREVIVAL: old>10d but vol5m>$5k +15%\n/bundle <addr>\n/labelgroup <NAME>\n/listgroups\n/listwallets\n/remove\n/status")
+        send_tg(f"🚀 V7 FIX 3-LEVEL + REVIVAL + DEDUP\n{len(SOL_WALLETS)}w (SOL:{sol_c} EVM:{evm_c}) | {uniq} groups\nTracking: 50 most active\nLevels: PROBE $20-200 <150kMC<2hr\nSWARM $500-8k 5m 2+ wallets\nWHALE >$1k\nDIST dedup 120s\n/bundle <addr>\n/labelgroup <NAME>")
     elif low.startswith("/bundle"):
         p=t.split()
         if len(p)<2: send_tg("Usage: /bundle <addr>")
@@ -607,12 +601,12 @@ def handle_command(text):
                     GROUPS.pop(gid,None); LABELS.pop(gid,None); save_all(); send_tg(f"🗑️ Group {a} removed")
                 else: send_tg("Not found")
     elif low.startswith("/clear"):
-        SOL_WALLETS.clear(); GROUPS.clear(); LABELS.clear(); recent_children.clear(); sniper_marked.clear(); recent_token_buys.clear(); save_all(); send_tg("🧹 Cleared")
+        SOL_WALLETS.clear(); GROUPS.clear(); LABELS.clear(); recent_children.clear(); sniper_marked.clear(); recent_token_buys.clear(); last_dist_alert.clear(); save_all(); send_tg("🧹 Cleared")
     elif low.startswith("/status"):
         mins=int((datetime.now()-last_tx_time).total_seconds()/60)
         sol_c=sum(1 for w in SOL_WALLETS if isinstance(w,dict) and w.get("chain")=="sol")
         evm_c=len(SOL_WALLETS)-sol_c
-        send_tg(f"📊 V7 FIX\nWallets {len(SOL_WALLETS)} (SOL:{sol_c} EVM:{evm_c})\nGroups {len(set(GROUPS.values()))}\nTracking 50 most active\nLevels PROBE/SWARM/WHALE + REVIVAL\nLast {mins}m")
+        send_tg(f"📊 V7 FIX DEDUP\nWallets {len(SOL_WALLETS)} (SOL:{sol_c} EVM:{evm_c})\nGroups {len(set(GROUPS.values()))}\nTracking 50 most active\nLast {mins}m")
 
 def poll_commands():
     off=0
@@ -629,7 +623,7 @@ def poll_commands():
 async def main_loop():
     threading.Thread(target=track_funders_15s,daemon=True).start()
     threading.Thread(target=auto_clean_dead_wallets,daemon=True).start()
-    send_tg("🚀 V7 FIX DEPLOYED\n✅ 3-LEVEL: PROBE $20-200 SWARM $500-8k WHALE >$1k\n✅ REVIVAL: old>10d but vol5m>$5k +15% = alert\n✅ Dead $666k $46 dust blocked\n✅ 50 most active wallets (no crash)\n✅ Liq<$5k blocked, BTCX $31k ghost fixed")
+    send_tg("🚀 V7 FIX DEDUP DEPLOYED\n✅ DIST/PREP dedup 120s/90s\n✅ No more 6w,7w,8w spam\n✅ Total fixed")
     await track_sol_polling()
 
 def start_bot():
