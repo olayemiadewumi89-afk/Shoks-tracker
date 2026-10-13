@@ -14,12 +14,13 @@ GROUPS = {}
 LABELS = {}
 seen_sigs = set()
 recent_children = defaultdict(list)
+recent_token_buys = defaultdict(list) # NEW: mint -> [(wallet, usd, time, group)]
 sniper_marked = {}
 tg_queue = deque()
 funder_cache = {}
 last_tx_time = datetime.now()
 last_bundled = None
-last_activity = {} # addr -> datetime of last tx
+last_activity = {}
 
 SOLANA_PUB_RPCS = [
     "https://api.mainnet-beta.solana.com",
@@ -56,17 +57,17 @@ def auto_set_commands():
             {"command":"listgroups","description":"List all groups"},
             {"command":"listwallets","description":"List wallets in group"},
             {"command":"remove","description":"Remove wallet or group"},
-            {"command":"status","description":"Bot status V6.2 FREE"},
+            {"command":"status","description":"Bot status V7 FIX"},
             {"command":"start","description":"Start bot"},
         ]
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands", json={"commands":cmds}, timeout=10)
-        print("✅ Commands auto-set FREE", flush=True)
+        print("✅ Commands auto-set V7", flush=True)
     except Exception as e:
         print(f"setCommands err {e}", flush=True)
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Shoks V6.2 FREE AUTO-CLEAN", 200
+def home(): return "Shoks V7 FIX 3-LEVEL + REVIVAL", 200
 @app.route('/health')
 def health(): return "OK", 200
 def run_flask(): app.run(host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
@@ -160,6 +161,7 @@ load_all()
 
 BLACKLIST_MINTS=["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB","So11111111111111111111111111111111111111112"]
 
+# === NEW: TOKEN INFO WITH VOLUME ===
 def get_token_info(token_address):
     if token_address in BLACKLIST_MINTS: return None
     try:
@@ -180,7 +182,12 @@ def get_token_info(token_address):
             pc=best.get("pairCreatedAt")
             if pc: age_min=int((time.time()*1000-pc)/60000)
         except: pass
-        return {"name":best.get("baseToken",{}).get("symbol",token_address[:6]),"mcap_str":mcap_str,"mcap_val":fdv,"price":price,"dex_link":f"https://dexscreener.com/{best.get('chainId','solana')}/{best.get('pairAddress',token_address)}","photon":f"https://photon-sol.tinyastro.io/en/lp/{token_address}" if best.get("chainId")=="solana" else f"https://photon.tinyastro.io/en/lp/{token_address}","pair":best.get("pairAddress",token_address),"chain":best.get("chainId","solana"),"age_min":age_min}
+        # NEW FIELDS
+        vol24 = float(best.get("volume",{}).get("h24",0) or 0)
+        vol5 = float(best.get("volume",{}).get("m5",0) or 0)
+        liq = float(best.get("liquidity",{}).get("usd",0) or 0)
+        chg5 = float(best.get("priceChange",{}).get("m5",0) or 0)
+        return {"name":best.get("baseToken",{}).get("symbol",token_address[:6]),"mcap_str":mcap_str,"mcap_val":fdv,"price":price,"dex_link":f"https://dexscreener.com/{best.get('chainId','solana')}/{best.get('pairAddress',token_address)}","photon":f"https://photon-sol.tinyastro.io/en/lp/{token_address}" if best.get("chainId")=="solana" else f"https://photon.tinyastro.io/en/lp/{token_address}","pair":best.get("pairAddress",token_address),"chain":best.get("chainId","solana"),"age_min":age_min,"vol24":vol24,"vol5":vol5,"liq":liq,"chg5":chg5}
     except: return None
 
 def get_signatures(wallet, limit=10):
@@ -346,10 +353,79 @@ def alert_prep(funder):
         cluster=f"\nCluster {len(sol_only)}w bundled same coin" if len(sol_only)>=2 else ""
         send_tg(f"⚠️ PREP {len(sol_only)}w 5m ⛓️ {chain}{cluster}\nG:{gl}\n{childs_str}{sniper_str}\n[SC](https://solscan.io/account/{funder})")
 
+# === NEW: CLASSIFY LOGIC ===
+def should_alert(mint, usd, info, wallet_group):
+    # Clean old buys 5m window
+    now = datetime.now()
+    recent = [x for x in recent_token_buys[mint] if (now - x[2]).total_seconds() <= 300]
+    recent_token_buys[mint] = recent
+
+    # Add current buy
+    recent.append((wallet_group, usd, now))
+    recent_token_buys[mint] = recent
+
+    total_5m = sum(x[1] for x in recent)
+    wallets_5m = len(set(x[0] for x in recent))
+    age_min = info["age_min"]
+    mcap = info["mcap_val"]
+    vol5 = info["vol5"]
+    vol24 = info["vol24"]
+    liq = info["liq"]
+    chg5 = info["chg5"]
+
+    # BLOCK dust liquidity
+    if liq < 5000:
+        return None
+
+    # DEAD coin filter with REVIVAL check
+    is_old = age_min > 14400 # >10 days
+    is_dead_volume = vol24 < 2000 and vol5 < 500
+    if is_old and is_dead_volume:
+        # REVIVAL? needs volume spike + price spike + liquidity
+        if not (vol5 > 5000 and chg5 > 15 and liq > 15000):
+            return None # block dead like BTCX $31k ghost
+
+    # 1. PROBE $20-$200 fresh
+    if 20 <= usd <= 200:
+        if mcap < 150000 and age_min < 120 and vol5 > 800:
+            return f"🟢 PROBE: 1w test BUY ${usd:.0f} at {info['mcap_str']} MC | {age_min}m old | vol5m ${vol5:.0f} | {info['name']}"
+        else:
+            return None # block $46 at $666k 1mo old
+
+    # 2. SWARM aggregate $500-$5000 in 5m
+    if 500 <= total_5m <= 8000:
+        if mcap < 600000 and wallets_5m >= 2:
+            if is_old:
+                # revival swarm needs higher vol
+                if vol5 > 8000 and chg5 > 20:
+                    return f"♻️🟡 REVIVAL SWARM: {wallets_5m}w total ${total_5m:.0f} in 5m at {info['mcap_str']} | age {age_min//1440}d | vol5m ${vol5:.0f} +{chg5:.0f}% | {info['name']}"
+                else:
+                    return None
+            else:
+                return f"🟡 SWARM: {wallets_5m}w total ${total_5m:.0f} in 5m at {info['mcap_str']} | {age_min}m | vol24 ${vol24:.0f} | {info['name']}"
+
+    # 3. WHALE >$1000 single
+    if usd >= 1000:
+        if is_old and is_dead_volume:
+            if vol5 > 5000 and liq > 10000:
+                return f"♻️🔵 REVIVAL WHALE: 1w BUY ${usd:.0f} at {info['mcap_str']} | {age_min//1440}d old but vol spike ${vol5:.0f} | {info['name']}"
+            else:
+                return None
+        return f"🔵 WHALE: 1w BUY ${usd:.0f} at {info['mcap_str']} | {age_min}m | liq ${liq:.0f} | {info['name']}"
+
+    return None
+
 async def track_sol_polling():
     while True:
         try:
-            for wdict in SOL_WALLETS[-40:]:
+            # KEEP 50 MOST ACTIVE TO AVOID CRASH (your request)
+            if last_activity:
+                sorted_w = sorted(SOL_WALLETS, key=lambda wdict: last_activity.get(wdict["addr"] if isinstance(wdict, dict) else wdict, datetime.min), reverse=True)
+                active_list = sorted_w[:50]
+            else:
+                active_list = SOL_WALLETS[-40:]
+
+            for wdict in active_list:
                 w=wdict["addr"] if isinstance(wdict,dict) else wdict
                 chain=wdict.get("chain","sol") if isinstance(wdict,dict) else "sol"
                 if chain!="sol": continue
@@ -359,27 +435,33 @@ async def track_sol_polling():
                     if not sig or sig in seen_sigs: continue
                     sols,tokens=get_tx_details(sig)
                     for _,owner,mint,amt,is_buy in tokens:
-                        if owner==w and amt>0:
+                        if owner==w and amt>0 and is_buy:
                             info=get_token_info(mint)
                             if not info: continue
                             usd=amt*info["price"]
-                            if usd<10: continue
+                            if usd<15: continue
                             seen_sigs.add(sig); save_seen()
                             global last_tx_time; last_tx_time=datetime.now()
                             last_activity[w]=datetime.now()
                             is_sniper=w in sniper_marked
-                            is_low=info["mcap_val"]<300_000; is_new=info["age_min"]<180
                             gl=display_group(w)
                             ds=info["dex_link"]; ph=info["photon"]; txl=f"https://solscan.io/tx/{sig}"
-                            if is_buy:
-                                if is_low and is_new:
-                                    tag="SNIPER" if is_sniper else "EARLY"
-                                    send_tg(f"🎯 EARLY {info['mcap_str']}\n🪙 {info['name']} | {info['mcap_str']} | {info['age_min']}m\n👤 `{short(w)}` G:{gl} {tag} | ${usd:.0f}\nCA: `{mint}`\n[DS]({ds}) [PH]({ph}) [TX]({txl})")
-                                else:
-                                    tag=" SNIPER" if is_sniper else ""
-                                    send_tg(f"💰 BUY ${usd:.0f} {info['mcap_str']}\n{info['name']} | `{short(w)}` G:{gl}{tag}\nCA: `{mint[:6]}..{mint[-4:]}`\n[DS]({ds}) [PH]({ph}) [TX]({txl})")
-                            else:
-                                send_tg(f"🔻 SELL ${usd:.0f} {info['mcap_str']}\n{info['name']} | `{short(w)}` G:{gl}\nCA: `{mint[:6]}..{mint[-4:]}`\n[DS]({ds}) [PH]({ph}) [TX]({txl})")
+
+                            alert_text = should_alert(mint, usd, info, w)
+                            if alert_text:
+                                sniper_tag = " 👑 SNIPER" if is_sniper else ""
+                                send_tg(f"{alert_text}\n👤 `{short(w)}` G:{gl}{sniper_tag}\nCA: `{mint}`\nVol24 ${info['vol24']:.0f} Vol5m ${info['vol5']:.0f} Liq ${info['liq']:.0f} {info['chg5']:.0f}% 5m\n[DS]({ds}) [PH]({ph}) [TX]({txl})")
+                            # SELL still alert always
+                        elif owner==w and amt>0 and not is_buy:
+                            info=get_token_info(mint)
+                            if not info: continue
+                            usd=amt*info["price"]
+                            if usd<100: continue
+                            seen_sigs.add(sig); save_seen()
+                            last_activity[w]=datetime.now()
+                            gl=display_group(w)
+                            ds=info["dex_link"]; ph=info["photon"]; txl=f"https://solscan.io/tx/{sig}"
+                            send_tg(f"🔻 SELL ${usd:.0f} {info['mcap_str']}\n{info['name']} | `{short(w)}` G:{gl}\nCA: `{mint[:6]}..{mint[-4:]}`\n[DS]({ds}) [PH]({ph}) [TX]({txl})")
         except Exception as e: print(f"poll err {e}", flush=True)
         await asyncio.sleep(6)
 
@@ -419,28 +501,26 @@ def track_funders_15s():
                 except: continue
         except Exception as e: print(f"funder err {e}", flush=True)
 
-# === NEW: AUTO-DELETE DEAD WALLETS - FREE ===
 def auto_clean_dead_wallets():
     while True:
-        time.sleep(3600) # run every 1 hour - FREE
+        time.sleep(3600)
         try:
-            if len(SOL_WALLETS) < 50: continue # don't clean if less than 50
+            if len(SOL_WALLETS) < 50: continue
             now=datetime.now()
             to_remove=[]
             checked=0
-            for wdict in SOL_WALLETS[:]: # copy
-                if checked >= 20: break # check max 20 per hour to save RPC - FREE
+            for wdict in SOL_WALLETS[:]:
+                if checked >= 20: break
                 w=wdict["addr"] if isinstance(wdict,dict) else wdict
                 chain=wdict.get("chain","sol") if isinstance(wdict,dict) else "sol"
                 if chain!="sol": continue
-                if w in GROUPS.values(): continue # never delete funder/parent
-                if w in sniper_marked: continue # never delete main sniper
+                if w in GROUPS.values(): continue
+                if w in sniper_marked: continue
                 last_act=last_activity.get(w)
-                if last_act and (now-last_act).total_seconds() < 86400: continue # active in last 24h, keep
+                if last_act and (now-last_act).total_seconds() < 86400: continue
                 bal=get_sol_balance(w)
                 checked+=1
                 time.sleep(0.5)
-                # DELETE ONLY IF <0.005 SOL = dust, no money
                 if bal < 0.005:
                     to_remove.append(wdict)
             if to_remove:
@@ -451,7 +531,7 @@ def auto_clean_dead_wallets():
                     last_activity.pop(w, None)
                     sniper_marked.pop(w, None)
                 save_all()
-                send_tg(f"🧹 Auto-cleaned {len(to_remove)} dead wallets (<0.005 SOL, no activity 24h)\nKept all wallets with >0.01 SOL\nNow {len(SOL_WALLETS)} wallets")
+                send_tg(f"🧹 Auto-cleaned {len(to_remove)} dead wallets (<0.005 SOL, no activity 24h)\nNow {len(SOL_WALLETS)} wallets")
         except Exception as e:
             print(f"clean err {e}", flush=True)
 
@@ -463,7 +543,7 @@ def handle_command(text):
         uniq=len(set(GROUPS.values()))
         sol_c=sum(1 for w in SOL_WALLETS if isinstance(w,dict) and w.get("chain")=="sol")
         evm_c=len(SOL_WALLETS)-sol_c
-        send_tg(f"🚀 V6.2 FREE AUTO-CLEAN\n{len(SOL_WALLETS)}w (SOL:{sol_c} EVM:{evm_c}) | {uniq} groups | {len(LABELS)} labels\nLast {mins}m\nAuto-delete ON: <0.005 SOL + 24h inactive = dead\nKeep >0.01 SOL forever\n/bundle <addr>\n/labelgroup <NAME>\n/listgroups\n/listwallets\n/remove\n/status")
+        send_tg(f"🚀 V7 FIX 3-LEVEL + REVIVAL\n{len(SOL_WALLETS)}w (SOL:{sol_c} EVM:{evm_c}) | {uniq} groups\nTracking: 50 most active (no crash)\nLevels: PROBE $20-200 <150kMC<2hr\nSWARM $500-8k 5m 2+ wallets\nWHALE >$1k\nREVIVAL: old>10d but vol5m>$5k +15%\n/bundle <addr>\n/labelgroup <NAME>\n/listgroups\n/listwallets\n/remove\n/status")
     elif low.startswith("/bundle"):
         p=t.split()
         if len(p)<2: send_tg("Usage: /bundle <addr>")
@@ -527,12 +607,12 @@ def handle_command(text):
                     GROUPS.pop(gid,None); LABELS.pop(gid,None); save_all(); send_tg(f"🗑️ Group {a} removed")
                 else: send_tg("Not found")
     elif low.startswith("/clear"):
-        SOL_WALLETS.clear(); GROUPS.clear(); LABELS.clear(); recent_children.clear(); sniper_marked.clear(); save_all(); send_tg("🧹 Cleared")
+        SOL_WALLETS.clear(); GROUPS.clear(); LABELS.clear(); recent_children.clear(); sniper_marked.clear(); recent_token_buys.clear(); save_all(); send_tg("🧹 Cleared")
     elif low.startswith("/status"):
         mins=int((datetime.now()-last_tx_time).total_seconds()/60)
         sol_c=sum(1 for w in SOL_WALLETS if isinstance(w,dict) and w.get("chain")=="sol")
         evm_c=len(SOL_WALLETS)-sol_c
-        send_tg(f"📊 V6.2 FREE AUTO-CLEAN\nWallets {len(SOL_WALLETS)} (SOL:{sol_c} EVM:{evm_c})\nGroups {len(set(GROUPS.values()))}\nLabels {len(LABELS)}\nSniper {len(sniper_marked)}\nLast {mins}m\nAuto-delete: <0.005 SOL + 24h inactive = dead\nKeep: >0.01 SOL always safe")
+        send_tg(f"📊 V7 FIX\nWallets {len(SOL_WALLETS)} (SOL:{sol_c} EVM:{evm_c})\nGroups {len(set(GROUPS.values()))}\nTracking 50 most active\nLevels PROBE/SWARM/WHALE + REVIVAL\nLast {mins}m")
 
 def poll_commands():
     off=0
@@ -548,8 +628,8 @@ def poll_commands():
 
 async def main_loop():
     threading.Thread(target=track_funders_15s,daemon=True).start()
-    threading.Thread(target=auto_clean_dead_wallets,daemon=True).start() # FREE AUTO-CLEAN
-    send_tg("🚀 V6.2 FREE AUTO-CLEAN DEPLOYED\n✅ Dead <0.005 SOL + no activity 24h = auto-delete\n✅ Keep >0.01 SOL forever safe\n✅ Never delete funder or main sniper\nUptimeRobot 5m is OK")
+    threading.Thread(target=auto_clean_dead_wallets,daemon=True).start()
+    send_tg("🚀 V7 FIX DEPLOYED\n✅ 3-LEVEL: PROBE $20-200 SWARM $500-8k WHALE >$1k\n✅ REVIVAL: old>10d but vol5m>$5k +15% = alert\n✅ Dead $666k $46 dust blocked\n✅ 50 most active wallets (no crash)\n✅ Liq<$5k blocked, BTCX $31k ghost fixed")
     await track_sol_polling()
 
 def start_bot():
