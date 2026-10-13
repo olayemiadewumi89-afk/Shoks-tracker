@@ -21,7 +21,7 @@ funder_cache = {}
 last_tx_time = datetime.now()
 last_bundled = None
 last_activity = {}
-last_dist_alert = {} # NEW: dedup -> (funder,mint) -> (time, count)
+last_dist_alert = {}
 
 SOLANA_PUB_RPCS = [
     "https://api.mainnet-beta.solana.com",
@@ -58,17 +58,17 @@ def auto_set_commands():
             {"command":"listgroups","description":"List all groups"},
             {"command":"listwallets","description":"List wallets in group"},
             {"command":"remove","description":"Remove wallet or group"},
-            {"command":"status","description":"Bot status V7 FIX"},
+            {"command":"status","description":"Bot status V8 NEW"},
             {"command":"start","description":"Start bot"},
         ]
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands", json={"commands":cmds}, timeout=10)
-        print("✅ Commands auto-set V7", flush=True)
+        print("✅ Commands auto-set V8 NEW", flush=True)
     except Exception as e:
         print(f"setCommands err {e}", flush=True)
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Shoks V7 FIX 3-LEVEL + REVIVAL", 200
+def home(): return "Shoks V8 NEW ONLY", 200
 @app.route('/health')
 def health(): return "OK", 200
 def run_flask(): app.run(host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
@@ -81,7 +81,8 @@ def send_tg_worker():
                 if not BOT_TOKEN or not CHAT_ID: print(text[:800], flush=True)
                 else:
                     try:
-                        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json={"chat_id":CHAT_ID,"text":text,"parse_mode":"Markdown","disable_web_page_preview":True},timeout=15)
+                        # FIX: NO MARKDOWN = NO CRASH ON _
+                        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json={"chat_id":CHAT_ID,"text":text,"disable_web_page_preview":True},timeout=15)
                     except: pass
                 time.sleep(0.6)
             else: time.sleep(0.2)
@@ -263,7 +264,7 @@ def handle_bundle(wallet):
     chain=detect_chain(wallet)
     evm=is_evm(wallet)
     if not evm and len(wallet)<30: send_tg("❌ Invalid wallet"); return
-    send_tg(f"🔍 FORWARD `{short(wallet)}` ⛓️ {chain.upper()}...")
+    send_tg(f"🔍 FORWARD {short(wallet)} ⛓️ {chain.upper()}...")
     try:
         funders=[]
         if not evm:
@@ -273,13 +274,14 @@ def handle_bundle(wallet):
                 if not sig: continue
                 sols,_=get_tx_details(sig)
                 for frm,to,amt in sols:
-                    if to==wallet and amt>=0.03 and frm not in [f[0] for f in funders]:
+                    # NEW ONLY FIX: 0.001 instead of 0.03
+                    if to==wallet and amt>=0.001 and frm not in [f[0] for f in funders]:
                         funders.append((frm,amt,sig))
         else:
             for ch in ["base","bsc"]:
                 txs=get_evm_txs(wallet, ch, 15)
                 for frm,to,amt,hash_ in parse_evm_transfers(txs):
-                    if to==wallet.lower() and amt>=0.002 and frm not in [f[0] for f in funders]:
+                    if to==wallet.lower() and amt>=0.0005 and frm not in [f[0] for f in funders]:
                         funders.append((frm,amt,hash_))
                         chain=ch
                 if funders: break
@@ -291,7 +293,7 @@ def handle_bundle(wallet):
             LABELS[wallet]=f"CEX_{short(wallet).upper()}"
             last_bundled=wallet; save_all()
             last_activity[wallet]=datetime.now()
-            send_tg(f"⚠️ No parent — **CEX/BINANCE**\n`{short(wallet)}` ⛓️ {chain.upper()}\n`CEX - {short(wallet)}`\nFORWARD tracking ON\n`/labelgroup FOMOFARMER`"); return
+            send_tg(f"⚠️ No parent — CEX/BINANCE\n{short(wallet)} ⛓️ {chain.upper()}\nCEX - {short(wallet)}\nFORWARD tracking ON\n/labelgroup FOMOFARMER"); return
 
         main_funder=funders[0][0]; last_bundled=main_funder
         GROUPS[wallet]=main_funder; GROUPS[main_funder]=main_funder
@@ -303,28 +305,33 @@ def handle_bundle(wallet):
         last_activity[main_funder]=datetime.now()
         added=0
         if not evm:
-            sib_sigs=get_signatures(main_funder,20)
-            for item in sib_sigs[:15]:
+            # NEW ONLY: only last 10 txs and only 10 min old
+            sib_sigs=get_signatures(main_funder,10)
+            now_ts = time.time()
+            for item in sib_sigs[:10]:
+                # TIME FILTER - NEW ONLY
+                bt = item.get("blockTime",0)
+                if bt and (now_ts - bt) > 600: # 600s = 10 min - skip old
+                    continue
                 sig=item.get("signature")
                 if not sig: continue
                 sols,_=get_tx_details(sig)
                 for frm,to,amt in sols:
-                    if frm==main_funder and to!=wallet and not wallet_exists(to) and amt>=0.03 and added<7:
+                    if frm==main_funder and to!=wallet and not wallet_exists(to) and amt>=0.001 and added<7:
                         SOL_WALLETS.append({"addr":to,"chain":chain,"group":main_funder}); GROUPS[to]=main_funder; added+=1
                         recent_children[main_funder].append((to,amt,datetime.now(),False,None))
                         last_activity[to]=datetime.now()
         else:
             txs=get_evm_txs(main_funder, chain, 20)
             for frm,to,amt,hash_ in parse_evm_transfers(txs):
-                if frm==main_funder.lower() and to!=wallet.lower() and not wallet_exists(to) and amt>=0.001 and added<7:
+                if frm==main_funder.lower() and to!=wallet.lower() and not wallet_exists(to) and amt>=0.0005 and added<7:
                     SOL_WALLETS.append({"addr":to,"chain":chain,"group":main_funder}); GROUPS[to]=main_funder; added+=1
                     recent_children[main_funder].append((to,amt,datetime.now(),False,None))
                     last_activity[to]=datetime.now()
         save_all(); save_recent()
-        send_tg(f"📦 Bundled `{short(wallet)}` ⛓️ {chain.upper()}\nParent `{short(main_funder)}` G:{display_group(main_funder)}\n✅ +{added} sibs | Total {len(SOL_WALLETS)}\nFORWARD ON\n`/labelgroup FOMOFARMER`")
+        send_tg(f"📦 Bundled {short(wallet)} ⛓️ {chain.upper()}\nParent {short(main_funder)} G:{display_group(main_funder)}\n✅ +{added} NEW sibs (10m) | Total {len(SOL_WALLETS)}\nFORWARD ON\n/labelgroup FOMOFARMER")
     except Exception as e: send_tg(f"❌ Bundle error: {e}")
 
-# === FIXED PREP / DIST WITH DEDUP ===
 def alert_prep(funder):
     now=datetime.now()
     recent=[x for x in recent_children[funder] if (now-x[2]).total_seconds()<=300]
@@ -340,21 +347,18 @@ def alert_prep(funder):
     if token_only:
         mint=token_only[-1][4] if len(token_only[-1])>4 else "token"
         count=len(token_only)
-        # DEDUP: if same funder+mint alerted <120s ago and count not grew by >=3, skip
         key=(funder, mint)
         last = last_dist_alert.get(key)
         if last and (now-last[0]).total_seconds() < 120 and count <= last[1]+2:
             return
         last_dist_alert[key]=(now, count)
-
         info=get_token_info(mint) if mint and mint!="token" else None
         name=info["name"] if info else short(mint) if mint else "token"
         mcap=info["mcap_str"] if info else ""
-        # FIX Total 0 - show last 5 with actual amounts
-        child_list="\n".join([f"• `{short(c[0])}` {c[1]:.2f} {name} +0.01 gas" if c[1]>=0.01 else f"• `{short(c[0])}` {c[1]:.0f} {name}" for c in token_only[-5:]])
+        child_list="\n".join([f"• {short(c[0])} {c[1]:.2f} {name} +0.01 gas" if c[1]>=0.01 else f"• {short(c[0])} {c[1]:.0f} {name}" for c in token_only[-5:]])
         total=sum(c[1] for c in token_only)
         total_str = f"\nTotal {total:.0f}" if total>=1 else ""
-        send_tg(f"🔴🔴🔴 DIST {count}w ABOUT TO SELL 🔴🔴🔴\nG:{gl} `{short(funder)}` ⛓️ {chain}\nToken {name} {mcap}\n{child_list}{total_str}\n[SC](https://solscan.io/account/{funder})")
+        send_tg(f"🔴🔴🔴 DIST {count}w ABOUT TO SELL 🔴🔴🔴\nG:{gl} {short(funder)} ⛓️ {chain}\nToken {name} {mcap}\n{child_list}{total_str}\nSC: https://solscan.io/account/{funder}")
         return
 
     if len(sol_only)>=1:
@@ -364,15 +368,14 @@ def alert_prep(funder):
         if last and (now-last[0]).total_seconds() < 90 and count <= last[1]+1:
             return
         last_dist_alert[key]=(now, count)
-
         biggest=max(sol_only, key=lambda x: x[1])
         biggest_amt=biggest[1]; biggest_child=biggest[0]
         if biggest_amt>=0.08:
             sniper_marked[biggest_child]={"funder":funder,"amt":biggest_amt,"time":now,"group":gl}
-        childs_str=" ".join([f"`{short(c[0])}` {c[1]:.2f}S" for c in sol_only[:5]])
-        sniper_str=f"\n🎯 MAIN SNIPER `{short(biggest_child)}` {biggest_amt:.2f} 👑" if biggest_amt>=0.15 else ""
+        childs_str=" ".join([f"{short(c[0])} {c[1]:.3f}S" for c in sol_only[:5]])
+        sniper_str=f"\n🎯 MAIN SNIPER {short(biggest_child)} {biggest_amt:.3f} 👑" if biggest_amt>=0.15 else ""
         cluster=f"\nCluster {len(sol_only)}w bundled same coin" if len(sol_only)>=2 else ""
-        send_tg(f"⚠️ PREP {len(sol_only)}w 5m ⛓️ {chain}{cluster}\nG:{gl}\n{childs_str}{sniper_str}\n[SC](https://solscan.io/account/{funder})")
+        send_tg(f"⚠️ PREP {len(sol_only)}w 5m ⛓️ {chain}{cluster}\nG:{gl}\n{childs_str}{sniper_str}\nSC: https://solscan.io/account/{funder}")
 
 def should_alert(mint, usd, info, wallet_group):
     now = datetime.now()
@@ -446,7 +449,7 @@ async def track_sol_polling():
                             alert_text = should_alert(mint, usd, info, w)
                             if alert_text:
                                 sniper_tag = " 👑 SNIPER" if is_sniper else ""
-                                send_tg(f"{alert_text}\n👤 `{short(w)}` G:{gl}{sniper_tag}\nCA: `{mint}`\nVol24 ${info['vol24']:.0f} Vol5m ${info['vol5']:.0f} Liq ${info['liq']:.0f} {info['chg5']:.0f}% 5m\n[DS]({ds}) [PH]({ph}) [TX]({txl})")
+                                send_tg(f"{alert_text}\n👤 {short(w)} G:{gl}{sniper_tag}\nCA: {mint}\nVol24 ${info['vol24']:.0f} Vol5m ${info['vol5']:.0f} Liq ${info['liq']:.0f} {info['chg5']:.0f}% 5m\nDS: {ds}\nPH: {ph}\nTX: {txl}")
                         elif owner==w and amt>0 and not is_buy:
                             info=get_token_info(mint)
                             if not info: continue
@@ -456,7 +459,7 @@ async def track_sol_polling():
                             last_activity[w]=datetime.now()
                             gl=display_group(w)
                             ds=info["dex_link"]; ph=info["photon"]; txl=f"https://solscan.io/tx/{sig}"
-                            send_tg(f"🔻 SELL ${usd:.0f} {info['mcap_str']}\n{info['name']} | `{short(w)}` G:{gl}\nCA: `{mint[:6]}..{mint[-4:]}`\n[DS]({ds}) [PH]({ph}) [TX]({txl})")
+                            send_tg(f"🔻 SELL ${usd:.0f} {info['mcap_str']}\n{info['name']} | {short(w)} G:{gl}\nCA: {mint[:6]}..{mint[-4:]}\nDS: {ds} PH: {ph} TX: {txl}")
         except Exception as e: print(f"poll err {e}", flush=True)
         await asyncio.sleep(6)
 
@@ -471,13 +474,18 @@ def track_funders_15s():
                 try:
                     chain=get_wallet_chain(funder)
                     if chain=="sol":
-                        sigs=get_signatures(funder,8)
-                        for item in sigs[:5]:
+                        # NEW ONLY: 5 txs only, 5 min filter
+                        sigs=get_signatures(funder,5)
+                        now_ts = time.time()
+                        for item in sigs[:3]:
+                            bt = item.get("blockTime",0)
+                            if bt and (now_ts - bt) > 300: # 5 min NEW ONLY
+                                continue
                             sig=item.get("signature")
                             if not sig or sig in seen_sigs: continue
                             sols,tokens=get_tx_details(sig)
                             for frm,to,amt in sols:
-                                if frm==funder and amt>=0.02 and not wallet_exists(to):
+                                if frm==funder and amt>=0.001 and not wallet_exists(to):
                                     SOL_WALLETS.append({"addr":to,"chain":"sol","group":GROUPS.get(funder,funder)}); GROUPS[to]=GROUPS.get(funder,funder); save_all()
                                     recent_children[funder].append((to,amt,datetime.now(),False,None)); seen_sigs.add(sig); save_seen(); save_recent()
                                     last_activity[to]=datetime.now(); last_activity[funder]=datetime.now(); alert_prep(funder)
@@ -489,7 +497,7 @@ def track_funders_15s():
                     else:
                         txs=get_evm_txs(funder, chain, 8)
                         for frm,to,amt,hash_ in parse_evm_transfers(txs):
-                            if frm==funder.lower() and not wallet_exists(to) and amt>=0.001 and hash_ not in seen_sigs:
+                            if frm==funder.lower() and not wallet_exists(to) and amt>=0.0005 and hash_ not in seen_sigs:
                                 SOL_WALLETS.append({"addr":to,"chain":chain,"group":GROUPS.get(funder,funder)}); GROUPS[to]=GROUPS.get(funder,funder); save_all()
                                 recent_children[funder].append((to,amt,datetime.now(),False,None)); seen_sigs.add(hash_); save_seen(); save_recent()
                                 last_activity[to]=datetime.now(); alert_prep(funder)
@@ -537,7 +545,7 @@ def handle_command(text):
         uniq=len(set(GROUPS.values()))
         sol_c=sum(1 for w in SOL_WALLETS if isinstance(w,dict) and w.get("chain")=="sol")
         evm_c=len(SOL_WALLETS)-sol_c
-        send_tg(f"🚀 V7 FIX 3-LEVEL + REVIVAL + DEDUP\n{len(SOL_WALLETS)}w (SOL:{sol_c} EVM:{evm_c}) | {uniq} groups\nTracking: 50 most active\nLevels: PROBE $20-200 <150kMC<2hr\nSWARM $500-8k 5m 2+ wallets\nWHALE >$1k\nDIST dedup 120s\n/bundle <addr>\n/labelgroup <NAME>")
+        send_tg(f"🚀 V8 NEW ONLY - 10m filter\n{len(SOL_WALLETS)}w (SOL:{sol_c} EVM:{evm_c}) | {uniq} groups\nTracking: 50 most active\nOnly NEW wallets 10m old\n/bundle <addr>\n/labelgroup <NAME>")
     elif low.startswith("/bundle"):
         p=t.split()
         if len(p)<2: send_tg("Usage: /bundle <addr>")
@@ -551,7 +559,7 @@ def handle_command(text):
             if not target: send_tg("Bundle first"); return
             gk=GROUPS.get(target,target)
             LABELS[gk]=nl; save_all()
-            send_tg(f"🏷️ `{short(gk)}` → **{nl}**")
+            send_tg(f"Label {short(gk)} -> {nl}")
     elif low.startswith("/listgroups"):
         c=Counter(GROUPS.values())
         if not c: send_tg("No groups")
@@ -562,7 +570,7 @@ def handle_command(text):
                 name=lbl if lbl else short(g)
                 extra=f" ({short(g)})" if lbl else ""
                 lines.append(f"{name}: {cnt}w{extra}")
-            send_tg("📦 Groups:\n"+"\n".join(lines))
+            send_tg("Groups:\n"+"\n".join(lines))
     elif low.startswith("/listwallets") or (low.startswith("/list") and not low.startswith("/listgroups")):
         parts=t.split(maxsplit=1)
         filter_gid=None
@@ -576,12 +584,12 @@ def handle_command(text):
             wallets=[w for w in SOL_WALLETS if (w.get("group") if isinstance(w,dict) else GROUPS.get(w,w))==filter_gid or GROUPS.get(w.get("addr","") if isinstance(w,dict) else w,"")==filter_gid]
         if not wallets: send_tg("Empty")
         else:
-            msg=f"📋 {len(wallets)}w:\n"
+            msg=f"{len(wallets)}w:\n"
             for wdict in wallets[-50:]:
                 w=wdict["addr"] if isinstance(wdict,dict) else wdict
                 ch=wdict.get("chain","sol").upper() if isinstance(wdict,dict) else "SOL"
                 g=display_group(w); tag=" SNIPER" if w in sniper_marked else ""
-                msg+=f"`{short(w)}` ⛓️{ch} G:{g}{tag}\n"
+                msg+=f"{short(w)} {ch} G:{g}{tag}\n"
             send_tg(msg)
     elif low.startswith("/remove"):
         p=t.split()
@@ -591,22 +599,22 @@ def handle_command(text):
             to_del=[w for w in SOL_WALLETS if (w["addr"] if isinstance(w,dict) else w)==a]
             if to_del:
                 for w in to_del: SOL_WALLETS.remove(w); GROUPS.pop(w["addr"] if isinstance(w,dict) else w,None)
-                save_all(); send_tg(f"🗑️ `{short(a)}` removed")
+                save_all(); send_tg(f"Removed {short(a)}")
             else:
                 gid=None
                 for g,l in LABELS.items():
                     if l==a.upper(): gid=g; break
                 if gid:
                     SOL_WALLETS[:]=[w for w in SOL_WALLETS if (w.get("group") if isinstance(w,dict) else GROUPS.get(w,w))!=gid and (w.get("addr") if isinstance(w,dict) else w)!=gid]
-                    GROUPS.pop(gid,None); LABELS.pop(gid,None); save_all(); send_tg(f"🗑️ Group {a} removed")
+                    GROUPS.pop(gid,None); LABELS.pop(gid,None); save_all(); send_tg(f"Group {a} removed")
                 else: send_tg("Not found")
     elif low.startswith("/clear"):
-        SOL_WALLETS.clear(); GROUPS.clear(); LABELS.clear(); recent_children.clear(); sniper_marked.clear(); recent_token_buys.clear(); last_dist_alert.clear(); save_all(); send_tg("🧹 Cleared")
+        SOL_WALLETS.clear(); GROUPS.clear(); LABELS.clear(); recent_children.clear(); sniper_marked.clear(); recent_token_buys.clear(); last_dist_alert.clear(); save_all(); send_tg("Cleared")
     elif low.startswith("/status"):
         mins=int((datetime.now()-last_tx_time).total_seconds()/60)
         sol_c=sum(1 for w in SOL_WALLETS if isinstance(w,dict) and w.get("chain")=="sol")
         evm_c=len(SOL_WALLETS)-sol_c
-        send_tg(f"📊 V7 FIX DEDUP\nWallets {len(SOL_WALLETS)} (SOL:{sol_c} EVM:{evm_c})\nGroups {len(set(GROUPS.values()))}\nTracking 50 most active\nLast {mins}m")
+        send_tg(f"V8 NEW ONLY\nWallets {len(SOL_WALLETS)} (SOL:{sol_c} EVM:{evm_c})\nGroups {len(set(GROUPS.values()))}\nTracking 50 most active\nLast {mins}m")
 
 def poll_commands():
     off=0
@@ -623,7 +631,7 @@ def poll_commands():
 async def main_loop():
     threading.Thread(target=track_funders_15s,daemon=True).start()
     threading.Thread(target=auto_clean_dead_wallets,daemon=True).start()
-    send_tg("🚀 V7 FIX DEDUP DEPLOYED\n✅ DIST/PREP dedup 120s/90s\n✅ No more 6w,7w,8w spam\n✅ Total fixed")
+    send_tg("🚀 V8 NEW ONLY DEPLOYED\n✅ Only 10m new wallets\n✅ Catches 0.0015 fundings\n✅ No Markdown crash")
     await track_sol_polling()
 
 def start_bot():
