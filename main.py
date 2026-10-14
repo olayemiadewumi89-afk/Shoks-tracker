@@ -15,10 +15,11 @@ BUY_BUFFER = defaultdict(list)
 SELL_BUFFER = defaultdict(list)
 LAST_ALERT = {}
 PREP_TRACKER = defaultdict(list)
+SEEN_MINTS = set() # NEW - to stop spam
 
 app_flask = Flask(__name__)
 @app_flask.route('/')
-def home(): return "SHOKS V25 CONFLICT FIX LIVE"
+def home(): return "SHOKS V26 ANTI-SPAM LIVE"
 def run_flask(): app_flask.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
 def rpc(m,p):
@@ -40,8 +41,9 @@ def dex_info(mint):
     try:
         ds = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=6).json()
         pair = ds.get('pairs',[{}])[0]
+        if not pair: return None, None, None, None
         return pair.get('baseToken',{}).get('symbol','UNKNOWN'), pair.get('fdv','?'), pair.get('volume',{}).get('h24','?'), pair.get('priceUsd','?')
-    except: return "UNKNOWN","?","?","?"
+    except: return None, None, None, None
 
 async def find_funder(addr):
     sigs = await asyncio.to_thread(get_sigs, addr, 20)
@@ -95,8 +97,13 @@ async def bundle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg = f"✅ No funder found on-chain.\nMaybe it's from Binance / OKX / CEX - central exchange.\nThat's where it's from and that's good.\n\n"
     SOL_WALLETS[a] = {"parent":"ROOT","gen":0,"added_at":time.time()}
+    # PRELOAD existing mints as seen to avoid spam
+    toks = await asyncio.to_thread(get_tokens, a)
+    for tok in toks:
+        try: SEEN_MINTS.add(tok['account']['data']['parsed']['info']['mint'])
+        except: pass
     SEEN_TX.clear()
-    msg += f"Now tracking {a[:6]}.. forward ONLY >0.001 SOL\nKeep following the money...\n\n👉 You name it:\n/labelgroup {a[:4]}.. <your_team_name>"
+    msg += f"Now tracking {a[:6]}.. forward ONLY >0.001 SOL\nOld tokens ignored to stop spam\n\n👉 You name it:\n/labelgroup {a[:4]}.. <your_team_name>"
     await update.message.reply_text(msg)
 
 async def labelgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -138,10 +145,10 @@ async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"⚙️ V25 CONFLICT FIX\nWallets: {len(SOL_WALLETS)}\nLabour Groups: {len(LABELS)}\nSeen TX: {len(SEEN_TX)}\nBuy Buffer: {len(BUY_BUFFER)}\nCHAT: {CHAT_ID}")
+    await update.message.reply_text(f"⚙️ V26 ANTI-SPAM\nWallets: {len(SOL_WALLETS)}\nLabour Groups: {len(LABELS)}\nSeen TX: {len(SEEN_TX)}\nSeen Mints: {len(SEEN_MINTS)}\nCHAT: {CHAT_ID}")
 
 async def clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    SOL_WALLETS.clear(); SEEN_TX.clear(); DELETED.clear(); BUY_BUFFER.clear(); SELL_BUFFER.clear(); PREP_TRACKER.clear()
+    SOL_WALLETS.clear(); SEEN_TX.clear(); DELETED.clear(); BUY_BUFFER.clear(); SELL_BUFFER.clear(); PREP_TRACKER.clear(); SEEN_MINTS.clear(); LAST_ALERT.clear()
     await update.message.reply_text("🗑️ Cleared all wallets & buffers.\nReady for new /bundle")
 
 async def error_handler(update, context):
@@ -197,12 +204,19 @@ async def buy_loop(app):
                     try:
                         info=tok['account']['data']['parsed']['info']; mint=info['mint']; amt=float(info['tokenAmount']['uiAmount'])
                         if amt==0: continue
+                        if mint in SEEN_MINTS: continue # SKIP OLD TOKENS
                         if mint in LAST_ALERT and time.time()-LAST_ALERT[mint]<600: continue
                         name,mcap,vol,price = await asyncio.to_thread(dex_info, mint)
-                        try: usd_val = float(price) * amt if price!="?" else 0
-                        except: usd_val = 0
+                        if not name or name=="UNKNOWN": continue # SKIP UNKNOWN
+                        if not price or price=="?": continue
+                        try: price_f = float(price)
+                        except: continue
+                        if price_f==0: continue
+                        usd_val = price_f * amt
+                        if usd_val < 5: continue # SKIP DUST < $5
                         if not any(b['addr']==addr for b in BUY_BUFFER[mint]):
                             BUY_BUFFER[mint].append({"addr":addr,"time":time.time(),"gen":SOL_WALLETS[addr]['gen'],"amt":amt,"usd":usd_val})
+                            SEEN_MINTS.add(mint) # mark as seen immediately
                     except: continue
             await asyncio.sleep(6)
         except: await asyncio.sleep(6)
@@ -217,7 +231,9 @@ async def cluster_alert_loop(app):
                 if not buys: BUY_BUFFER.pop(mint,None); continue
                 if time.time()-min(b['time'] for b in buys)>15:
                     name,mcap,vol,price = await asyncio.to_thread(dex_info, mint)
+                    if not name or name=="UNKNOWN": BUY_BUFFER.pop(mint,None); continue
                     total_usd = sum([b['usd'] for b in buys])
+                    if total_usd < 10: BUY_BUFFER.pop(mint,None); continue
                     buyers=" ".join([f"{b['addr'][:4]}..g{b['gen']}" for b in buys[:10]])
                     group_name = ""
                     for b in buys:
@@ -237,6 +253,7 @@ async def cluster_alert_loop(app):
                 if not sells: SELL_BUFFER.pop(mint,None); continue
                 if len(sells)>=2 and time.time()-min(s['time'] for s in sells)>15:
                     name,mcap,vol,price = await asyncio.to_thread(dex_info, mint)
+                    if not name or name=="UNKNOWN": SELL_BUFFER.pop(mint,None); continue
                     msg=(f"⚠️ SELL PREP\nToken: ${name}\nCA: `{mint}`\n{len(sells)} transfers\n[Dex](https://dexscreener.com/solana/{mint}) | [Photon](https://photon-sol.tinyastro.io/en/lp/{mint})\nTX: https://solscan.io/tx/{sells[0]['sig']}")
                     await app.bot.send_message(CHAT_ID, msg, parse_mode="Markdown", disable_web_page_preview=True)
                     SELL_BUFFER.pop(mint,None)
@@ -257,7 +274,6 @@ async def dead_loop(app):
         except: pass
 
 async def post_init(app):
-    # FIX CONFLICT - delete webhook
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
         print("Webhook deleted - conflict fixed")
@@ -284,7 +300,7 @@ def main():
     app.add_handler(CommandHandler("clear_all", clear_all))
     app.add_handler(CommandHandler("clear", clear_all))
     app.add_error_handler(error_handler)
-    print("start bot V25 conflict fix")
+    print("start bot V26 anti-spam")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__=="__main__":
