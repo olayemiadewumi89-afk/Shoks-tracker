@@ -18,7 +18,7 @@ PREP_TRACKER = defaultdict(list)
 
 app_flask = Flask(__name__)
 @app_flask.route('/')
-def home(): return "SHOKS V24 FINAL LIVE"
+def home(): return "SHOKS V25 CONFLICT FIX LIVE"
 def run_flask(): app_flask.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
 def rpc(m,p):
@@ -138,11 +138,14 @@ async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"⚙️ V24 FINAL\nWallets: {len(SOL_WALLETS)}\nLabour Groups: {len(LABELS)}\nSeen TX: {len(SEEN_TX)}\nBuy Buffer: {len(BUY_BUFFER)}\nCHAT: {CHAT_ID}")
+    await update.message.reply_text(f"⚙️ V25 CONFLICT FIX\nWallets: {len(SOL_WALLETS)}\nLabour Groups: {len(LABELS)}\nSeen TX: {len(SEEN_TX)}\nBuy Buffer: {len(BUY_BUFFER)}\nCHAT: {CHAT_ID}")
 
 async def clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SOL_WALLETS.clear(); SEEN_TX.clear(); DELETED.clear(); BUY_BUFFER.clear(); SELL_BUFFER.clear(); PREP_TRACKER.clear()
     await update.message.reply_text("🗑️ Cleared all wallets & buffers.\nReady for new /bundle")
+
+async def error_handler(update, context):
+    print(f"Error: {context.error}")
 
 async def forward_loop(app):
     global CHAT_ID
@@ -254,6 +257,11 @@ async def dead_loop(app):
         except: pass
 
 async def post_init(app):
+    # FIX CONFLICT - delete webhook
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        print("Webhook deleted - conflict fixed")
+    except: pass
     asyncio.create_task(forward_loop(app))
     asyncio.create_task(buy_loop(app))
     asyncio.create_task(cluster_alert_loop(app))
@@ -275,8 +283,9 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("clear_all", clear_all))
     app.add_handler(CommandHandler("clear", clear_all))
-    print("start bot")
-    app.run_polling()
+    app.add_error_handler(error_handler)
+    print("start bot V25 conflict fix")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__=="__main__":
     main()
