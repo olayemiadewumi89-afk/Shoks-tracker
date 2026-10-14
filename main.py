@@ -6,6 +6,9 @@ from flask import Flask
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 RPC = os.environ.get("RPC_URL", "https://api.mainnet-beta.solana.com")
+if not BOT_TOKEN:
+    print("FATAL: BOT_TOKEN not set!")
+    raise SystemExit(1)
 
 SOL_WALLETS = {}
 BOUGHT_CACHE = {}
@@ -13,6 +16,7 @@ PRE_SELL_QUEUE = []
 CHAT_ID = None
 LAST_PRE_SELL = 0
 
+# ---- FLASK FOR RENDER ----
 app_flask = Flask(__name__)
 @app_flask.route('/')
 def home(): return "Bot Running V18.2 - OK"
@@ -20,6 +24,7 @@ def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app_flask.run(host='0.0.0.0', port=port)
 
+# ---- RPC HELPERS ----
 def rpc(method, params):
     try:
         r = requests.post(RPC, json={"jsonrpc":"2.0","id":1,"method":method,"params":params}, timeout=10).json()
@@ -41,11 +46,12 @@ def get_ata_info(ata):
         return data.get('mint'), data.get('owner')
     except: return None, None
 
+# ---- TELEGRAM COMMANDS ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CHAT_ID
     CHAT_ID = update.effective_chat.id
     SOL_WALLETS.clear(); BOUGHT_CACHE.clear(); PRE_SELL_QUEUE.clear()
-    await update.message.reply_text("🚀 V18.2 READY\n/add <addr>\n/list\n/list_group\n/clear_all")
+    await update.message.reply_text("🚀 V18.2 READY\n/add <wallet> - track whale\n/list - show wallets\n/list_group - show groups\n/clear_all - clear all")
 
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CHAT_ID
@@ -81,6 +87,7 @@ async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SOL_WALLETS.clear(); BOUGHT_CACHE.clear(); PRE_SELL_QUEUE.clear()
     await update.message.reply_text("🗑️ Cleared. /add <new_whale>")
 
+# ---- LOOPS - FORWARD / PRESELL / BUY / AUTO DELETE ----
 async def forward_loop(app):
     global CHAT_ID
     while True:
@@ -168,9 +175,18 @@ async def dead_loop(app):
                     except: pass
         except: pass
 
-async def main():
+# ---- THIS FIXES YOUR DEADLOCK ----
+async def post_init(app):
+    print("Bot init done, starting loops...")
+    asyncio.create_task(forward_loop(app))
+    asyncio.create_task(presell_loop(app))
+    asyncio.create_task(buy_loop(app))
+    asyncio.create_task(dead_loop(app))
+
+def main():
     threading.Thread(target=run_flask, daemon=True).start()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    print("Flask started")
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", add_cmd))
     app.add_handler(CommandHandler("bundle", add_cmd))
@@ -178,10 +194,8 @@ async def main():
     app.add_handler(CommandHandler("list_group", list_group_cmd))
     app.add_handler(CommandHandler("clear_all", clear_cmd))
     app.add_handler(CommandHandler("label_group", list_group_cmd))
-    asyncio.create_task(forward_loop(app))
-    asyncio.create_task(presell_loop(app))
-    asyncio.create_task(buy_loop(app))
-    asyncio.create_task(dead_loop(app))
-    await app.run_polling()
+    print("V18.2 Bot polling started")
+    app.run_polling()
 
-if __name__=="__main__": asyncio.run(main())
+if __name__=="__main__":
+    main()
