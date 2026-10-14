@@ -22,6 +22,7 @@ last_tx_time = datetime.now()
 last_bundled = None
 last_activity = {}
 last_dist_alert = {}
+best_alert_cache = {}
 
 SOLANA_PUB_RPCS = [
     "https://api.mainnet-beta.solana.com",
@@ -81,7 +82,6 @@ def send_tg_worker():
                 if not BOT_TOKEN or not CHAT_ID: print(text[:800], flush=True)
                 else:
                     try:
-                        # FIX: NO MARKDOWN = NO CRASH ON _
                         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json={"chat_id":CHAT_ID,"text":text,"disable_web_page_preview":True},timeout=15)
                     except: pass
                 time.sleep(0.6)
@@ -169,7 +169,7 @@ def get_token_info(token_address):
         r=requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",timeout=7).json()
         pairs=r.get("pairs",[])
         if not pairs: return None
-        valid=[p for p in pairs if (p.get("liquidity",{}).get("usd",0) or 0)>=50]
+        valid=[p for p in pairs if (p.get("liquidity",{}).get("usd",0) or 0)>=20]
         if not valid: valid=pairs
         best=sorted(valid, key=lambda x: x.get("liquidity",{}).get("usd",0) or 0, reverse=True)[0]
         fdv=best.get("fdv") or best.get("marketCap") or 0
@@ -177,7 +177,9 @@ def get_token_info(token_address):
         elif fdv>=1000: mcap_str=f"${fdv/1000:.0f}k"
         else: mcap_str=f"${fdv:.0f}"
         price=float(best.get("priceUsd",0) or 0)
-        if price==0: return None
+        # FIX: DON'T RETURN NONE WHEN PRICE 0 - early Pump coin
+        is_early = price == 0
+        if price==0: price = 0.00000001
         age_min=0
         try:
             pc=best.get("pairCreatedAt")
@@ -187,7 +189,7 @@ def get_token_info(token_address):
         vol5 = float(best.get("volume",{}).get("m5",0) or 0)
         liq = float(best.get("liquidity",{}).get("usd",0) or 0)
         chg5 = float(best.get("priceChange",{}).get("m5",0) or 0)
-        return {"name":best.get("baseToken",{}).get("symbol",token_address[:6]),"mcap_str":mcap_str,"mcap_val":fdv,"price":price,"dex_link":f"https://dexscreener.com/{best.get('chainId','solana')}/{best.get('pairAddress',token_address)}","photon":f"https://photon-sol.tinyastro.io/en/lp/{token_address}" if best.get("chainId")=="solana" else f"https://photon.tinyastro.io/en/lp/{token_address}","pair":best.get("pairAddress",token_address),"chain":best.get("chainId","solana"),"age_min":age_min,"vol24":vol24,"vol5":vol5,"liq":liq,"chg5":chg5}
+        return {"name":best.get("baseToken",{}).get("symbol",token_address[:6]),"mcap_str":mcap_str,"mcap_val":fdv,"price":price,"dex_link":f"https://dexscreener.com/{best.get('chainId','solana')}/{best.get('pairAddress',token_address)}","photon":f"https://photon-sol.tinyastro.io/en/lp/{token_address}" if best.get("chainId")=="solana" else f"https://photon.tinyastro.io/en/lp/{token_address}","pair":best.get("pairAddress",token_address),"chain":best.get("chainId","solana"),"age_min":age_min,"vol24":vol24,"vol5":vol5,"liq":liq,"chg5":chg5,"is_early":is_early}
     except: return None
 
 def get_signatures(wallet, limit=10):
@@ -274,7 +276,6 @@ def handle_bundle(wallet):
                 if not sig: continue
                 sols,_=get_tx_details(sig)
                 for frm,to,amt in sols:
-                    # NEW ONLY FIX: 0.001 instead of 0.03
                     if to==wallet and amt>=0.001 and frm not in [f[0] for f in funders]:
                         funders.append((frm,amt,sig))
         else:
@@ -305,45 +306,41 @@ def handle_bundle(wallet):
         last_activity[main_funder]=datetime.now()
         added=0
         if not evm:
-            # NEW ONLY: only last 10 txs and only 10 min old
-            sib_sigs=get_signatures(main_funder,10)
+            sib_sigs=get_signatures(main_funder,15)
             now_ts = time.time()
-            for item in sib_sigs[:10]:
-                # TIME FILTER - NEW ONLY
+            for item in sib_sigs[:12]:
                 bt = item.get("blockTime",0)
-                if bt and (now_ts - bt) > 600: # 600s = 10 min - skip old
+                if bt and (now_ts - bt) > 900: # 15m
                     continue
                 sig=item.get("signature")
                 if not sig: continue
                 sols,_=get_tx_details(sig)
                 for frm,to,amt in sols:
-                    if frm==main_funder and to!=wallet and not wallet_exists(to) and amt>=0.001 and added<7:
+                    if frm==main_funder and to!=wallet and not wallet_exists(to) and amt>=0.001 and added<15:
                         SOL_WALLETS.append({"addr":to,"chain":chain,"group":main_funder}); GROUPS[to]=main_funder; added+=1
                         recent_children[main_funder].append((to,amt,datetime.now(),False,None))
                         last_activity[to]=datetime.now()
         else:
             txs=get_evm_txs(main_funder, chain, 20)
             for frm,to,amt,hash_ in parse_evm_transfers(txs):
-                if frm==main_funder.lower() and to!=wallet.lower() and not wallet_exists(to) and amt>=0.0005 and added<7:
+                if frm==main_funder.lower() and to!=wallet.lower() and not wallet_exists(to) and amt>=0.0005 and added<15:
                     SOL_WALLETS.append({"addr":to,"chain":chain,"group":main_funder}); GROUPS[to]=main_funder; added+=1
                     recent_children[main_funder].append((to,amt,datetime.now(),False,None))
                     last_activity[to]=datetime.now()
         save_all(); save_recent()
-        send_tg(f"📦 Bundled {short(wallet)} ⛓️ {chain.upper()}\nParent {short(main_funder)} G:{display_group(main_funder)}\n✅ +{added} NEW sibs (10m) | Total {len(SOL_WALLETS)}\nFORWARD ON\n/labelgroup FOMOFARMER")
+        send_tg(f"📦 Bundled {short(wallet)} ⛓️ {chain.upper()}\nParent {short(main_funder)} G:{display_group(main_funder)}\n✅ +{added} NEW sibs (15m) | Total {len(SOL_WALLETS)}\nFORWARD ON\n/labelgroup FOMOFARMER")
     except Exception as e: send_tg(f"❌ Bundle error: {e}")
 
 def alert_prep(funder):
     now=datetime.now()
-    recent=[x for x in recent_children[funder] if (now-x[2]).total_seconds()<=300]
+    recent=[x for x in recent_children[funder] if (now-x[2]).total_seconds()<=600]
     recent_children[funder]=recent
     save_recent()
     if not recent: return
-
     sol_only=[x for x in recent if not x[3]]
     token_only=[x for x in recent if x[3]]
     gl=display_group(funder)
     chain=get_wallet_chain(funder).upper()
-
     if token_only:
         mint=token_only[-1][4] if len(token_only[-1])>4 else "token"
         count=len(token_only)
@@ -360,7 +357,6 @@ def alert_prep(funder):
         total_str = f"\nTotal {total:.0f}" if total>=1 else ""
         send_tg(f"🔴🔴🔴 DIST {count}w ABOUT TO SELL 🔴🔴🔴\nG:{gl} {short(funder)} ⛓️ {chain}\nToken {name} {mcap}\n{child_list}{total_str}\nSC: https://solscan.io/account/{funder}")
         return
-
     if len(sol_only)>=1:
         count=len(sol_only)
         key=(funder, "SOL_PREP")
@@ -379,7 +375,7 @@ def alert_prep(funder):
 
 def should_alert(mint, usd, info, wallet_group):
     now = datetime.now()
-    recent = [x for x in recent_token_buys[mint] if (now - x[2]).total_seconds() <= 300]
+    recent = [x for x in recent_token_buys[mint] if (now - x[2]).total_seconds() <= 600]
     recent_token_buys[mint] = recent
     recent.append((wallet_group, usd, now))
     recent_token_buys[mint] = recent
@@ -391,25 +387,27 @@ def should_alert(mint, usd, info, wallet_group):
     vol24 = info["vol24"]
     liq = info["liq"]
     chg5 = info["chg5"]
-    if liq < 5000: return None
+    # FIX: allow early coins with low liq
+    if liq < 1000 and age_min > 15:
+        return None
     is_old = age_min > 14400
     is_dead_volume = vol24 < 2000 and vol5 < 500
     if is_old and is_dead_volume:
         if not (vol5 > 5000 and chg5 > 15 and liq > 15000):
             return None
-    if 20 <= usd <= 200:
-        if mcap < 150000 and age_min < 120 and vol5 > 800:
+    if 5 <= usd <= 300: # FIX was 20-200, now 5-300 to catch $80 buys
+        if (mcap < 300000 and age_min < 180) or info.get("is_early"):
             return f"🟢 PROBE: 1w test BUY ${usd:.0f} at {info['mcap_str']} MC | {age_min}m old | vol5m ${vol5:.0f} | {info['name']}"
         else: return None
-    if 500 <= total_5m <= 8000:
-        if mcap < 600000 and wallets_5m >= 2:
+    if 80 <= total_5m <= 15000: # FIX was 500-8000, now 80-15000
+        if mcap < 800000 and wallets_5m >= 2 or info.get("is_early"):
             if is_old:
                 if vol5 > 8000 and chg5 > 20:
                     return f"♻️🟡 REVIVAL SWARM: {wallets_5m}w total ${total_5m:.0f} in 5m at {info['mcap_str']} | age {age_min//1440}d | vol5m ${vol5:.0f} +{chg5:.0f}% | {info['name']}"
                 else: return None
             else:
                 return f"🟡 SWARM: {wallets_5m}w total ${total_5m:.0f} in 5m at {info['mcap_str']} | {age_min}m | vol24 ${vol24:.0f} | {info['name']}"
-    if usd >= 1000:
+    if usd >= 500: # FIX was 1000
         if is_old and is_dead_volume:
             if vol5 > 5000 and liq > 10000:
                 return f"♻️🔵 REVIVAL WHALE: 1w BUY ${usd:.0f} at {info['mcap_str']} | {age_min//1440}d old but vol spike ${vol5:.0f} | {info['name']}"
@@ -417,29 +415,67 @@ def should_alert(mint, usd, info, wallet_group):
         return f"🔵 WHALE: 1w BUY ${usd:.0f} at {info['mcap_str']} | {age_min}m | liq ${liq:.0f} | {info['name']}"
     return None
 
+def get_best_bet():
+    now=datetime.now()
+    best_mint=None
+    best_score=0
+    best_data=None
+    for mint, buys in list(recent_token_buys.items()):
+        recent=[b for b in buys if (now-b[2]).total_seconds()<=600]
+        if len(recent)<1: continue
+        total=sum(b[1] for b in recent)
+        wallets=len(set(b[0] for b in recent))
+        biggest=max(b[1] for b in recent)
+        if total < 50: continue # ignore dust
+        score = total + (wallets*200) + biggest
+        if score > best_score:
+            best_score=score
+            best_mint=mint
+            best_data=(total,wallets,biggest,recent)
+    if not best_mint: return None
+    if best_mint in best_alert_cache and (now-best_alert_cache[best_mint]).total_seconds()<300:
+        return None
+    best_alert_cache[best_mint]=now
+    total,wallets,biggest,recent = best_data
+    info=get_token_info(best_mint)
+    name=info["name"] if info else f"{best_mint[:6]}.."
+    mcap=info["mcap_str"] if info else "early"
+    return f"🔥🔥🔥 BEST BET 🔥🔥🔥\n{name} {mcap}\nTotal ${total:.0f} across {wallets}w | Biggest ${biggest:.0f}\nCA: {best_mint}\nDS: {info['dex_link'] if info else f'https://dexscreener.com/solana/{best_mint}'}\nPH: https://photon-sol.tinyastro.io/en/lp/{best_mint}"
+
 async def track_sol_polling():
     while True:
         try:
             if last_activity:
                 sorted_w = sorted(SOL_WALLETS, key=lambda wdict: last_activity.get(wdict["addr"] if isinstance(wdict, dict) else wdict, datetime.min), reverse=True)
-                active_list = sorted_w[:50]
+                # FIX: include all last_bundled group wallets
+                bundled_extra = [w for w in SOL_WALLETS if GROUPS.get(w["addr"] if isinstance(w,dict) else w,"")==last_bundled] if last_bundled else []
+                active_list = (sorted_w[:30] + bundled_extra)[:60]
             else:
-                active_list = SOL_WALLETS[-40:]
+                active_list = SOL_WALLETS[-50:]
             for wdict in active_list:
                 w=wdict["addr"] if isinstance(wdict,dict) else wdict
                 chain=wdict.get("chain","sol") if isinstance(wdict,dict) else "sol"
                 if chain!="sol": continue
-                sigs=get_signatures(w,3)
-                for item in sigs[:2]:
+                sigs=get_signatures(w,6)
+                for item in sigs[:4]:
                     sig=item.get("signature")
                     if not sig or sig in seen_sigs: continue
                     sols,tokens=get_tx_details(sig)
                     for _,owner,mint,amt,is_buy in tokens:
                         if owner==w and amt>0 and is_buy:
                             info=get_token_info(mint)
-                            if not info: continue
+                            if not info:
+                                # FIX: Pump early coin with no Dexscreener price - still alert!
+                                if amt>1000:
+                                    send_tg(f"🟢 EARLY PUMP BUY (no price yet)\n👤 {short(w)} G:{display_group(w)}\nCA: {mint}\nAmount: {amt:.0f} tokens\nTX: https://solscan.io/tx/{sig}\nSC: https://solscan.io/account/{w}")
+                                    seen_sigs.add(sig); save_seen()
+                                    last_activity[w]=datetime.now()
+                                    # Track for BEST BET even if no info
+                                    recent_token_buys[mint].append((w, 20, datetime.now()))
+                                continue
                             usd=amt*info["price"]
-                            if usd<15: continue
+                            if info.get("is_early"): usd = max(usd, 15) # force at least $15 for early
+                            if usd<5: continue
                             seen_sigs.add(sig); save_seen()
                             last_tx_time=datetime.now()
                             last_activity[w]=datetime.now()
@@ -460,48 +496,65 @@ async def track_sol_polling():
                             gl=display_group(w)
                             ds=info["dex_link"]; ph=info["photon"]; txl=f"https://solscan.io/tx/{sig}"
                             send_tg(f"🔻 SELL ${usd:.0f} {info['mcap_str']}\n{info['name']} | {short(w)} G:{gl}\nCA: {mint[:6]}..{mint[-4:]}\nDS: {ds} PH: {ph} TX: {txl}")
+            # BEST BET check every loop
+            best = get_best_bet()
+            if best: send_tg(best)
         except Exception as e: print(f"poll err {e}", flush=True)
-        await asyncio.sleep(6)
+        await asyncio.sleep(5)
 
 def track_funders_15s():
     while True:
-        time.sleep(15)
+        time.sleep(10)
         try:
             funders=set(GROUPS.values())
             for k in recent_children.keys(): funders.add(k)
             if not funders: funders=set([(w["addr"] if isinstance(w,dict) else w) for w in SOL_WALLETS[:25]])
-            for funder in list(funders)[:40]:
+            print(f"Checking {len(funders)} funders...", flush=True)
+            for funder in list(funders)[:50]:
                 try:
                     chain=get_wallet_chain(funder)
                     if chain=="sol":
-                        # NEW ONLY: 5 txs only, 5 min filter
-                        sigs=get_signatures(funder,5)
+                        sigs=get_signatures(funder,12)
                         now_ts = time.time()
-                        for item in sigs[:3]:
+                        for item in sigs[:8]:
                             bt = item.get("blockTime",0)
-                            if bt and (now_ts - bt) > 300: # 5 min NEW ONLY
+                            if bt and (now_ts - bt) > 900: # FIX 15m not 5m
                                 continue
                             sig=item.get("signature")
                             if not sig or sig in seen_sigs: continue
                             sols,tokens=get_tx_details(sig)
+                            found=False
                             for frm,to,amt in sols:
-                                if frm==funder and amt>=0.001 and not wallet_exists(to):
-                                    SOL_WALLETS.append({"addr":to,"chain":"sol","group":GROUPS.get(funder,funder)}); GROUPS[to]=GROUPS.get(funder,funder); save_all()
-                                    recent_children[funder].append((to,amt,datetime.now(),False,None)); seen_sigs.add(sig); save_seen(); save_recent()
-                                    last_activity[to]=datetime.now(); last_activity[funder]=datetime.now(); alert_prep(funder)
+                                if frm==funder and amt>=0.001:
+                                    if not wallet_exists(to):
+                                        SOL_WALLETS.append({"addr":to,"chain":"sol","group":GROUPS.get(funder,funder)}); GROUPS[to]=GROUPS.get(funder,funder)
+                                    # FIX: always add to recent even if wallet exists
+                                    recent_children[funder].append((to,amt,datetime.now(),False,None))
+                                    seen_sigs.add(sig); save_seen(); save_recent(); save_all()
+                                    last_activity[to]=datetime.now(); last_activity[funder]=datetime.now()
+                                    found=True
                             for _,to2,mint,amt2,_ in tokens:
-                                if not wallet_exists(to2) and amt2>0 and len(mint)>20:
-                                    SOL_WALLETS.append({"addr":to2,"chain":"sol","group":GROUPS.get(funder,funder)}); GROUPS[to2]=GROUPS.get(funder,funder); save_all()
-                                    recent_children[funder].append((to2,amt2,datetime.now(),True,mint)); seen_sigs.add(sig); save_seen(); save_recent()
-                                    last_activity[to2]=datetime.now(); alert_prep(funder)
+                                if amt2>0 and len(mint)>20:
+                                    if not wallet_exists(to2):
+                                        SOL_WALLETS.append({"addr":to2,"chain":"sol","group":GROUPS.get(funder,funder)}); GROUPS[to2]=GROUPS.get(funder,funder)
+                                    recent_children[funder].append((to2,amt2,datetime.now(),True,mint))
+                                    seen_sigs.add(sig); save_seen(); save_recent(); save_all()
+                                    last_activity[to2]=datetime.now()
+                                    found=True
+                            if found:
+                                alert_prep(funder)
+                                print(f"PREP alert for {short(funder)}", flush=True)
                     else:
                         txs=get_evm_txs(funder, chain, 8)
                         for frm,to,amt,hash_ in parse_evm_transfers(txs):
-                            if frm==funder.lower() and not wallet_exists(to) and amt>=0.0005 and hash_ not in seen_sigs:
-                                SOL_WALLETS.append({"addr":to,"chain":chain,"group":GROUPS.get(funder,funder)}); GROUPS[to]=GROUPS.get(funder,funder); save_all()
-                                recent_children[funder].append((to,amt,datetime.now(),False,None)); seen_sigs.add(hash_); save_seen(); save_recent()
+                            if frm==funder.lower() and amt>=0.0005 and hash_ not in seen_sigs:
+                                if not wallet_exists(to):
+                                    SOL_WALLETS.append({"addr":to,"chain":chain,"group":GROUPS.get(funder,funder)}); GROUPS[to]=GROUPS.get(funder,funder)
+                                recent_children[funder].append((to,amt,datetime.now(),False,None)); seen_sigs.add(hash_); save_seen(); save_recent(); save_all()
                                 last_activity[to]=datetime.now(); alert_prep(funder)
-                except: continue
+                except Exception as e:
+                    print(f"funder loop err {e}", flush=True)
+                    continue
         except Exception as e: print(f"funder err {e}", flush=True)
 
 def auto_clean_dead_wallets():
@@ -545,7 +598,7 @@ def handle_command(text):
         uniq=len(set(GROUPS.values()))
         sol_c=sum(1 for w in SOL_WALLETS if isinstance(w,dict) and w.get("chain")=="sol")
         evm_c=len(SOL_WALLETS)-sol_c
-        send_tg(f"🚀 V8 NEW ONLY - 10m filter\n{len(SOL_WALLETS)}w (SOL:{sol_c} EVM:{evm_c}) | {uniq} groups\nTracking: 50 most active\nOnly NEW wallets 10m old\n/bundle <addr>\n/labelgroup <NAME>")
+        send_tg(f"🚀 V8 FIXED - BEST BET\n{len(SOL_WALLETS)}w (SOL:{sol_c} EVM:{evm_c}) | {uniq} groups\nTracking 60 active\n/bundle <addr>")
     elif low.startswith("/bundle"):
         p=t.split()
         if len(p)<2: send_tg("Usage: /bundle <addr>")
@@ -614,7 +667,7 @@ def handle_command(text):
         mins=int((datetime.now()-last_tx_time).total_seconds()/60)
         sol_c=sum(1 for w in SOL_WALLETS if isinstance(w,dict) and w.get("chain")=="sol")
         evm_c=len(SOL_WALLETS)-sol_c
-        send_tg(f"V8 NEW ONLY\nWallets {len(SOL_WALLETS)} (SOL:{sol_c} EVM:{evm_c})\nGroups {len(set(GROUPS.values()))}\nTracking 50 most active\nLast {mins}m")
+        send_tg(f"V8 FIXED BEST BET\nWallets {len(SOL_WALLETS)} (SOL:{sol_c} EVM:{evm_c})\nGroups {len(set(GROUPS.values()))}\nTracking 60 active\nLast {mins}m")
 
 def poll_commands():
     off=0
@@ -631,7 +684,7 @@ def poll_commands():
 async def main_loop():
     threading.Thread(target=track_funders_15s,daemon=True).start()
     threading.Thread(target=auto_clean_dead_wallets,daemon=True).start()
-    send_tg("🚀 V8 NEW ONLY DEPLOYED\n✅ Only 10m new wallets\n✅ Catches 0.0015 fundings\n✅ No Markdown crash")
+    send_tg("🚀 V8 FIXED DEPLOYED\n✅ Catches 0.0015 fundings (15m)\n✅ Picks coins with no price (Pump early)\n✅ BEST BET for 10 coins")
     await track_sol_polling()
 
 def start_bot():
