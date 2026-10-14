@@ -8,7 +8,6 @@ SOL_WALLETS=[]; GROUPS={}; LABELS={}; seen_sigs=set(); recent_children=defaultdi
 sniper_marked={}; tg_queue=deque(); funder_cache={}; last_tx_time=datetime.now(); last_bundled=None; last_activity={}; last_dist_alert={}; best_alert_cache={}
 
 SOLANA_PUB_RPCS=["https://api.mainnet-beta.solana.com","https://solana-rpc.publicnode.com","https://rpc.ankr.com/solana","https://solana.api.onchainkit.io"]
-EVM_RPCS={"base":["https://rpc.ankr.com/base"],"bsc":["https://rpc.ankr.com/bsc"]}
 rpc_idx=0; last_rpc_call=0
 def get_public_rpc():
     global rpc_idx,last_rpc_call
@@ -19,7 +18,7 @@ def get_public_rpc():
 BOT_TOKEN=os.getenv("BOT_TOKEN"); CHAT_ID=os.getenv("CHAT_ID")
 app=Flask(__name__)
 @app.route('/')
-def home(): return "Shoks V8 PRETTY",200
+def home(): return "Shoks V8 FINAL",200
 @app.route('/health')
 def health(): return "OK",200
 def run_flask(): app.run(host='0.0.0.0',port=int(os.getenv("PORT",10000)))
@@ -73,6 +72,20 @@ def load_all():
     except: pass
     try:
         if os.path.exists(SEEN_FILE): seen_sigs=set(json.load(open(SEEN_FILE)))
+    except: pass
+    try:
+        if os.path.exists(RECENT_FILE):
+            d=json.load(open(RECENT_FILE))
+            for k,v in d.items():
+                lst=[]
+                for item in v:
+                    try:
+                        a,b,c_str,d_flag,e = item
+                        c = datetime.fromisoformat(c_str)
+                        if (datetime.now()-c).total_seconds() < 3600:
+                            lst.append((a,b,c,d_flag,e))
+                    except: continue
+                recent_children[k]=lst
     except: pass
 load_all()
 def save_all():
@@ -165,7 +178,6 @@ def get_token_balance_quick(wallet):
     return None,0,None
 
 def fmt_links(mint,sig=None,wallet=None):
-    # SHORT pretty links: DS | PH | TX | SC
     ds=f"https://dexscreener.com/solana/{mint}"
     ph=f"https://photon-sol.tinyastro.io/en/lp/{mint}"
     out=f'<a href="{ds}">DS</a> | <a href="{ph}">PH</a>'
@@ -221,25 +233,43 @@ def alert_prep(funder):
     recent_children[funder]=recent; save_recent()
     if not recent: return
     sol_only=[x for x in recent if not x[3]]
-    if len(sol_only)>=1:
-        count=len(sol_only); key=(funder,"SOL_PREP"); last=last_dist_alert.get(key)
-        if last and (now-last[0]).total_seconds()<60 and count<=last[1]: return
-        last_dist_alert[key]=(now,count)
-        biggest=max(sol_only,key=lambda x:x[1]); biggest_amt=biggest[1]; biggest_child=biggest[0]
-        childs=" ".join([f"{short(c[0])} {c[1]:.3f}" for c in sol_only[:6]])
-        coin_line=""
-        try:
-            time.sleep(2)
-            for child_addr,_,_,_,_ in reversed(sol_only[-3:]):
-                mint,amt,sig=get_token_balance_quick(child_addr)
-                if mint:
-                    info=get_token_info(mint); name=info["name"] if info else short(mint); mcap=info["mcap_str"] if info else "early"
-                    coin_line=f"\n\n💰 <b>{html.escape(name)} {mcap}</b> • {amt:.0f}\nCA: <code>{mint[:6]}..{mint[-4:]}</code>\n{fmt_links(mint,sig,child_addr)}"
-                    recent_token_buys[mint].append((child_addr,50,datetime.now()))
-                    break
-        except: pass
-        msg=f"⚠️ <b>PREP {count}w • 10m</b> ⛓️ SOL\nG:{display_group(funder)} • {short(funder)}\n{childs}{coin_line}\n\n<a href=\"https://solscan.io/account/{funder}\">Factory SC</a>"
-        send_tg(msg)
+    if len(sol_only)<1: return
+    key=(funder,"SOL_PREP")
+    last=last_dist_alert.get(key)
+    if last and (now-last[0]).total_seconds()<45 and len(sol_only)<=last[1]: return
+    last_dist_alert[key]=(now,len(sol_only))
+
+    gl=display_group(funder)
+    childs=" ".join([f"{short(c[0])} {c[1]:.3f}S" for c in sol_only[:6]])
+
+    mint_counter=Counter()
+    mint_details={}
+    time.sleep(2.5)
+    for child_addr,_,_,_,_ in sol_only[-6:]:
+        mint,amt,sig=get_token_balance_quick(child_addr)
+        if mint and amt>100:
+            mint_counter[mint]+=1
+            if mint not in mint_details:
+                mint_details[mint]=(amt,sig,child_addr)
+
+    coin_line=""
+    cluster_tag=""
+    if mint_counter:
+        common_mint, common_count = mint_counter.most_common(1)[0]
+        amt,sig,child_addr=mint_details[common_mint]
+        info=get_token_info(common_mint)
+        name=info["name"] if info else f"{common_mint[:6]}"
+        mcap=info["mcap_str"] if info else "early"
+        if common_count>=2:
+            cluster_tag=f" 🔥 CLUSTER {common_count}w SAME"
+        coin_line=f"\n\n💰 <b>{html.escape(name)} {mcap}</b>{cluster_tag}\nCA: <code>{common_mint}</code>\nAmt: {amt:.0f} x{common_count}\n{fmt_links(common_mint,sig,child_addr)}"
+        for _ in range(common_count):
+            recent_token_buys[common_mint].append((funder,50,now))
+    else:
+        coin_line="\n\n⏳ Funded - waiting buy..."
+
+    msg=f"⚠️ <b>PREP {len(sol_only)}w • 10m{cluster_tag}</b>\nG:{gl} • {short(funder)}\n{childs}{coin_line}\n\n<a href=\"https://solscan.io/account/{funder}\">Factory SC</a>"
+    send_tg(msg)
 
 def should_alert(mint,usd,info,wallet_group):
     now=datetime.now()
@@ -269,7 +299,7 @@ def get_best_bet():
     best_alert_cache[best_mint]=now
     total,wallets,biggest=best_data; info=get_token_info(best_mint)
     name=info["name"] if info else short(best_mint); mcap=info["mcap_str"] if info else "early"
-    return f"🔥 <b>BEST BET</b> {html.escape(name)} {mcap}\n${total:.0f} across {wallets}w • Big ${biggest:.0f}\nCA: <code>{best_mint[:6]}..{best_mint[-4:]}</code>\n{fmt_links(best_mint)}"
+    return f"🔥 <b>BEST BET</b> {html.escape(name)} {mcap}\n${total:.0f} across {wallets}w • Big ${biggest:.0f}\nCA: <code>{best_mint}</code>\n{fmt_links(best_mint)}"
 
 async def track_sol_polling():
     while True:
@@ -292,7 +322,7 @@ async def track_sol_polling():
                             info=get_token_info(mint)
                             if not info:
                                 if amt>500:
-                                    send_tg(f"🟢 <b>EARLY PUMP</b>\n👤 {short(w)} G:{display_group(w)}\nCA: <code>{mint[:6]}..{mint[-4:]}</code> • {amt:.0f}\n{fmt_links(mint,sig,w)}")
+                                    send_tg(f"🟢 <b>EARLY PUMP</b>\n👤 {short(w)} G:{display_group(w)}\nCA: <code>{mint}</code> • {amt:.0f}\n{fmt_links(mint,sig,w)}")
                                     seen_sigs.add(sig); save_seen(); last_activity[w]=datetime.now(); recent_token_buys[mint].append((w,30,datetime.now()))
                                 continue
                             usd=amt*info["price"]
@@ -301,8 +331,15 @@ async def track_sol_polling():
                             seen_sigs.add(sig); save_seen(); last_tx_time=datetime.now(); last_activity[w]=datetime.now()
                             alert_text=should_alert(mint,usd,info,w)
                             if alert_text:
-                                msg=f"{alert_text}\n{html.escape(info['name'])} {info['mcap_str']}\nCA: <code>{mint[:6]}..{mint[-4:]}</code>\n{fmt_links(mint,sig,w)}"
+                                msg=f"{alert_text}\n{html.escape(info['name'])} {info['mcap_str']}\nCA: <code>{mint}</code>\n{fmt_links(mint,sig,w)}"
                                 send_tg(msg)
+                        elif owner==w and amt>0 and not is_buy:
+                            info=get_token_info(mint)
+                            if not info: continue
+                            usd=amt*info["price"]
+                            if usd<100: continue
+                            seen_sigs.add(sig); save_seen(); last_activity[w]=datetime.now()
+                            send_tg(f"🔻 <b>SELL</b> ${usd:.0f} {info['mcap_str']}\n{html.escape(info['name'])} | {short(w)} G:{display_group(w)}\nCA: <code>{mint[:6]}..{mint[-4:]}</code>\n{fmt_links(mint,sig,w)}")
             best=get_best_bet()
             if best: send_tg(best)
         except Exception as e: print(f"poll err {e}",flush=True)
@@ -337,16 +374,88 @@ def track_funders_15s():
         except Exception as e: print(f"funder err {e}",flush=True)
 
 def handle_command(text):
-    global last_bundled
+    global last_bundled, LABELS, GROUPS, SOL_WALLETS, recent_children, sniper_marked, recent_token_buys
     t=text.strip(); low=t.lower()
     if low.startswith("/start"):
-        uniq=len(set(GROUPS.values())); sol_c=sum(1 for w in SOL_WALLETS if isinstance(w,dict) and w.get("chain")=="sol")
-        send_tg(f"🚀 <b>V8 PRETTY</b> • {len(SOL_WALLETS)}w • {uniq} groups")
+        uniq=len(set(GROUPS.values()))
+        sol_c=sum(1 for w in SOL_WALLETS if isinstance(w,dict) and w.get("chain")=="sol")
+        evm_c=len(SOL_WALLETS)-sol_c
+        send_tg(f"🚀 <b>V8 FINAL</b> • {len(SOL_WALLETS)}w (SOL:{sol_c} EVM:{evm_c}) • {uniq} groups\n/bundle <addr>\n/labelgroup VEIL\n/listgroups\n/listwallets\n/status")
     elif low.startswith("/bundle"):
         p=t.split()
         if len(p)<2: send_tg("Usage: /bundle <addr>")
-        else: threading.Thread(target=handle_bundle,args=(p[1],),daemon=True).start()
-    elif low.startswith("/status"): send_tg(f"V8 PRETTY • {len(SOL_WALLETS)}w • Last {(datetime.now()-last_tx_time).seconds//60}m")
+        else: threading.Thread(target=handle_bundle, args=(p[1],), daemon=True).start()
+    elif low.startswith("/labelgroup"):
+        p=t.split(maxsplit=1)
+        if len(p)<2:
+            send_tg("Usage: /labelgroup VEIL"); return
+        new_label=p[1].strip().upper().replace(" ","_")[:20]
+        target=last_bundled
+        if not target:
+            send_tg("❌ No bundle yet. /bundle first"); return
+        GROUPS[target]=target
+        LABELS[target]=new_label
+        for w in SOL_WALLETS:
+            if isinstance(w,dict) and w.get("group")==target: w["group"]=target
+        save_all()
+        send_tg(f"✅ Label <code>{short(target)}</code> -> <b>{new_label}</b>\nNow G:{new_label}")
+    elif low.startswith("/listgroups"):
+        if not GROUPS:
+            send_tg("No groups"); return
+        c=Counter(GROUPS.values())
+        lines=[]
+        for g,cnt in c.most_common(20):
+            lbl=LABELS.get(g, "")
+            name=lbl if lbl else short(g)
+            extra=f" {short(g)}" if lbl else ""
+            lines.append(f"{name}: {cnt}w{extra}")
+        send_tg("📋 <b>Groups:</b>\n" + "\n".join(lines))
+    elif low.startswith("/listwallets"):
+        parts=t.split(maxsplit=1)
+        filter_gid=None
+        if len(parts)>1:
+            fg=parts[1].strip().upper()
+            for gid,lbl in LABELS.items():
+                if lbl==fg:
+                    filter_gid=gid; break
+            if not filter_gid: filter_gid=parts[1].strip()
+        wallets=SOL_WALLETS
+        if filter_gid:
+            wallets=[w for w in SOL_WALLETS if (w.get("group") if isinstance(w,dict) else GROUPS.get(w,w))==filter_gid or GROUPS.get(w.get("addr","") if isinstance(w,dict) else w,"")==filter_gid or (w.get("addr") if isinstance(w,dict) else w)==filter_gid]
+        if not wallets:
+            send_tg("Empty"); return
+        msg=f"👛 <b>{len(wallets)} wallets:</b>\n"
+        for wdict in wallets[-50:]:
+            w=wdict["addr"] if isinstance(wdict,dict) else wdict
+            ch=wdict.get("chain","sol").upper() if isinstance(wdict,dict) else "SOL"
+            g=display_group(w)
+            tag=" 👑" if w in sniper_marked else ""
+            msg+=f"<code>{short(w)}</code> {ch} G:{g}{tag}\n"
+        send_tg(msg)
+    elif low.startswith("/remove"):
+        p=t.split()
+        if len(p)<2: send_tg("Usage: /remove <addr>"); return
+        a=p[1].strip()
+        to_del=[w for w in SOL_WALLETS if (w["addr"] if isinstance(w,dict) else w)==a]
+        if to_del:
+            for w in to_del: SOL_WALLETS.remove(w); GROUPS.pop(w["addr"] if isinstance(w,dict) else w,None)
+            save_all(); send_tg(f"Removed <code>{short(a)}</code>")
+        else:
+            gid=None
+            for g,l in LABELS.items():
+                if l==a.upper(): gid=g; break
+            if gid:
+                SOL_WALLETS[:]=[w for w in SOL_WALLETS if (w.get("group") if isinstance(w,dict) else GROUPS.get(w,w))!=gid and (w.get("addr") if isinstance(w,dict) else w)!=gid]
+                GROUPS.pop(gid,None); LABELS.pop(gid,None); save_all(); send_tg(f"Group <b>{a}</b> removed")
+            else: send_tg("Not found")
+    elif low.startswith("/clear"):
+        SOL_WALLETS.clear(); GROUPS.clear(); LABELS.clear(); recent_children.clear(); sniper_marked.clear(); recent_token_buys.clear(); last_dist_alert.clear(); save_all(); send_tg("🧹 Cleared all")
+    elif low.startswith("/status"):
+        mins=int((datetime.now()-last_tx_time).total_seconds()/60)
+        uniq=len(set(GROUPS.values()))
+        send_tg(f"V8 FINAL • {len(SOL_WALLETS)}w • {uniq} groups • Last {mins}m • Bundle {short(last_bundled) if last_bundled else 'none'}")
+    elif low.startswith("/clear_all"):
+        SOL_WALLETS.clear(); GROUPS.clear(); LABELS.clear(); recent_children.clear(); sniper_marked.clear(); recent_token_buys.clear(); last_dist_alert.clear(); save_all(); send_tg("🧹 Cleared all - /bundle to start")
 
 def poll_commands():
     off=0
@@ -361,7 +470,7 @@ def poll_commands():
 
 async def main_loop():
     threading.Thread(target=track_funders_15s,daemon=True).start()
-    send_tg("🚀 <b>V8 PRETTY DEPLOYED</b>\n✅ Short links: DS | PH | TX | SC\n✅ Pretty Telegram UI")
+    send_tg("🚀 <b>V8 FINAL FIXED DEPLOYED</b>\n✅ /labelgroup VEIL works\n✅ /listgroups works\n✅ /listwallets works\n✅ PREP+COIN CLUSTER")
     await track_sol_polling()
 
 def start_bot():
