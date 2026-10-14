@@ -37,7 +37,7 @@ def auto_set_commands():
 
 app=Flask(__name__)
 @app.route('/')
-def home(): return "Shoks V13 Recursive PnL",200
+def home(): return "Shoks V13.1 BUY FIX",200
 @app.route('/health')
 def health(): return "OK",200
 def run_flask(): app.run(host='0.0.0.0',port=int(os.getenv("PORT",10000)))
@@ -119,7 +119,7 @@ def get_token_info(token_address, chain="sol"):
         return {"name":best.get("baseToken",{}).get("symbol",token_address[:6]),"mcap_str":mcap_str,"mcap_val":fdv,"price":price if price>0 else 0.00000001,"mint":token_address,"chain":chain}
     except: return None
 
-# ============ PnL SYSTEM ============
+# ============ PnL + Holdings ============
 def record_buy(wallet, mint, amount, price, mcap_val, chain):
     if wallet not in TRADES: TRADES[wallet]={}
     if mint in TRADES[wallet]:
@@ -168,7 +168,6 @@ def calculate_group_pnl(group_id):
     for wdict in wallets:
         w=wdict["addr"]; chain=wdict.get("chain","sol")
         holdings = get_sol_holdings(w) if chain=="sol" else get_evm_holdings(w)
-        # fallback to recorded trades if holdings empty
         if not holdings and w in TRADES:
             for mint,dat in TRADES[w].items(): holdings.append((mint,dat["amount"]))
         for mint, live_amt in holdings[:10]:
@@ -210,6 +209,7 @@ def get_signatures(wallet,limit=10):
         payload={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress","params":[wallet,{"limit":limit}]}
         return requests.post(get_sol_rpc(),json=payload,timeout=12).json().get("result",[]) or []
     except: return []
+
 def get_tx_details(sig):
     if sig in funder_cache and (datetime.now()-funder_cache[sig][0]).total_seconds()<600: return funder_cache[sig][1]
     sol_transfers=[]; token_transfers=[]
@@ -229,26 +229,43 @@ def get_tx_details(sig):
                         info=instr["parsed"]["info"]; sol_transfers.append((info["source"],info["destination"],info.get("lamports",0)/1e9))
                 except: continue
         pre={(b.get("owner",""),b.get("mint","")): float(b.get("uiTokenAmount",{}).get("uiAmount",0) or 0) for b in res.get("meta",{}).get("preTokenBalances",[]) or []}
-        for b in res.get("meta",{}).get("postTokenBalances",[]) or []:
+        post_list=res.get("meta",{}).get("postTokenBalances",[]) or []
+        for b in post_list:
             owner=b.get("owner",""); mint=b.get("mint","")
             if mint in BLACKLIST_MINTS: continue
-            post_amt=float(b.get("uiTokenAmount",{}).get("uiAmount",0) or 0); diff=post_amt-pre.get((owner,mint),0)
-            if abs(diff)>0.000001: token_transfers.append(("unknown",owner,mint,abs(diff),diff>0))
+            post_amt=float(b.get("uiTokenAmount",{}).get("uiAmount",0) or 0)
+            # FIX: Check both owner match and ATA match via pre dict
+            pre_amt=pre.get((owner,mint),0)
+            # Also try to find pre with same mint but different owner (ATA case)
+            if pre_amt==0:
+                for (p_owner,p_mint),p_amt in pre.items():
+                    if p_mint==mint: pre_amt=p_amt; break
+            diff=post_amt-pre_amt
+            if abs(diff)>0.0000001: token_transfers.append(("unknown",owner,mint,abs(diff),diff>0))
     except: pass
     funder_cache[sig]=(datetime.now(),(sol_transfers,token_transfers))
     if len(funder_cache)>800: funder_cache.clear()
     return sol_transfers,token_transfers
 
 def get_token_balance_quick(wallet):
+    # FIX 1: Check live holdings first - catches old buys
     try:
-        payload={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress","params":[wallet,{"limit":3}]}
-        sigs=requests.post(get_sol_rpc(),json=payload,timeout=8).json().get("result",[]) or []
-        for item in sigs[:2]:
+        holdings=get_sol_holdings(wallet)
+        if holdings:
+            for mint, amt in holdings:
+                if amt>0 and mint not in BLACKLIST_MINTS:
+                    return mint, amt, "holdings"
+    except: pass
+    # FIX 2: Check 10 sigs, not 2, and accept any amount >0
+    try:
+        sigs=get_signatures(wallet,10)
+        for item in sigs[:8]:
             sig=item.get("signature")
             if not sig: continue
             _,tokens=get_tx_details(sig)
             for _,owner,mint,amt,is_buy in tokens:
-                if owner==wallet and is_buy and amt>100: return mint,amt,sig
+                if is_buy and amt>0.000001 and mint not in BLACKLIST_MINTS:
+                    return mint,amt,sig
     except: pass
     return None,0,None
 
@@ -282,16 +299,15 @@ def fmt_links(mint,sig=None,wallet=None,chain="sol"):
     else:
         ds=f"https://dexscreener.com/base/{mint}"
         out=f'<a href="{ds}">DS</a> | <a href="https://basescan.org/token/{mint}">BS</a>'
-    if sig: out+=f' | <a href="https://solscan.io/tx/{sig}">TX</a>' if chain=="sol" else f' | <a href="https://basescan.org/tx/{sig}">TX</a>'
+    if sig and sig!="holdings": out+=f' | <a href="https://solscan.io/tx/{sig}">TX</a>' if chain=="sol" else f' | <a href="https://basescan.org/tx/{sig}">TX</a>'
     if wallet: out+=f' | <a href="https://solscan.io/account/{wallet}">SC</a>' if chain=="sol" else f' | <a href="https://basescan.org/address/{wallet}">SC</a>'
     return out
 
-# ============ BUNDLE ============
 def handle_bundle(wallet):
     global last_bundled
     wallet=wallet.strip(); chain=detect_chain(wallet); evm=is_evm(wallet)
     if not evm and len(wallet)<30: send_tg("❌ Invalid wallet"); return
-    send_tg(f"🔍 <b>FORWARD {short(wallet)}</b> ⛓️ {chain.upper()} - AGGRESSIVE RECURSIVE ON")
+    send_tg(f"🔍 <b>FORWARD {short(wallet)}</b> ⛓️ {chain.upper()} - RECURSIVE ON")
     try:
         funders=[]
         if not evm:
@@ -344,7 +360,7 @@ def handle_bundle(wallet):
                             recent_children[main_funder].append((to,float(tx["value"])/1e18,datetime.now(),False,None)); last_activity[to]=datetime.now()
                 except: continue
         save_all()
-        send_tg(f"📦 <b>Bundled {short(wallet)}</b> ⛓️ {chain.upper()}\nParent <code>{short(main_funder)}</code> G:{display_group(main_funder)}\n✅ +{added} sibs | Total {len(SOL_WALLETS)} | Recursive tracking ON for all")
+        send_tg(f"📦 <b>Bundled {short(wallet)}</b> ⛓️ {chain.upper()}\nParent <code>{short(main_funder)}</code> G:{display_group(main_funder)}\n✅ +{added} sibs | Total {len(SOL_WALLETS)}")
     except Exception as e: send_tg(f"❌ Bundle error: {e}")
 
 def alert_prep(funder):
@@ -363,19 +379,21 @@ def alert_prep(funder):
     childs=" ".join([f"{short(c[0])} {c[1]:.4f}{unit}" for c in sol_only[:6]])
     for child_addr,_,_,_,_ in sol_only:
         if child_addr not in pending_buys: pending_buys[child_addr]=(funder,now,gl)
-    mint_counter=Counter(); mint_details={}; time.sleep(2.5)
+    mint_counter=Counter(); mint_details={}
+    time.sleep(1)
     for child_addr,_,_,_,_ in sol_only[-6:]:
-        if chain=="sol":
+        # FIX: Use holdings check for instant cluster detection
+        holdings=get_sol_holdings(child_addr) if chain=="sol" else []
+        if holdings:
+            for mint, amt in holdings[:2]:
+                if mint not in BLACKLIST_MINTS:
+                    mint_counter[mint]+=1
+                    if mint not in mint_details: mint_details[mint]=(amt,"holdings",child_addr)
+        else:
             mint,amt,sig=get_token_balance_quick(child_addr)
-            if mint and amt>100:
+            if mint and amt>0:
                 mint_counter[mint]+=1
                 if mint not in mint_details: mint_details[mint]=(amt,sig,child_addr)
-        else:
-            transfers=get_evm_token_transfers(child_addr, chain)
-            for frm,to,mint,amt,is_buy in transfers[:2]:
-                if is_buy and amt>0:
-                    mint_counter[mint]+=1
-                    if mint not in mint_details: mint_details[mint]=(amt,"",child_addr)
     coin_line=""; cluster_tag=""
     if mint_counter:
         common_mint, common_count = mint_counter.most_common(1)[0]
@@ -389,24 +407,40 @@ def alert_prep(funder):
     msg=f"⚠️ <b>PREP {len(sol_only)}w • 10m{cluster_tag}</b> ⛓️ {chain.upper()}\nG:{gl} • {short(funder)}\n{childs}{coin_line}"
     send_tg(msg)
 
+# ============ FIXED BUY DETECTION ============
 def watch_pending_buys_loop():
     while True:
-        time.sleep(4)
+        time.sleep(3)
         try:
             now=datetime.now()
-            for child_addr in list(pending_buys.keys()):
+            for child_addr in list(pending_buys.keys())[:60]:
                 parent_funder, funded_time, gl = pending_buys[child_addr]
                 if (now-funded_time).total_seconds()>86400:
                     pending_buys.pop(child_addr,None); continue
                 chain = next((w.get("chain","sol") for w in SOL_WALLETS if w.get("addr")==child_addr), "sol")
                 if chain=="sol":
-                    mint,amt,sig=get_token_balance_quick(child_addr)
-                    if mint and amt>100:
+                    # METHOD 1: Direct holdings - catches ALL buys even old
+                    holdings=get_sol_holdings(child_addr)
+                    for mint, amt in holdings:
+                        if mint in BLACKLIST_MINTS: continue
+                        if amt < 0.000001: continue
                         info=get_token_info(mint, chain)
-                        name=info["name"] if info else short(mint); mcap=info["mcap_str"] if info else "early"
-                        if info: record_buy(child_addr,mint,amt,info["price"],info["mcap_val"],chain)
+                        if not info: continue
+                        # Valid token found
+                        record_buy(child_addr,mint,amt,info["price"],info["mcap_val"],chain)
                         pending_buys.pop(child_addr,None)
-                        send_tg(f"💰 <b>BOUGHT {html.escape(name)} {mcap}</b>\nChild <code>{short(child_addr)}</code> G:{gl}\nParent {short(parent_funder)}\nCA: <code>{mint}</code>\nAmt: {amt:.0f}\n{fmt_links(mint,sig,child_addr,chain)}")
+                        send_tg(f"💰 <b>BOUGHT {html.escape(info['name'])} {info['mcap_str']}</b>\nChild <code>{short(child_addr)}</code> G:{gl}\nParent {short(parent_funder)}\nCA: <code>{mint}</code>\nAmt: {amt:.2f}\n{fmt_links(mint,'',child_addr,chain)}")
+                        break
+                    else:
+                        # METHOD 2: sig scan if holdings empty
+                        mint,amt,sig=get_token_balance_quick(child_addr)
+                        if mint and amt>0:
+                            info=get_token_info(mint, chain)
+                            name=info["name"] if info else short(mint); mcap=info["mcap_str"] if info else "early"
+                            if info: record_buy(child_addr,mint,amt,info["price"],info["mcap_val"],chain)
+                            pending_buys.pop(child_addr,None)
+                            send_tg(f"💰 <b>BOUGHT {html.escape(name)} {mcap}</b>\nChild <code>{short(child_addr)}</code> G:{gl}\nCA: <code>{mint}</code>\nAmt: {amt:.2f}\n{fmt_links(mint,sig,child_addr,chain)}")
+                            continue
                     # RECURSIVE: if this child funds new wallet, track it
                     sigs=get_signatures(child_addr,4)
                     for item in sigs[:2]:
@@ -420,11 +454,12 @@ def watch_pending_buys_loop():
                                 pending_buys[to]=(grp,now,display_group(grp))
                                 seen_sigs.add(sig); save_all()
                 else:
-                    transfers=get_evm_token_transfers(child_addr, chain)
-                    for frm,to,mint,amt,is_buy in transfers[:3]:
-                        if is_buy and amt>0:
+                    # EVM
+                    holdings=get_evm_holdings(child_addr)
+                    if holdings:
+                        for mint, amt in holdings[:2]:
                             info=get_token_info(mint, chain)
-                            name=info["name"] if info else short(mint); mcap=info["mcap_str"] if info else "early"
+                            name=info["name"] if info else short(mint); mcap=info["mcap_str"] if info else ""
                             if info: record_buy(child_addr,mint,amt,info["price"],info["mcap_val"],chain)
                             pending_buys.pop(child_addr,None)
                             send_tg(f"💰 <b>BOUGHT {html.escape(name)} {mcap}</b> ⛓️ {chain.upper()}\nChild <code>{short(child_addr)}</code> G:{gl}\nCA: <code>{mint}</code>\n{fmt_links(mint,chain=chain)}")
@@ -448,7 +483,7 @@ async def track_sol_polling():
                         if not sig or sig in seen_sigs: continue
                         sols,tokens=get_tx_details(sig)
                         for _,owner,mint,amt,is_buy in tokens:
-                            if owner==w and amt>0 and is_buy:
+                            if amt>0 and is_buy and mint not in BLACKLIST_MINTS:
                                 info=get_token_info(mint, chain)
                                 if not info: continue
                                 seen_sigs.add(sig); save_seen(); last_tx_time=datetime.now(); last_activity[w]=datetime.now()
@@ -457,15 +492,13 @@ async def track_sol_polling():
         except Exception as e: print(f"poll err {e}",flush=True)
         await asyncio.sleep(3)
 
-# ============ AGGRESSIVE RECURSIVE TRACKER ============
 def track_funders_aggressive():
     while True:
         time.sleep(7)
         try:
-            # Track ALL wallets, not just parents - infinite depth
-            all_wallets = SOL_WALLETS[-180:] # last 180 wallets to avoid rate limit
+            all_wallets = SOL_WALLETS[-180:]
             for wdict in all_wallets:
-                funder=wdfunc=w = wdict["addr"]
+                funder=w = wdict["addr"]
                 chain=wdict.get("chain","sol")
                 try:
                     if chain=="sol":
@@ -473,7 +506,7 @@ def track_funders_aggressive():
                         for item in sigs[:5]:
                             sig=item.get("signature")
                             if not sig or sig in seen_sigs: continue
-                            if item.get("blockTime") and time.time()-item["blockTime"]>900: continue # only last 15m
+                            if item.get("blockTime") and time.time()-item["blockTime"]>900: continue
                             sols,_=get_tx_details(sig)
                             for frm,to,amt in sols:
                                 if frm==funder and amt>=0.0008 and not wallet_exists(to):
@@ -483,9 +516,7 @@ def track_funders_aggressive():
                                     recent_children[funder].append((to,amt,datetime.now(),False,None))
                                     last_activity[to]=datetime.now()
                                     seen_sigs.add(sig); save_all()
-                                    # Silent recursive alert only if parent is tracked group
-                                    if len(recent_children[funder])>=1:
-                                        alert_prep(funder)
+                                    if len(recent_children[funder])>=1: alert_prep(funder)
                     else:
                         txs=get_evm_txs(funder, chain, 8)
                         for tx in txs[:5]:
@@ -510,7 +541,7 @@ def handle_command(text):
     if low.startswith("/start"):
         uniq=len(set(GROUPS.values()))
         sol_c=sum(1 for w in SOL_WALLETS if w.get("chain")=="sol"); evm_c=len(SOL_WALLETS)-sol_c
-        send_tg(f"🚀 <b>V13 Recursive PnL</b> • {len(SOL_WALLETS)}w SOL:{sol_c} EVM:{evm_c} • {uniq} groups\n/bundle <addr>\n/labelgroup VEIL\n/pnl [group]\n/listgroups\n/listwallets\n/status")
+        send_tg(f"🚀 <b>V13.1 BUY FIX</b> • {len(SOL_WALLETS)}w SOL:{sol_c} EVM:{evm_c} • {uniq} groups\n/bundle <addr>\n/labelgroup VEIL\n/pnl [group]\n/listgroups\n/listwallets\n/status")
     elif low.startswith("/bundle"):
         p=t.split()
         if len(p)<2: send_tg("Usage: /bundle <addr>")
@@ -532,7 +563,7 @@ def handle_command(text):
                 if lbl==q: target_gid=gid; break
             else: target_gid=parts[1].strip()
         if not target_gid: send_tg("❌ No bundle. /bundle first"); return
-        send_tg(f"⏳ Calculating PnL for {display_group(target_gid)}... ⛓️ SOL+EVM Recursive")
+        send_tg(f"⏳ Calculating PnL for {display_group(target_gid)}...")
         def calc_and_send():
             inv,curr,pnl,pct,details=calculate_group_pnl(target_gid)
             if inv==0: send_tg(f"📉 No PnL data yet for {display_group(target_gid)}. Wait for buys."); return
@@ -572,15 +603,13 @@ def handle_command(text):
             for w in to_del: SOL_WALLETS.remove(w); GROUPS.pop(w["addr"],None)
             save_all(); send_tg(f"Removed <code>{short(a)}</code>")
         else: send_tg("Not found")
-    elif low.startswith("/clear_all"):
-        SOL_WALLETS.clear(); GROUPS.clear(); LABELS.clear(); recent_children.clear(); pending_buys.clear(); TRADES.clear(); save_all(); send_tg("🧹 Cleared all")
-    elif low.startswith("/clear"):
+    elif low.startswith("/clear_all") or low.startswith("/clear"):
         SOL_WALLETS.clear(); GROUPS.clear(); LABELS.clear(); recent_children.clear(); pending_buys.clear(); TRADES.clear(); save_all(); send_tg("🧹 Cleared all")
     elif low.startswith("/status"):
         mins=int((datetime.now()-last_tx_time).total_seconds()/60)
         uniq=len(set(GROUPS.values()))
         sol_c=sum(1 for w in SOL_WALLETS if w.get("chain")=="sol"); evm_c=len(SOL_WALLETS)-sol_c
-        send_tg(f"V13 Recursive PnL • {len(SOL_WALLETS)}w SOL:{sol_c} EVM:{evm_c} • {uniq} groups • Last {mins}m • Bundle {short(last_bundled) if last_bundled else 'none'} • Recursive ON")
+        send_tg(f"V13.1 BUY FIX • {len(SOL_WALLETS)}w SOL:{sol_c} EVM:{evm_c} • {uniq} groups • Last {mins}m • Bundle {short(last_bundled) if last_bundled else 'none'} • Recursive ON")
 
 def poll_commands():
     off=0
@@ -597,7 +626,7 @@ async def main_loop():
     threading.Thread(target=track_funders_aggressive,daemon=True).start()
     threading.Thread(target=watch_pending_buys_loop,daemon=True).start()
     threading.Thread(target=auto_pnl_checker,daemon=True).start()
-    send_tg("🚀 <b>V13 RECURSIVE PnL DEPLOYED</b>\n✅ Infinite recursive A->B->C->D\n✅ SOL + Base both\n✅ /pnl VEIL\n✅ Auto PnL every 10m")
+    send_tg("🚀 <b>V13.1 BUY FIX DEPLOYED</b>\n✅ Fixed buy detection via holdings\n✅ Now catches old buys\n✅ Recursive + PnL")
     await track_sol_polling()
 
 def start_bot():
