@@ -1,233 +1,238 @@
-import os, asyncio, time, aiohttp, threading
-from collections import deque
-from flask import Flask
-from telegram import Bot
-from telegram.ext import Application, CommandHandler
+import os
+import json
+import asyncio
+import aiohttp
+import time
+from collections import defaultdict, deque
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# === YOUR ENV NAMES FROM RENDER ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-ALCHEMY_KEY = os.getenv("ALCHEMY_API_KEY") # your Helius key is here
-SUPA_URL = os.getenv("SUPABASE_URL")
-SUPA_KEY = os.getenv("SUPABASE_KEY")
+HELIUS_KEY = os.getenv("HELIUS_KEY")
+CHAT_ID_ENV = os.getenv("CHAT_ID")
 
-# === FIX RENDER WEB SERVICE - FAKE PORT ===
-web_app = Flask(__name__)
-@web_app.route('/')
-def home(): return "V29 BUY ONLY RUNNING - TG: /status"
+PREP_THRESHOLD_USD = 50
+BUY_THRESHOLD_USD = 50
+PREP_INTERVAL = 30
+SWAP_INTERVAL = 10
+CLUSTER_WINDOW = 180
 
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    web_app.run(host="0.0.0.0", port=port)
+FACTORIES_FILE = "factories.json"
 
-threading.Thread(target=run_web, daemon=True).start()
+def load_factories():
+    if os.path.exists(FACTORIES_FILE):
+        try:
+            with open(FACTORIES_FILE,"r") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return {addr: addr[:6] for addr in data}
+                return data
+        except:
+            return {}
+    return {}
 
-# === V29 CONFIG ===
-FACTORY = [] # fresh start - add via /add
-WATCHED = {} # address -> placeholder
-SEEN_TX = set()
-SWAP_HISTORY = deque(maxlen=1000)
+def save_factories():
+    with open(FACTORIES_FILE,"w") as f:
+        json.dump(factories, f)
 
-PREP_FILTER = 50
-SWAP_FILTER = 50
-PREP_POLL = 30
-SWAP_POLL = 10
-CLUSTER_WINDOW = 120
-SOL_PRICE = 160
+factories = load_factories()
+watched_workers = set()
+last_signatures = set()
+cluster_buys = defaultdict(lambda: deque())
+sol_price = 160.0
 
-bot = Bot(token=BOT_TOKEN)
-print("Starting V29...")
+HELIUS_URL = f"https://api.helius.xyz/v0/addresses/{{}}/transactions?api-key={HELIUS_KEY}&limit=20"
 
 async def get_sol_price():
-    global SOL_PRICE
+    global sol_price
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get("https://price.jup.ag/v4/price?ids=SOL", timeout=5) as r:
-                data = await r.json()
-                SOL_PRICE = float(data['data']['SOL']['price'])
-                print(f"SOL Price: {SOL_PRICE}")
+            async with s.get("https://price.jup.ag/v6/price?ids=So11111111111111111111111111111111111111112") as r:
+                j = await r.json()
+                sol_price = float(j['data']['So11111111111111111111111111111111111111112']['price'])
     except:
-        SOL_PRICE = 160
+        pass
 
-async def fetch_txs(address):
-    if not ALCHEMY_KEY: return []
+async def get_txs(address):
+    url = HELIUS_URL.format(address)
     try:
-        url = f"https://api.helius.xyz/v0/addresses/{address}/transactions?api-key={ALCHEMY_KEY}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as r:
-                if r.status == 200:
-                    return await r.json()
-                else:
-                    print(f"Helius error {r.status} for {address[:6]}")
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=15) as r:
+                if r.status!= 200:
                     return []
-    except Exception as e:
-        print(f"fetch error: {e}")
+                return await r.json()
+    except:
         return []
 
-def short(addr):
-    if not addr or len(addr) < 8: return addr
-    return f"{addr[:4]}..{addr[-4:]}"
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        f"<b>V30 BUY ONLY + LABELS RUNNING</b>\n"
+        f"Prep: {PREP_INTERVAL}s | Swap: {SWAP_INTERVAL}s\n"
+        f"Filter: >${BUY_THRESHOLD_USD}\n"
+        f"Factories: {len(factories)}\n"
+        f"Watched workers: {len(watched_workers)}\n"
+        f"SOL: ${sol_price:.2f}\n\n"
+        f"<b>Commands:</b>\n"
+        f"/add <addr> [label] - e.g. /add 6F5x.. PoorGoat\n"
+        f"/remove <addr> or /remove <label>\n"
+        f"/list\n"
+        f"/clear_all"
+    )
+    await update.message.reply_text(msg, parse_mode='HTML')
 
-async def send(msg):
-    if not BOT_TOKEN or not CHAT_ID: return
-    try:
-        await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown", disable_web_page_preview=True)
-    except Exception as e:
-        print(f"TG send error: {e}")
+async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /add <address> [label]\nExample: /add 6F5xv9Kq... PoorGoat")
+        return
+    addr = context.args[0].strip()
+    label = " ".join(context.args[1:]) if len(context.args) > 1 else addr[:6]
+    factories[addr] = label
+    save_factories()
+    await update.message.reply_text(f"✅ Added factory [{label}]:\n{addr}")
 
-async def prep_loop():
-    await get_sol_price()
-    print("PREP LOOP 30s STARTED")
-    while True:
-        try:
-            if not FACTORY:
-                await asyncio.sleep(5)
-                continue
-            for factory in FACTORY:
-                txs = await fetch_txs(factory)
-                for tx in txs[:20]:
-                    sig = tx.get('signature')
-                    if not sig or sig in SEEN_TX: continue
+async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /remove <address> or label")
+        return
+    addr = context.args[0].strip()
+    if addr in factories:
+        lab = factories.pop(addr)
+        save_factories()
+        await update.message.reply_text(f"❌ Removed [{lab}]: {addr}")
+    else:
+        found = [k for k,v in factories.items() if v.lower()==addr.lower()]
+        if found:
+            for k in found:
+                factories.pop(k)
+            save_factories()
+            await update.message.reply_text(f"❌ Removed by label {addr}")
+        else:
+            await update.message.reply_text("Not found")
 
-                    for tr in tx.get('nativeTransfers', []):
-                        try:
-                            amount_sol = tr.get('amount', 0) / 1e9
-                            usd = amount_sol * SOL_PRICE
-                            if usd < PREP_FILTER: continue # ignore 0.0029 ATA dust
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not factories:
+        await update.message.reply_text("No factories. Use /add <addr> [label]")
+        return
+    txt = "<b>Factories:</b>\n"
+    for addr, label in factories.items():
+        txt += f"• [{label}] - <code>{addr}</code>\n"
+    txt += f"\nWatched workers: {len(watched_workers)}"
+    await update.message.reply_text(txt, parse_mode='HTML')
 
-                            to_user = tr.get('toUserAccount')
-                            from_user = tr.get('fromUserAccount')
+async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    factories.clear()
+    watched_workers.clear()
+    save_factories()
+    await update.message.reply_text("✅ Cleared all. Fresh start. Use /add <addr> [label]")
 
-                            # SILENT RECURSIVE - add worker without TG spam
-                            if to_user and to_user not in WATCHED and to_user not in FACTORY:
-                                WATCHED[to_user] = 999
-                                print(f"Added worker {short(to_user)} via recursive")
-
-                            msg = f"PREP: {short(from_user)} -> {short(to_user)} | {amount_sol:.2f} SOL (${usd:.0f}) | [Tx](https://solscan.io/tx/{sig})"
-                            await send(msg)
-                            SEEN_TX.add(sig)
-                        except: continue
-        except Exception as e:
-            print(f"PREP ERR: {e}")
-        await asyncio.sleep(PREP_POLL)
-
-async def swap_loop():
-    print("SWAP LOOP 10s STARTED")
+async def prep_loop(app):
+    await asyncio.sleep(5)
     while True:
         try:
             await get_sol_price()
-            workers = list(WATCHED.keys()) + FACTORY
-            if not workers:
-                await asyncio.sleep(5)
-                continue
-
-            for worker in workers[:50]: # max 50 to stay light, no crash
-                txs = await fetch_txs(worker)
-                for tx in txs[:10]:
+            for f_addr, f_label in list(factories.items()):
+                txs = await get_txs(f_addr)
+                for tx in txs:
                     sig = tx.get('signature')
-                    if not sig or sig in SEEN_TX: continue
-                    if tx.get('type')!= 'SWAP': continue # catches Photon/Trojan/BullX/Jupiter all
-
-                    for tt in tx.get('tokenTransfers', []):
-                        if tt.get('toUserAccount') == worker:
-                            try:
-                                # SOL spent = native transfers from worker
-                                native_spent = sum([n.get('amount',0) for n in tx.get('nativeTransfers',[]) if n.get('fromUserAccount')==worker]) / 1e9
-                                usd_spent = native_spent * SOL_PRICE
-                                if usd_spent < SWAP_FILTER: continue
-
-                                mint = tt.get('mint')
-                                if not mint: continue
-                                token_name = tt.get('tokenSymbol') or short(mint)
-
-                                now = time.time()
-                                SWAP_HISTORY.append((now, mint, worker, usd_spent, sig))
-                                recent = [s for s in SWAP_HISTORY if now - s[0] <= CLUSTER_WINDOW and s[1] == mint]
-                                total = sum(s[3] for s in recent)
-
-                                cluster_line = f"\nCluster: {len(recent)} wallets, ${total:.0f} total in 120s" if len(recent) > 1 else ""
-
-                                msg = f"MAIN BUY: {token_name}\nMint: `{mint}`\nBuyer: {short(worker)} (${usd_spent:.0f}){cluster_line}\n[Chart](https://dexscreener.com/solana/{mint}) | [Tx](https://solscan.io/tx/{sig})"
-                                await send(msg)
-                                SEEN_TX.add(sig)
-                                break
-                            except: continue
+                    if not sig or sig in last_signatures:
+                        continue
+                    native = tx.get('nativeTransfers', []) or []
+                    for nt in native:
+                        if nt.get('fromUserAccount') == f_addr:
+                            to_acc = nt.get('toUserAccount')
+                            amount_sol = nt.get('amount',0) / 1e9
+                            usd = amount_sol * sol_price
+                            if usd >= PREP_THRESHOLD_USD and to_acc not in factories:
+                                last_signatures.add(sig)
+                                watched_workers.add(to_acc)
+                                try:
+                                    explorer = f"https://solscan.io/tx/{sig}"
+                                    msg = (
+                                        f"🟡 PREP [{f_label}]\n"
+                                        f"{f_addr[:6]}.. -> {to_acc[:6]}..\n"
+                                        f"{amount_sol:.2f} SOL (${usd:.0f})\n"
+                                        f"<a href='{explorer}'>Tx</a>"
+                                    )
+                                    if CHAT_ID_ENV:
+                                        await app.bot.send_message(chat_id=int(CHAT_ID_ENV) if CHAT_ID_ENV.lstrip('-').isdigit() else CHAT_ID_ENV, text=msg, parse_mode='HTML')
+                                except Exception as e:
+                                    print(e)
+                await asyncio.sleep(1)
         except Exception as e:
-            print(f"SWAP ERR: {e}")
-        await asyncio.sleep(SWAP_POLL)
+            print("prep loop error", e)
+        await asyncio.sleep(PREP_INTERVAL)
 
-# === TG COMMANDS - 5 ESSENTIAL ===
-async def cmd_status(update, ctx):
-    msg = f"V29 BUY ONLY RUNNING\nPrep: {PREP_POLL}s | Swap: {SWAP_POLL}s\nFilter: >${PREP_FILTER}\nFactories: {len(FACTORY)}\nWatched workers: {len(WATCHED)}\nSOL: ${SOL_PRICE:.0f}\n\nCommands:\n/add <addr>\n/remove <addr>\n/list\n/clear_all"
-    await update.message.reply_text(msg)
+async def swap_loop(app):
+    await asyncio.sleep(10)
+    while True:
+        try:
+            for worker in list(watched_workers)[:100]:
+                txs = await get_txs(worker)
+                for tx in txs:
+                    sig = tx.get('signature')
+                    if not sig or sig in last_signatures:
+                        continue
+                    ttype = tx.get('type','')
+                    if ttype == 'SWAP' or 'swap' in ttype.lower():
+                        token_transfers = tx.get('tokenTransfers',[]) or []
+                        for tt in token_transfers:
+                            if tt.get('toUserAccount') == worker:
+                                mint = tt.get('mint','')
+                                if mint == 'So11111111111111111111111111111111111111112':
+                                    continue
+                                native_spent = 0
+                                for nt in tx.get('nativeTransfers',[]):
+                                    if nt.get('fromUserAccount') == worker:
+                                        native_spent += nt.get('amount',0)/1e9
+                                usd = native_spent * sol_price
+                                if usd < BUY_THRESHOLD_USD:
+                                    continue
+                                last_signatures.add(sig)
+                                now = time.time()
+                                desc = tx.get('description','')
+                                symbol = mint[:6]
+                                if desc:
+                                    parts = desc.split()
+                                    symbol = parts[-2] if len(parts)>2 else mint[:6]
+                                dq = cluster_buys[mint]
+                                dq.append((now, usd))
+                                while dq and now - dq[0][0] > CLUSTER_WINDOW:
+                                    dq.popleft()
+                                total_cluster = sum(x[1] for x in dq)
+                                count_cluster = len(dq)
+                                explorer = f"https://solscan.io/tx/{sig}"
+                                chart = f"https://dexscreener.com/solana/{mint}"
+                                msg = (
+                                    f"🟢 MAIN BUY\n"
+                                    f"Token: {symbol}\n"
+                                    f"Buyer: <code>{worker[:8]}..</code> (${usd:.0f})\n"
+                                    f"Cluster: {count_cluster} wallets, ${total_cluster:.0f} total in {CLUSTER_WINDOW//60}m\n"
+                                    f"<a href='{chart}'>Chart</a> | <a href='{explorer}'>Tx</a>\n"
+                                    f"<code>{mint}</code>"
+                                )
+                                if CHAT_ID_ENV:
+                                    await app.bot.send_message(chat_id=int(CHAT_ID_ENV) if CHAT_ID_ENV.lstrip('-').isdigit() else CHAT_ID_ENV, text=msg, parse_mode='HTML', disable_web_page_preview=True)
+                                break
+                await asyncio.sleep(0.3)
+        except Exception as e:
+            print("swap loop error", e)
+        await asyncio.sleep(SWAP_INTERVAL)
 
-async def cmd_add(update, ctx):
-    if not ctx.args:
-        await update.message.reply_text("Use: /add <factory_address>\nExample: /add 3MmgY...")
-        return
-    addr = ctx.args[0].strip()
-    if addr in FACTORY:
-        await update.message.reply_text(f"Already tracking {short(addr)}")
-        return
-    FACTORY.append(addr)
-    await update.message.reply_text(f"✅ Added factory {short(addr)}\nNow tracking >$50 buys\nDo /list to see")
+def main():
+    print("Starting V30 with labels")
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("add", add_cmd))
+    app.add_handler(CommandHandler("remove", remove_cmd))
+    app.add_handler(CommandHandler("list", list_cmd))
+    app.add_handler(CommandHandler("clear_all", clear_cmd))
 
-async def cmd_remove(update, ctx):
-    if not ctx.args:
-        await update.message.reply_text("Use: /remove <address>")
-        return
-    addr = ctx.args[0].strip()
-    removed = False
-    if addr in FACTORY:
-        FACTORY.remove(addr)
-        removed = True
-    if addr in WATCHED:
-        del WATCHED[addr]
-        removed = True
-    await update.message.reply_text(f"✅ Removed {short(addr)}" if removed else f"Not found {short(addr)}")
+    async def on_startup(app):
+        asyncio.create_task(prep_loop(app))
+        asyncio.create_task(swap_loop(app))
 
-async def cmd_clear(update, ctx):
-    FACTORY.clear()
-    WATCHED.clear()
-    SEEN_TX.clear()
-    SWAP_HISTORY.clear()
-    await update.message.reply_text("✅ Cleared all. Fresh start.\nAdd new factory with /add")
-
-async def cmd_list(update, ctx):
-    if not FACTORY and not WATCHED:
-        await update.message.reply_text("Empty - no factories yet.\nAdd with: /add <address>")
-        return
-    lines = []
-    for f in FACTORY:
-        lines.append(f"Factory: {short(f)}")
-    for w in list(WATCHED.keys())[:20]:
-        lines.append(f"Worker: {short(w)}")
-    txt = "\n".join(lines)
-    await update.message.reply_text(f"Active ({len(FACTORY)} factories, {len(WATCHED)} workers):\n{txt}")
-
-async def main():
-    if not BOT_TOKEN or not CHAT_ID or not ALCHEMY_KEY:
-        print("ERROR: Missing ENV - BOT_TOKEN, CHAT_ID, ALCHEMY_API_KEY required")
-        while True: await asyncio.sleep(3600)
-
-    print(f"BOT TOKEN OK: {BOT_TOKEN[:10]}...")
-    print(f"CHAT ID: {CHAT_ID}")
-    print("Starting TG Bot polling...")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_status))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("add", cmd_add))
-    app.add_handler(CommandHandler("remove", cmd_remove))
-    app.add_handler(CommandHandler("clear_all", cmd_clear))
-    app.add_handler(CommandHandler("list", cmd_list))
-
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-
-    print("V29 FRESH START READY - TG COMMANDS LIVE")
-    await asyncio.gather(prep_loop(), swap_loop())
+    app.post_init = on_startup
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
