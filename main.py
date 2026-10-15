@@ -17,7 +17,6 @@ LAST_ALERT = {}
 PREP_TRACKER = defaultdict(lambda: {"wallets":[], "times":[]})
 SEEN_MINTS = set()
 
-# --- PERSISTENCE FIX ---
 WALLET_FILE = "wallets.json"
 LABEL_FILE = "labels.json"
 SEEN_FILE = "seen_mints.json"
@@ -34,7 +33,6 @@ def load_all():
     try:
         if os.path.exists(WALLET_FILE):
             with open(WALLET_FILE,'r') as f: SOL_WALLETS.update(json.load(f))
-            print(f"Loaded {len(SOL_WALLETS)} wallets from file")
     except: pass
     try:
         if os.path.exists(LABEL_FILE):
@@ -47,7 +45,7 @@ def load_all():
 
 app_flask = Flask(__name__)
 @app_flask.route('/')
-def home(): return "SHOKS V28 BUNDLED PERMANENT FIX LIVE"
+def home(): return "SHOKS V28.1 BUNDLED FIX LIVE"
 def run_flask(): app_flask.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
 def rpc(m,p):
@@ -102,7 +100,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CHAT_ID = update.effective_chat.id
     load_all()
     if not LABELS:
-        await update.message.reply_text(f"👋 SHOKS TRACKER V28\nTotal Wallets: {len(SOL_WALLETS)}\n/bundle <wallet> then /labelgroup <wallet> <name>")
+        await update.message.reply_text(f"👋 SHOKS TRACKER V28.1\nTotal Wallets: {len(SOL_WALLETS)}\n/bundle <wallet>")
         return
     groups = defaultdict(list)
     for a,inf in SOL_WALLETS.items():
@@ -112,7 +110,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         root = cur if ci['parent']=="ROOT" else inf['parent']
         if inf['parent']=="ROOT": root=a
         groups[root].append(a)
-    msg = f"📊 SHOKS V28 - LABOUR GROUPS\nGroups: {len(LABELS)} | Total: {len(SOL_WALLETS)}\n\n"
+    msg = f"📊 SHOKS V28.1 - LABOUR GROUPS\nGroups: {len(LABELS)} | Total: {len(SOL_WALLETS)}\n\n"
     for root_addr, team_name in LABELS.items():
         cnt = len(groups.get(root_addr, []))
         if cnt==0 and root_addr in SOL_WALLETS: cnt=1
@@ -129,7 +127,7 @@ async def bundle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if founder:
         msg = f"✅ Found funder: {founder[:4]}.. sent {amt:.4f} SOL\nTX: https://solscan.io/tx/{sig}\n\n"
     else:
-        msg = f"✅ No funder found (CEX/Binance) - that's good.\n\n"
+        msg = f"✅ No funder found (CEX/Binance) - good.\n\n"
     SOL_WALLETS[a] = {"parent":"ROOT","gen":0,"added_at":time.time()}
     toks = await asyncio.to_thread(get_tokens, a)
     for tok in toks:
@@ -137,7 +135,7 @@ async def bundle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
     SEEN_TX.clear()
     save_all()
-    msg += f"Now tracking {a[:6]}.. forward ONLY >0.001 SOL\nOld tokens ignored\n\n👉 Name it:\n/labelgroup {a[:6]} <your_team_name>"
+    msg += f"Now tracking {a[:6]}..\nOld tokens ignored\n\n👉 /labelgroup {a[:6]} <name>"
     await update.message.reply_text(msg)
 
 async def labelgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -145,7 +143,7 @@ async def labelgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     addr = context.args[0]; name = " ".join(context.args[1:])
     LABELS[addr] = name
     save_all()
-    await update.message.reply_text(f"🏷️ Team named: {name}\nWallet: {addr[:4]}..\n🚀 Forward tracking active")
+    await update.message.reply_text(f"🏷️ Team named: {name}\nWallet: {addr[:4]}..")
 
 async def listwallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not SOL_WALLETS: await update.message.reply_text("Empty. Use /bundle <addr>"); return
@@ -171,8 +169,16 @@ async def listgroups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"📌 {team_name} : {cnt} wallets\n"
     await update.message.reply_text(msg)
 
+async def pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not SOL_WALLETS: await update.message.reply_text("Empty"); return
+    msg="📊 Balances:\n"
+    for addr in list(SOL_WALLETS.keys())[:15]:
+        bal = await asyncio.to_thread(get_bal, addr)
+        msg+=f"{addr[:4]}.. g{SOL_WALLETS[addr]['gen']}: {bal:.4f} SOL\n"
+    await update.message.reply_text(msg)
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"⚙️ V28 BUNDLED FIX\nWallets: {len(SOL_WALLETS)}\nLabour Groups: {len(LABELS)}\nSeen TX: {len(SEEN_TX)}\nSeen Mints: {len(SEEN_MINTS)}\nCHAT: {CHAT_ID}")
+    await update.message.reply_text(f"⚙️ V28.1 BUNDLED FIX\nWallets: {len(SOL_WALLETS)}\nLabour Groups: {len(LABELS)}\nSeen TX: {len(SEEN_TX)}\nSeen Mints: {len(SEEN_MINTS)}\nCHAT: {CHAT_ID}")
 
 async def clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SOL_WALLETS.clear(); SEEN_TX.clear(); DELETED.clear(); BUY_BUFFER.clear(); SELL_BUFFER.clear(); PREP_TRACKER.clear(); SEEN_MINTS.clear(); LAST_ALERT.clear()
@@ -182,7 +188,6 @@ async def clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update, context):
     print(f"Error: {context.error}")
 
-# --- V28 BUNDLED FORWARD LOOP ---
 async def forward_loop(app):
     global CHAT_ID
     while True:
@@ -207,10 +212,8 @@ async def forward_loop(app):
                             dest=parsed['info'].get('destination'); amt=parsed['info'].get('lamports',0)/1e9
                             if dest and amt>0.001 and dest not in SOL_WALLETS and dest not in DELETED:
                                 SOL_WALLETS[dest]={"parent":addr,"gen":SOL_WALLETS[addr]['gen']+1,"added_at":time.time()}
-                                # BUNDLED TRACKER
                                 PREP_TRACKER[addr]["wallets"].append(dest)
                                 PREP_TRACKER[addr]["times"].append(time.time())
-                                # Clean old >120s
                                 recent_w=[]; recent_t=[]
                                 for w,t in zip(PREP_TRACKER[addr]["wallets"], PREP_TRACKER[addr]["times"]):
                                     if time.time()-t<120:
@@ -224,18 +227,16 @@ async def forward_loop(app):
                             if mint and dst_ata:
                                 _,owner=await asyncio.to_thread(get_ata_info, dst_ata)
                                 if owner: SELL_BUFFER[mint].append({"from":addr,"to":owner,"sig":sig,"time":time.time()})
-                await asyncio.sleep(1.2) # RPC PROTECTION
-            # SEND BUNDLED PREP ALERTS EVERY 20 SEC
+                await asyncio.sleep(1.2)
             for parent_addr in list(PREP_TRACKER.keys()):
                 data = PREP_TRACKER[parent_addr]
                 if not data["wallets"]: continue
-                # if oldest >30 sec OR count >=3, send bundle
                 oldest = min(data["times"]) if data["times"] else 0
                 if time.time()-oldest>30 or len(data["wallets"])>=2:
                     count = len(data["wallets"])
                     wallets_preview = ", ".join([w[:4]+".." for w in data["wallets"][:5]])
                     try:
-                        await app.bot.send_message(CHAT_ID, f"🚨 BUY PREP ALERT (BUNDLED)\n{parent_addr[:4]}.. sent SOL to {count} wallets -> buying soon\nWallets: {wallets_preview}\nGroup: {LABELS.get(parent_addr,'')}\nTX: https://solscan.io/account/{parent_addr}\nCheck /listwallets")
+                        await app.bot.send_message(CHAT_ID, f"🚨 BUY PREP ALERT (BUNDLED)\n{parent_addr[:4]}.. sent SOL to {count} wallets -> buying soon\nWallets: {wallets_preview}\nGroup: {LABELS.get(parent_addr,'')}\nhttps://solscan.io/account/{parent_addr}")
                     except: pass
                     PREP_TRACKER[parent_addr]={"wallets":[],"times":[]}
             await asyncio.sleep(8)
@@ -299,31 +300,20 @@ async def cluster_alert_loop(app):
                         msg=(f"💰 BOUGHT - ${name} - ${total_usd:.0f}\n\nCoin: ${name}\nCA: `{mint}`\n[Dex](https://dexscreener.com/solana/{mint}) | [Photon](https://photon-sol.tinyastro.io/en/lp/{mint}) | [Solscan](https://solscan.io/token/{mint})\n\nGroup: {group_name}\nBuyer: {buyers}")
                     await app.bot.send_message(CHAT_ID, msg, parse_mode="Markdown", disable_web_page_preview=True)
                     LAST_ALERT[mint]=time.time(); BUY_BUFFER.pop(mint,None)
-            for mint in list(SELL_BUFFER.keys()):
-                sells=[s for s in SELL_BUFFER[mint] if time.time()-s['time']<70]
-                if not sells: SELL_BUFFER.pop(mint,None); continue
-                if len(sells)>=2 and time.time()-min(s['time'] for s in sells)>15:
-                    name,mcap,vol,price = await asyncio.to_thread(dex_info, mint)
-                    if not name or name=="UNKNOWN": SELL_BUFFER.pop(mint,None); continue
-                    msg=(f"⚠️ SELL PREP\nToken: ${name}\nCA: `{mint}`\n{len(sells)} transfers\n[Dex](https://dexscreener.com/solana/{mint}) | [Photon](https://photon-sol.tinyastro.io/en/lp/{mint})\nTX: https://solscan.io/tx/{sells[0]['sig']}")
-                    await app.bot.send_message(CHAT_ID, msg, parse_mode="Markdown", disable_web_page_preview=True)
-                    SELL_BUFFER.pop(mint,None)
         except: await asyncio.sleep(5)
 
-# --- PERMANENT FIX: DEAD LOOP ---
 async def dead_loop(app):
     while True:
-        await asyncio.sleep(3600) # 1 HOUR, NOT 30 SEC
+        await asyncio.sleep(3600)
         try:
-            # SKIP if factory funding happening now
             total_pending = sum([len(v["wallets"]) for v in PREP_TRACKER.values()])
             if total_pending > 3:
-                print(f"Skipping dead check - factory funding {total_pending} wallets")
+                print(f"Skipping dead check - factory funding {total_pending}")
                 continue
             for addr in list(SOL_WALLETS.keys()):
                 inf=SOL_WALLETS[addr]
                 if inf['parent']=="ROOT": continue
-                if time.time()-inf['added_at']<10800: continue # 3 hours grace
+                if time.time()-inf['added_at']<10800: continue
                 bal=await asyncio.to_thread(get_bal, addr)
                 await asyncio.sleep(0.5)
                 if bal>0.002: continue
@@ -332,15 +322,12 @@ async def dead_loop(app):
                 if bal<=0.001 and len(toks)==0:
                     del SOL_WALLETS[addr]; DELETED.add(addr)
                     save_all()
-                    print(f"Deleted dead {addr[:4]}..")
-        except Exception as e:
-            print(f"dead_loop error {e}")
+        except: pass
 
 async def post_init(app):
     load_all()
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
-        print("Webhook deleted")
     except: pass
     asyncio.create_task(forward_loop(app))
     asyncio.create_task(buy_loop(app))
@@ -365,7 +352,7 @@ def main():
     app.add_handler(CommandHandler("clear_all", clear_all))
     app.add_handler(CommandHandler("clear", clear_all))
     app.add_error_handler(error_handler)
-    print(f"start bot V28 bundled fix - wallets {len(SOL_WALLETS)}")
+    print(f"start bot V28.1 - wallets {len(SOL_WALLETS)}")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__=="__main__":
