@@ -9,16 +9,16 @@ from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# --- FAKE WEB SERVER FOR RENDER (FIXES No ports detected) ---
+# --- FAKE WEB SERVER FOR RENDER ---
 flask_app = Flask(__name__)
 @flask_app.route('/')
 def home():
-    return "Shoks Tracker V30.2 Running"
+    return "Shoks Tracker V30.3 Running"
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host='0.0.0.0', port=port)
 threading.Thread(target=run_flask, daemon=True).start()
-# -------------------------------------------------------------
+# ----------------------------------
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 HELIUS_KEY = os.getenv("HELIUS_KEY")
@@ -70,31 +70,58 @@ async def get_txs(address):
                 return await r.json()
     except: return []
 
+# FIXED: No <addr> tags in HTML messages
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"<b>V30.2 FIXED + WEB PORT RUNNING</b>\nFactories: {len(factories)}\nWatched: {len(watched_workers)}\nSOL: ${sol_price:.2f}\n\n/add <addr> [label]", parse_mode='HTML')
+    msg = (
+        f"V30.3 FIXED RUNNING\n"
+        f"Factories: {len(factories)}\n"
+        f"Watched: {len(watched_workers)}\n"
+        f"SOL: ${sol_price:.2f}\n\n"
+        f"Commands:\n"
+        f"/add address label - ex: /add 6F5x... PoorGoat\n"
+        f"/remove address\n"
+        f"/list\n"
+        f"/clear_all"
+    )
+    await update.message.reply_text(msg)
+
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: return await update.message.reply_text("Usage: /add <address> [label]")
-    addr=context.args[0].strip(); label=" ".join(context.args[1:]) if len(context.args)>1 else addr[:6]
-    factories[addr]=label; save_factories()
-    await update.message.reply_text(f"✅ Added [{label}]: {addr}")
+    if not context.args: 
+        await update.message.reply_text("Usage: /add ADDRESS LABEL")
+        return
+    addr=context.args[0].strip()
+    label=" ".join(context.args[1:]) if len(context.args)>1 else addr[:6]
+    factories[addr]=label
+    save_factories()
+    await update.message.reply_text(f"Added [{label}]: {addr}")
+
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args: return
     addr=context.args[0].strip()
     if addr in factories:
-        lab=factories.pop(addr); save_factories(); await update.message.reply_text(f"❌ Removed [{lab}]")
+        lab=factories.pop(addr)
+        save_factories()
+        await update.message.reply_text(f"Removed [{lab}]")
     else:
         found=[k for k,v in factories.items() if v.lower()==addr.lower()]
         if found:
             for k in found: factories.pop(k)
-            save_factories(); await update.message.reply_text(f"❌ Removed label {addr}")
+            save_factories()
+            await update.message.reply_text(f"Removed label {addr}")
+
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not factories: return await update.message.reply_text("No factories")
-    txt="<b>Factories:</b>\n"
-    for a,l in factories.items(): txt+=f"• [{l}] - <code>{a}</code>\n"
-    await update.message.reply_text(txt, parse_mode='HTML')
+    if not factories:
+        await update.message.reply_text("No factories")
+        return
+    txt="Factories:\n"
+    for a,l in factories.items(): txt+=f"- [{l}] {a}\n"
+    await update.message.reply_text(txt)
+
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    factories.clear(); watched_workers.clear(); save_factories()
-    await update.message.reply_text("✅ Cleared all")
+    factories.clear()
+    watched_workers.clear()
+    save_factories()
+    await update.message.reply_text("Cleared all")
 
 async def prep_loop(app):
     await asyncio.sleep(5)
@@ -108,11 +135,14 @@ async def prep_loop(app):
                     if not sig or sig in last_signatures: continue
                     for nt in tx.get('nativeTransfers',[]) or []:
                         if nt.get('fromUserAccount')==f_addr:
-                            to_acc=nt.get('toUserAccount'); amt=nt.get('amount',0)/1e9; usd=amt*sol_price
+                            to_acc=nt.get('toUserAccount')
+                            amt=nt.get('amount',0)/1e9
+                            usd=amt*sol_price
                             if usd>=PREP_THRESHOLD_USD and to_acc not in factories:
-                                last_signatures.add(sig); watched_workers.add(to_acc)
+                                last_signatures.add(sig)
+                                watched_workers.add(to_acc)
                                 if CHAT_ID_ENV:
-                                    try: await app.bot.send_message(chat_id=CHAT_ID_ENV, text=f"🟡 PREP [{f_label}] {amt:.2f} SOL (${usd:.0f}) -> {to_acc[:6]}")
+                                    try: await app.bot.send_message(chat_id=CHAT_ID_ENV, text=f"PREP [{f_label}] {amt:.2f} SOL (${usd:.0f})")
                                     except: pass
                 await asyncio.sleep(1)
         except: pass
@@ -136,9 +166,9 @@ async def swap_loop(app):
                                 usd=spent*sol_price
                                 if usd<BUY_THRESHOLD_USD: continue
                                 last_signatures.add(sig)
-                                msg=f"🟢 MAIN BUY\nBuyer: {worker[:8]} (${usd:.0f})\n<code>{mint}</code>"
+                                msg=f"MAIN BUY\nBuyer: {worker[:8]} (${usd:.0f})\n{mint}"
                                 if CHAT_ID_ENV:
-                                    try: await app.bot.send_message(chat_id=CHAT_ID_ENV, text=msg, parse_mode='HTML')
+                                    try: await app.bot.send_message(chat_id=CHAT_ID_ENV, text=msg)
                                     except: pass
                                 break
                 await asyncio.sleep(0.4)
