@@ -1,7 +1,7 @@
 """
-V33.3 MERGED FIX - LIVE SOL + CLICKABLE LINKS + FACTORY-ONLY LISTENER
-Fix: transfer_loop now listens ONLY to your factories, not whole Solana (111111...)
-This guarantees you catch funding like your 32k whale video
+V33.4 FINAL MERGED - FACTORY LISTENER + ANY DEX (DFLOW/JUPITER/PUMP/RAYDIUM)
+Fix 1: transfer_loop = factory-only (catches funding after 1PM)
+Fix 2: swap_loop = listens to Jupiter, DFlow, Token Program (catches USDC swaps)
 """
 import os, asyncio, time, gc, json, threading
 from collections import defaultdict
@@ -41,7 +41,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(f"OK V33.3 Factories:{len(factories)} Workers:{len(watched_workers)} SOL:${sol_price:.2f}".encode())
+        self.wfile.write(f"OK V33.4 Factories:{len(factories)} Workers:{len(watched_workers)} SOL:${sol_price:.2f}".encode())
     def log_message(self, *args): pass
 
 def run_web_server():
@@ -51,13 +51,14 @@ def run_web_server():
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     price_txt = f"${sol_price:.2f}" if sol_price > 0 else "FETCHING..."
     await update.message.reply_text(
-        f"✅ V33.3 SMART HUNTER RUNNING\n"
+        f"✅ V33.4 SMART HUNTER RUNNING\n"
         f"Factories: {len(factories)} Workers: {len(watched_workers)} SOL:{price_txt}\n"
         f"Logic1: Recursive depth {MAX_DEPTH}\n"
         f"Logic2: Fresh wallet\n"
         f"Logic3: Same-slot Jito\n"
         f"Logic4: Mixed cluster 5/5min\n"
-        f"Listener: Factory-only (FIXED)\n\n"
+        f"Funding: Factory-only (FIXED)\n"
+        f"Swaps: Pump+Ray+Jupiter+DFlow+Token (FIXED)\n\n"
         f"/bundle address label\n/status /remove /clear_all"
     )
 
@@ -66,7 +67,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     price_txt = f"${sol_price:.2f}" if sol_price > 0 else "FETCHING..."
     listening = ", ".join([k[:4] for k in factories.keys()][:10])
     await update.message.reply_text(
-        f"V33.3 STATUS\n"
+        f"V33.4 STATUS\n"
         f"SOL Live: {price_txt}\n"
         f"Factories: {len(factories)} (L0-{MAX_DEPTH})\n"
         f"Workers: {len(watched_workers)} Fresh:{fresh}\n"
@@ -91,7 +92,7 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_clear_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     factories.clear(); watched_workers.clear()
     dust_tracker.clear(); main_tracker.clear(); mixed_tracker.clear(); bundle_buys.clear(); slot_tracker.clear()
-    await update.message.reply_text("✅ V33.3 Cleared all")
+    await update.message.reply_text("✅ V33.4 Cleared all")
 
 async def cmd_label(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(ctx.args) < 2: return
@@ -219,7 +220,6 @@ async def handle_buy(wallet, mint, slot, sig, app):
         level = w_info["level"]
         fresh_tag = "🔥 FRESH" if w_info.get("fresh") else ""
 
-        # SHORT CLICKABLE LINKS
         dex_link = f"https://dexscreener.com/solana/{mint}"
         photon_link = f"https://photon-sol.tinyastro.io/en/lp/{mint}"
         solscan_link = f"https://solscan.io/token/{mint}"
@@ -267,21 +267,18 @@ def parse_transfer(meta, keys):
     except: pass
     return transfers
 
-# ---- FIXED TRANSFER LOOP - FACTORY ONLY LISTENER (MERGED FIX) ----
+# ---- FIXED TRANSFER LOOP - FACTORY ONLY LISTENER ----
 async def transfer_loop(app):
     while True:
         try:
             async with websockets.connect(ALCHEMY_WSS, ping_interval=20) as ws:
-                print("V33.3 transfer loop connected - factory-only mode")
+                print("V33.4 transfer loop connected - factory-only mode")
                 subscribed = set()
-                # Subscribe to existing factories immediately
                 for f in list(factories.keys()):
                     await ws.send(json.dumps({"jsonrpc":"2.0","id":1,"method":"logsSubscribe","params":[{"mentions":[f]}, {"commitment":"confirmed"}]}))
                     subscribed.add(f)
                     print(f"SUBSCRIBED factory {f[:8]}")
-
                 while True:
-                    # Dynamic subscribe for new factories added via /bundle
                     for f in list(factories.keys()):
                         if f not in subscribed:
                             await ws.send(json.dumps({"jsonrpc":"2.0","id":1,"method":"logsSubscribe","params":[{"mentions":[f]}, {"commitment":"confirmed"}]}))
@@ -290,7 +287,6 @@ async def transfer_loop(app):
                             try:
                                 await app.bot.send_message(chat_id=CHAT_ID, text=f"🔍 Now listening to new factory {f[:4]}")
                             except: pass
-
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=15)
                         data = json.loads(raw)
@@ -302,13 +298,12 @@ async def transfer_loop(app):
                         keys = [k if isinstance(k,str) else k["pubkey"] for k in tx["transaction"]["message"]["accountKeys"]]
                         pre = tx["meta"].get("preBalances", [])
                         post = tx["meta"].get("postBalances", [])
-                        # FIXED PARSING: factory is sender, any receiver with increase >0.005 SOL
                         for i in range(min(len(keys), len(pre))):
                             if keys[i] in factories and pre[i] > post[i]:
                                 for j in range(min(len(keys), len(post))):
                                     if post[j] > pre[j] and keys[j]!= keys[i]:
                                         recv = post[j] - pre[j]
-                                        if recv > 5_000_000: # >0.005 SOL to avoid spam
+                                        if recv > 5_000_000:
                                             await handle_funding(keys[i], keys[j], recv, app)
                     except asyncio.TimeoutError:
                         continue
@@ -316,12 +311,23 @@ async def transfer_loop(app):
             print(f"transfer err {e} - reconnect in 5s")
             await asyncio.sleep(5)
 
+# ---- FIXED SWAP LOOP - CATCHES DFLOW/JUPITER/ANY DEX ----
 async def swap_loop(app):
+    PROGRAMS = [
+        "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", # Pump
+        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", # Raydium
+        "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4", # Jupiter V6
+        "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB", # Jupiter V4
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", # SPL Token - catches DFlow v4 + ANY swap
+        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc", # Orca Whirlpool
+    ]
+    STABLES = {"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB","So11111111111111111111111111111111111111112"}
     while True:
         try:
             async with websockets.connect(ALCHEMY_WSS, ping_interval=20) as ws:
-                await ws.send(json.dumps({"jsonrpc":"2.0","id":2,"method":"logsSubscribe","params":[{"mentions":[PUMP_FUN]}, {"commitment":"confirmed"}]}))
-                await ws.send(json.dumps({"jsonrpc":"2.0","id":3,"method":"logsSubscribe","params":[{"mentions":[RAYDIUM]}, {"commitment":"confirmed"}]}))
+                for i, prog in enumerate(PROGRAMS):
+                    await ws.send(json.dumps({"jsonrpc":"2.0","id":i+1,"method":"logsSubscribe","params":[{"mentions":[prog]}, {"commitment":"confirmed"}]}))
+                    print(f"Swap listener {prog[:4]}")
                 async for m in ws:
                     data = json.loads(m)
                     if "params" not in data: continue
@@ -334,7 +340,9 @@ async def swap_loop(app):
                     if not wallet: continue
                     for post in tx["meta"].get("postTokenBalances",[]):
                         if post.get("owner")==wallet and post.get("mint"):
-                            await handle_buy(wallet, post["mint"], slot, sig, app)
+                            mint = post["mint"]
+                            if mint in STABLES: continue
+                            await handle_buy(wallet, mint, slot, sig, app)
         except Exception as e:
             print(f"swap err {e}")
             await asyncio.sleep(5)
@@ -346,7 +354,7 @@ async def keep_alive():
         for w in list(watched_workers.keys()):
             if now - watched_workers[w]["time"] > 7200:
                 del watched_workers[w]
-        print(f"V33.3 alive {len(watched_workers)} workers {len(factories)} factories SOL ${sol_price}")
+        print(f"V33.4 alive {len(watched_workers)} workers {len(factories)} factories SOL ${sol_price}")
         gc.collect()
 
 async def main():
@@ -362,9 +370,9 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    print("V33.3 commands started")
+    print("V33.4 commands started")
     price_init = f"${sol_price:.2f}" if sol_price>0 else "fetching..."
-    await app.bot.send_message(chat_id=CHAT_ID, text=f"✅ V33.3 LIVE + LINKS + FACTORY LISTENER FIXED\nSOL: {price_init} live 30s\nBuy: DEX | Photon | TX | Solscan clickable\nListening only to your factories - will catch your 32k whale\n/bundle addr to add\nPort {PORT}")
+    await app.bot.send_message(chat_id=CHAT_ID, text=f"✅ V33.4 LIVE + LINKS + FIXED BOTH\nSOL: {price_init} live 30s\nFunding: Factory-only (fixes 1PM miss)\nSwaps: Pump+Ray+Jup+DFlow+Token (fixes USDC miss)\nBuy: DEX | Photon | TX | Solscan clickable\n/bundle addr to add\nPort {PORT}")
     await asyncio.gather(update_sol_price(), transfer_loop(app), swap_loop(app), keep_alive())
 
 if __name__ == "__main__":
