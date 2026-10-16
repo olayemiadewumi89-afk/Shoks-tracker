@@ -1,3 +1,4 @@
-python-telegram-bot==20.7
-aiohttp==3.9.1
-Flask==2.3.3
+python-telegram-bot
+websockets
+httpx
+python-dotenv
