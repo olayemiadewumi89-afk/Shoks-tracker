@@ -1,7 +1,7 @@
 """
-V33.7 MERGED FIX - LIVE SOL + CLICKABLE LINKS + FACTORY-ONLY LISTENER + POLLING + ANY DEX
-Fix: transfer_loop WS + polling every 6s, swap_loop catches DFlow/Jupiter
-Based on your V33.3 you pasted - NOTHING REMOVED
+V33.8 FINAL - PERSISTENCE + WS+POLL + ANY DEX
+Fixes: Factories wiped on restart (your screenshot) + $1.03 funding + DFlow
+Based on V33.7 - NOTHING REMOVED - Added save.json
 """
 import os, asyncio, time, gc, json, threading
 from collections import defaultdict
@@ -37,11 +37,30 @@ slot_tracker = defaultdict(list)
 sol_price = 0.0
 recent_bundles = []
 
+# ---- PERSISTENCE FIX FOR YOUR SCREENSHOT ----
+SAVE_FILE = "save.json"
+if os.path.exists(SAVE_FILE):
+    try:
+        with open(SAVE_FILE, "r") as f:
+            data = json.load(f)
+            factories.update(data.get("factories", {}))
+            watched_workers.update(data.get("workers", {}))
+            print(f"LOADED {len(factories)} factories {len(watched_workers)} workers from {SAVE_FILE}")
+    except Exception as e:
+        print(f"load err {e}")
+
+def save_all():
+    try:
+        with open(SAVE_FILE, "w") as f:
+            json.dump({"factories": factories, "workers": watched_workers}, f)
+    except Exception as e:
+        print(f"save err {e}")
+
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(f"OK V33.7 Factories:{len(factories)} Workers:{len(watched_workers)} SOL:${sol_price:.2f}".encode())
+        self.wfile.write(f"OK V33.8 Factories:{len(factories)} Workers:{len(watched_workers)} SOL:${sol_price:.2f}".encode())
     def log_message(self, *args): pass
 
 def run_web_server():
@@ -51,23 +70,23 @@ def run_web_server():
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     price_txt = f"${sol_price:.2f}" if sol_price > 0 else "FETCHING..."
     await update.message.reply_text(
-        f"✅ V33.7 SMART HUNTER RUNNING\n"
+        f"✅ V33.8 SMART HUNTER RUNNING\n"
         f"Factories: {len(factories)} Workers: {len(watched_workers)} SOL:{price_txt}\n"
         f"Logic1: Recursive depth {MAX_DEPTH}\n"
         f"Logic2: Fresh wallet\n"
         f"Logic3: Same-slot Jito\n"
         f"Logic4: Mixed cluster 5/5min\n"
-        f"Listener: Factory-only + Polling (FIXED)\n"
-        f"Swaps: Pump+Ray+Jupiter+DFlow (FIXED)\n\n"
+        f"Listener: Factory-only + Polling 6s + Persistence\n"
+        f"Swaps: Pump+Ray+Jupiter+DFlow\n\n"
         f"/bundle address label\n/status /remove /clear_all"
     )
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fresh = sum(1 for w in watched_workers.values() if w.get('fresh'))
     price_txt = f"${sol_price:.2f}" if sol_price > 0 else "FETCHING..."
-    listening = ", ".join([k[:4] for k in factories.keys()][:10])
+    listening = ", ".join([k[:4] for k in factories.keys()][:12])
     await update.message.reply_text(
-        f"V33.7 STATUS\n"
+        f"V33.8 STATUS\n"
         f"SOL Live: {price_txt}\n"
         f"Factories: {len(factories)} (L0-{MAX_DEPTH})\n"
         f"Workers: {len(watched_workers)} Fresh:{fresh}\n"
@@ -82,22 +101,26 @@ async def cmd_bundle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     addr = ctx.args[0]
     label = ctx.args[1] if len(ctx.args) > 1 else "factory"
     factories[addr] = {"label": label, "level": 0}
-    await update.message.reply_text(f"✅ ADDED L0 Factory [{addr[:4]}] {label} -> auto L{MAX_DEPTH}\nNow listening directly to it.")
+    save_all()
+    await update.message.reply_text(f"✅ ADDED L0 Factory [{addr[:4]}] {label} -> auto L{MAX_DEPTH}\nNow listening directly to it. SAVED.")
 
 async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args: return
     factories.pop(ctx.args[0], None)
-    await update.message.reply_text(f"✅ Removed {ctx.args[0][:6]}")
+    save_all()
+    await update.message.reply_text(f"✅ Removed {ctx.args[0][:6]} - SAVED")
 
 async def cmd_clear_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     factories.clear(); watched_workers.clear()
     dust_tracker.clear(); main_tracker.clear(); mixed_tracker.clear(); bundle_buys.clear(); slot_tracker.clear()
-    await update.message.reply_text("✅ V33.7 Cleared all")
+    save_all()
+    await update.message.reply_text("✅ V33.8 Cleared all - SAVED")
 
 async def cmd_label(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(ctx.args) < 2: return
     if ctx.args[0] in factories:
         factories[ctx.args[0]]["label"] = ctx.args[1]
+        save_all()
     await update.message.reply_text(f"✅ Labeled {ctx.args[0][:4]} as {ctx.args[1]}")
 
 async def update_sol_price():
@@ -168,6 +191,7 @@ async def handle_funding(factory, to_wallet, lamports, app):
                 if f_level+1 < MAX_DEPTH:
                     factories[w] = {"label": f"sub_{factory[:4]}_L{f_level+1}", "level": f_level+1}
         mixed_tracker[factory].clear()
+        save_all()
 
     is_dust = usd < THRESHOLD
     tracker = dust_tracker if is_dust else main_tracker
@@ -197,8 +221,8 @@ async def handle_funding(factory, to_wallet, lamports, app):
         await app.bot.send_message(chat_id=CHAT_ID, text=msg)
         last_alert[key] = now
         tracker[factory].clear()
+        save_all()
 
-# ---- BUY ALERT WITH SHORT CLICKABLE LINKS ----
 async def handle_buy(wallet, mint, slot, sig, app):
     if wallet not in watched_workers: return
     now = time.time()
@@ -209,41 +233,22 @@ async def handle_buy(wallet, mint, slot, sig, app):
             del slot_tracker[s]
     same_slot = [(w,sg) for m,w,t,sg in slot_tracker.get(slot, []) if m == mint]
     same_slot_wallets = [w for w,sg in same_slot]
-
     bundle_buys[mint].append((now, wallet, slot, sig))
     bundle_buys[mint] = [x for x in bundle_buys[mint] if now - x[0] < 30]
     wc = len(bundle_buys[mint])
-
     if wc >= 3 or len(same_slot_wallets) >= 2:
         symbol, mcap, price = await get_token_info(mint)
         origin = w_info["origin"]
         level = w_info["level"]
         fresh_tag = "🔥 FRESH" if w_info.get("fresh") else ""
-
-        # SHORT CLICKABLE LINKS
         dex_link = f"https://dexscreener.com/solana/{mint}"
         photon_link = f"https://photon-sol.tinyastro.io/en/lp/{mint}"
         solscan_link = f"https://solscan.io/token/{mint}"
         tx_link = f"https://solscan.io/tx/{sig}" if sig else solscan_link
-
         if len(same_slot_wallets) >= 2:
-            msg = (
-                f"⚡ JITO BUNDLE L{level} {fresh_tag}\n"
-                f"Token: {symbol} | ${mcap:,.0f} MCap\n"
-                f"Mint: <code>{mint}</code>\n"
-                f"Slot: {slot} | {len(same_slot_wallets)} SAME SLOT!\n"
-                f"Origin: {origin[:4]} | Wallets: {', '.join([w[:4] for w in same_slot_wallets[:4]])}\n\n"
-                f"<a href=\"{dex_link}\">DEX</a> | <a href=\"{photon_link}\">Photon</a> | <a href=\"{tx_link}\">TX</a> | <a href=\"{solscan_link}\">Solscan</a>"
-            )
+            msg = f"⚡ JITO BUNDLE L{level} {fresh_tag}\nToken: {symbol} | ${mcap:,.0f} MCap\nMint: <code>{mint}</code>\nSlot: {slot} | {len(same_slot_wallets)} SAME SLOT!\nOrigin: {origin[:4]} | Wallets: {', '.join([w[:4] for w in same_slot_wallets[:4]])}\n\n<a href=\"{dex_link}\">DEX</a> | <a href=\"{photon_link}\">Photon</a> | <a href=\"{tx_link}\">TX</a> | <a href=\"{solscan_link}\">Solscan</a>"
         else:
-            msg = (
-                f"🔥 BUNDLE L{level} {fresh_tag}\n"
-                f"Token: {symbol} | ${mcap:,.0f} MCap\n"
-                f"Mint: <code>{mint}</code>\n"
-                f"Buy: {wc} wallets 30s | Origin: {origin[:4]}\n\n"
-                f"<a href=\"{dex_link}\">DEX</a> | <a href=\"{photon_link}\">Photon</a> | <a href=\"{tx_link}\">TX</a> | <a href=\"{solscan_link}\">Solscan</a>"
-            )
-
+            msg = f"🔥 BUNDLE L{level} {fresh_tag}\nToken: {symbol} | ${mcap:,.0f} MCap\nMint: <code>{mint}</code>\nBuy: {wc} wallets 30s | Origin: {origin[:4]}\n\n<a href=\"{dex_link}\">DEX</a> | <a href=\"{photon_link}\">Photon</a> | <a href=\"{tx_link}\">TX</a> | <a href=\"{solscan_link}\">Solscan</a>"
         recent_bundles.append({"symbol": symbol, "mcap": mcap, "mint": mint, "slot": slot})
         await app.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="HTML", disable_web_page_preview=True)
         bundle_buys[mint].clear()
@@ -268,7 +273,6 @@ def parse_transfer(meta, keys):
     except: pass
     return transfers
 
-# ---- FIXED TRANSFER LOOP - FACTORY ONLY + POLLING BACKUP ----
 async def transfer_loop(app):
     last_sig_seen = {}
     async def poll_factories():
@@ -308,7 +312,7 @@ async def transfer_loop(app):
         while True:
             try:
                 async with websockets.connect(ALCHEMY_WSS, ping_interval=20) as ws:
-                    print("V33.7 WS connected - factory-only + polling", flush=True)
+                    print("V33.8 WS connected - factory-only + polling", flush=True)
                     subscribed = set()
                     for f in list(factories.keys()):
                         await ws.send(json.dumps({"jsonrpc":"2.0","id":1,"method":"logsSubscribe","params":[{"mentions":[f]}, {"commitment":"confirmed"}]}))
@@ -349,15 +353,14 @@ async def transfer_loop(app):
 
     await asyncio.gather(poll_factories(), ws_factories())
 
-# ---- FIXED SWAP LOOP - CATCHES DFLOW/JUPITER/ANY DEX ----
 async def swap_loop(app):
     PROGRAMS = [
-        "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", # Pump
-        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", # Raydium
-        "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4", # Jupiter V6
-        "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB", # Jupiter V4
-        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", # SPL Token - catches DFlow v4 + ANY swap
-        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc", # Orca
+        "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+        "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+        "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB",
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
     ]
     STABLES = {"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB","So11111111111111111111111111111111111111112"}
     while True:
@@ -389,10 +392,14 @@ async def keep_alive():
     while True:
         await asyncio.sleep(600)
         now = time.time()
+        removed = False
         for w in list(watched_workers.keys()):
             if now - watched_workers[w]["time"] > 7200:
                 del watched_workers[w]
-        print(f"V33.7 alive {len(watched_workers)} workers {len(factories)} factories SOL ${sol_price}")
+                removed = True
+        if removed:
+            save_all()
+        print(f"V33.8 alive {len(watched_workers)} workers {len(factories)} factories SOL ${sol_price}")
         gc.collect()
 
 async def main():
@@ -408,9 +415,9 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    print("V33.7 commands started")
+    print("V33.8 commands started")
     price_init = f"${sol_price:.2f}" if sol_price>0 else "fetching..."
-    await app.bot.send_message(chat_id=CHAT_ID, text=f"✅ V33.7 LIVE FULL + FIXED BOTH\nSOL: {price_init} live 30s\nFunding:WS+Poll 6s (fixes 1PM miss + $1.03)\nSwaps:Pump+Ray+Jup+DFlow+Token (fixes USDC->BFRG)\nBuy:DEX | Photon | TX | Solscan clickable\nPort {PORT}")
+    await app.bot.send_message(chat_id=CHAT_ID, text=f"✅ V33.8 LIVE FULL + PERSISTENCE\nSOL: {price_init} live 30s\nFunding:WS+Poll 6s (fixes 1PM miss + $1.03)\nSwaps:Pump+Ray+Jup+DFlow+Token (fixes USDC->BFRG)\nBuy:DEX | Photon | TX | Solscan clickable\nFactories restored: {len(factories)}\nPort {PORT}")
     await asyncio.gather(update_sol_price(), transfer_loop(app), swap_loop(app), keep_alive())
 
 if __name__ == "__main__":
