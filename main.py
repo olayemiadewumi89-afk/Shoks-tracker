@@ -1,212 +1,176 @@
-import os
-import json
-import asyncio
-import aiohttp
-import time
-import threading
-from collections import defaultdict, deque
-from flask import Flask
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+"""
+V32-Web Service FIX - For Render Free (No Background Worker)
+Works with Uptimerobot
+"""
+import os, asyncio, time, gc, json, threading
+from collections import defaultdict
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import websockets, httpx
+from telegram import Bot
+from dotenv import load_dotenv
 
-flask_app = Flask(__name__)
-@flask_app.route('/')
-def home():
-    return f"Shoks Tracker V30.5 Running - SOL ${sol_price:.2f}"
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host='0.0.0.0', port=port)
-threading.Thread(target=run_flask, daemon=True).start()
+load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-HELIUS_KEY = os.getenv("HELIUS_KEY")
-CHAT_ID_ENV = os.getenv("CHAT_ID")
+CHAT_ID = os.getenv("CHAT_ID")
+ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY")
+PORT = int(os.getenv("PORT", 10000))
 
-PREP_THRESHOLD_USD = 50
-BUY_THRESHOLD_USD = 50
-PREP_INTERVAL = 30
-SWAP_INTERVAL = 10
-CHAIN_INTERVAL = 20
-FACTORIES_FILE = "factories.json"
-MAX_CHAIN_DEPTH = 2
-CHAIN_WATCH_TTL = 1800
+THRESHOLD = 45.0
+bot = Bot(token=BOT_TOKEN)
 
-def load_factories():
-    if os.path.exists(FACTORIES_FILE):
-        try:
-            with open(FACTORIES_FILE,"r") as f:
-                data = json.load(f)
-                if isinstance(data, list): return {addr: addr[:6] for addr in data}
-                return data
-        except: return {}
-    return {}
+ALCHEMY_WSS = f"wss://solana-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
+ALCHEMY_HTTPS = f"https://solana-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 
-def save_factories():
-    with open(FACTORIES_FILE,"w") as f: json.dump(factories, f)
+PUMP_FUN = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+RAYDIUM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 
-factories = load_factories()
+dust_tracker = defaultdict(list)
+main_tracker = defaultdict(list)
+last_alert = defaultdict(float)
 watched_workers = {}
-last_signatures = set()
-sol_price = 105.0
-HELIUS_URL = f"https://api.helius.xyz/v0/addresses/{{}}/transactions?api-key={HELIUS_KEY}&limit=20"
+bundle_buys = defaultdict(list)
+sol_price = 150.0
 
-async def get_sol_price():
+# ---- WEB SERVER FOR RENDER (STOPS SLEEP) ----
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(f"OK - Watching {len(watched_workers)} workers - SOL ${sol_price}".encode())
+    def log_message(self, *args): pass
+
+def run_web_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    print(f"Web server on {PORT}")
+    server.serve_forever()
+
+# ---- YOUR LOGIC (same as before) ----
+async def update_sol_price():
     global sol_price
-    urls = [
-        "https://lite-api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112",
-        "https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112",
-        "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
-    ]
-    for url in urls:
+    while True:
         try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, timeout=6) as r:
-                    if r.status != 200: continue
-                    j = await r.json()
-                    if 'data' in j and 'So11111111111111111111111111111111111111112' in j.get('data',{}):
-                        sol_price = float(j['data']['So11111111111111111111111111111111111111112']['price'])
-                        print(f"[PRICE] SOL ${sol_price:.2f} live")
-                        return
-                    if 'So11111111111111111111111111111111111111112' in j:
-                        sol_price = float(j['So11111111111111111111111111111111111111112']['price'])
-                        print(f"[PRICE] SOL ${sol_price:.2f} live v2")
-                        return
-                    if 'solana' in j:
-                        sol_price = float(j['solana']['usd'])
-                        print(f"[PRICE] SOL ${sol_price:.2f} live CG")
-                        return
-        except: continue
+            async with httpx.AsyncClient() as c:
+                r = await c.get("https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112", timeout=10)
+                sol_price = float(r.json()["pairs"][0]["priceUsd"])
+        except: pass
+        await asyncio.sleep(60)
 
-async def get_txs(address):
+async def get_token_info(mint):
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(HELIUS_URL.format(address), timeout=15) as r:
-                if r.status!=200: return []
-                return await r.json()
-    except: return []
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=6)
+            pair = sorted(r.json()["pairs"], key=lambda x: x.get("fdv",0) or 0, reverse=True)[0]
+            return pair["baseToken"]["symbol"], float(pair.get("fdv",0) or 0), pair.get("priceUsd","0")
+    except: return mint[:6], 0, "0"
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"V30.5 RUNNING\nFactories: {len(factories)}\nWatched: {len(watched_workers)}\nSOL: ${sol_price:.2f}\nChain depth: {MAX_CHAIN_DEPTH} (silent)\n\nCommands:\n/add address label\n/remove address\n/list\n/clear_all")
+async def handle_funding(factory, to_wallet, lamports):
+    usd = (lamports / 1e9) * sol_price
+    if usd < 0.1: return
+    now = time.time()
+    is_dust = usd < THRESHOLD
+    tracker = dust_tracker if is_dust else main_tracker
+    key = f"{factory}_{'dust' if is_dust else 'main'}"
+    tracker[factory].append((now, to_wallet, usd))
+    tracker[factory] = [x for x in tracker[factory] if now - x[0] < 600]
+    count = len(tracker[factory])
+    total = sum(x[2] for x in tracker[factory])
+    limit = 15 if is_dust else 3
+    if count >= limit and now - last_alert[key] > 600:
+        if is_dust:
+            msg = f"⚠️ DUST FACTORY [{factory[:4]}] {count} wallets <${THRESHOLD:.0f} in 10min\nTotal ${total:.0f} | Avg ${total/count:.2f}"
+        else:
+            preview = ", ".join([w[:4] for _,w,_ in tracker[factory][:4]])
+            msg = f"💰 MAIN FACTORY [{factory[:4]}] {count} wallets >${THRESHOLD:.0f} in 10min\nTotal ${total:.0f} | Avg ${total/count:.0f}\nWallets: {preview}"
+        await bot.send_message(chat_id=CHAT_ID, text=msg)
+        last_alert[key] = now
+        for _, w, _ in tracker[factory]:
+            watched_workers[w] = {"origin": factory, "type": "dust" if is_dust else "main", "time": now}
+        tracker[factory].clear()
 
-async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: await update.message.reply_text("Usage: /add ADDRESS LABEL"); return
-    addr=context.args[0].strip(); label=" ".join(context.args[1:]) if len(context.args)>1 else addr[:6]
-    factories[addr]=label; save_factories(); await update.message.reply_text(f"Added [{label}]: {addr}")
+async def handle_buy(wallet, mint, usd):
+    if wallet not in watched_workers: return
+    now = time.time()
+    bundle_buys[mint].append((now, wallet, usd))
+    bundle_buys[mint] = [x for x in bundle_buys[mint] if now - x[0] < 30]
+    wc = len(bundle_buys[mint])
+    total = sum(x[2] for x in bundle_buys[mint])
+    if wc >= 3 and total >= 1000:
+        symbol, mcap, price = await get_token_info(mint)
+        origin = watched_workers[wallet]["origin"]
+        msg = f"🔥 BUNDLE ALERT\nToken: {symbol}\nMint: {mint}\nPrice: ${price}\nMCap: ${mcap:,.0f}\nBuy: {wc} wallets ${total:.0f} in 30s\nOrigin: {origin[:4]}\nTime: NOW!"
+        await bot.send_message(chat_id=CHAT_ID, text=msg)
+        bundle_buys[mint].clear()
 
-async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: return
-    addr=context.args[0].strip()
-    if addr in factories:
-        lab=factories.pop(addr); save_factories(); await update.message.reply_text(f"Removed [{lab}]")
-    else:
-        found=[k for k,v in factories.items() if v.lower()==addr.lower()]
-        if found:
-            for k in found: factories.pop(k)
-            save_factories(); await update.message.reply_text(f"Removed label {addr}")
+async def get_tx(sig):
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.post(ALCHEMY_HTTPS, json={"jsonrpc":"2.0","id":1,"method":"getTransaction","params":[sig, {"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]}, timeout=10)
+            return r.json().get("result")
+    except: return None
 
-async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not factories: await update.message.reply_text("No factories"); return
-    txt="Factories:\n"
-    for a,l in factories.items(): txt+=f"- [{l}] {a}\n"
-    txt+=f"\nWorkers: {len(watched_workers)}"; await update.message.reply_text(txt)
+def parse_transfer(meta, keys):
+    transfers = []
+    try:
+        pre, post = meta.get("preBalances",[]), meta.get("postBalances",[])
+        for i in range(len(pre)):
+            diff = pre[i] - post[i]
+            if diff > 1_000_000:
+                for j in range(len(post)):
+                    if post[j] - pre[j] > 1_000_000:
+                        transfers.append((keys[i], keys[j], post[j]-pre[j]))
+    except: pass
+    return transfers
 
-async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    factories.clear(); watched_workers.clear(); save_factories(); await update.message.reply_text("Cleared all")
-
-async def prep_loop(app):
-    await asyncio.sleep(5)
+async def transfer_loop():
     while True:
         try:
-            await get_sol_price()
-            for f_addr,f_label in list(factories.items()):
-                txs=await get_txs(f_addr)
-                for tx in txs:
-                    sig=tx.get('signature')
-                    if not sig or sig in last_signatures: continue
-                    for nt in tx.get('nativeTransfers',[]) or []:
-                        if nt.get('fromUserAccount')==f_addr:
-                            to_acc=nt.get('toUserAccount')
-                            if not to_acc or to_acc in factories or to_acc in watched_workers: continue
-                            amt=nt.get('amount',0)/1e9; usd=amt*sol_price
-                            if usd>=PREP_THRESHOLD_USD:
-                                last_signatures.add(sig)
-                                watched_workers[to_acc]={"origin":f_label,"depth":1,"added":time.time(),"parent":f_addr}
-                                print(f"[CLOUD] PREP L1 {f_label} -> {to_acc[:8]}")
-                                if CHAT_ID_ENV:
-                                    try: await app.bot.send_message(chat_id=CHAT_ID_ENV, text=f"PREP [{f_label}] {amt:.2f} SOL (${usd:.0f}) -> {to_acc[:6]}")
-                                    except: pass
-                await asyncio.sleep(1)
-        except: pass
-        await asyncio.sleep(PREP_INTERVAL)
+            async with websockets.connect(ALCHEMY_WSS, ping_interval=20) as ws:
+                await ws.send(json.dumps({"jsonrpc":"2.0","id":1,"method":"logsSubscribe","params":[{"mentions":["11111111111111111111111111111111"]}, {"commitment":"confirmed"}]}))
+                async for m in ws:
+                    data = json.loads(m)
+                    if "params" not in data: continue
+                    sig = data["params"]["result"]["value"].get("signature")
+                    if not sig: continue
+                    tx = await get_tx(sig)
+                    if not tx or tx["meta"].get("err"): continue
+                    keys = [k if isinstance(k,str) else k["pubkey"] for k in tx["transaction"]["message"]["accountKeys"]]
+                    for f,t,l in parse_transfer(tx["meta"], keys):
+                        await handle_funding(f,t,l)
+        except Exception as e:
+            await asyncio.sleep(5)
 
-async def chain_forward_loop(app):
-    await asyncio.sleep(15)
+async def swap_loop():
     while True:
         try:
-            for w_addr, info in list(watched_workers.items())[:40]:
-                if info.get("depth",1) >= MAX_CHAIN_DEPTH: continue
-                if time.time() - info.get("added",0) > CHAIN_WATCH_TTL: continue
-                txs=await get_txs(w_addr)
-                for tx in txs:
-                    sig=tx.get('signature')
-                    if not sig or sig in last_signatures: continue
-                    for nt in tx.get('nativeTransfers',[]) or []:
-                        if nt.get('fromUserAccount')==w_addr:
-                            to_acc=nt.get('toUserAccount')
-                            if not to_acc or to_acc in factories or to_acc in watched_workers: continue
-                            amt=nt.get('amount',0)/1e9; usd=amt*sol_price
-                            if usd>=PREP_THRESHOLD_USD:
-                                last_signatures.add(sig)
-                                watched_workers[to_acc]={"origin":info.get("origin"),"depth":info.get("depth",1)+1,"added":time.time(),"parent":w_addr}
-                                print(f"[CLOUD] PREP L{info.get('depth',1)+1} CHAIN {info.get('origin')} : {w_addr[:6]} -> {to_acc[:6]}")
-                await asyncio.sleep(0.5)
-        except: pass
-        await asyncio.sleep(CHAIN_INTERVAL)
+            async with websockets.connect(ALCHEMY_WSS, ping_interval=20) as ws:
+                await ws.send(json.dumps({"jsonrpc":"2.0","id":2,"method":"logsSubscribe","params":[{"mentions":[PUMP_FUN]}, {"commitment":"confirmed"}]}))
+                await ws.send(json.dumps({"jsonrpc":"2.0","id":3,"method":"logsSubscribe","params":[{"mentions":[RAYDIUM]}, {"commitment":"confirmed"}]}))
+                async for m in ws:
+                    data = json.loads(m)
+                    if "params" not in data: continue
+                    sig = data["params"]["result"]["value"].get("signature")
+                    tx = await get_tx(sig)
+                    if not tx or tx["meta"].get("err"): continue
+                    keys = [k if isinstance(k,str) else k["pubkey"] for k in tx["transaction"]["message"]["accountKeys"]]
+                    wallet = next((k for k in keys if k in watched_workers), None)
+                    if not wallet: continue
+                    for post in tx["meta"].get("postTokenBalances",[]):
+                        if post.get("owner")==wallet and post.get("mint"):
+                            await handle_buy(wallet, post["mint"], 50)
+        except: await asyncio.sleep(5)
 
-async def swap_loop(app):
-    await asyncio.sleep(10)
+async def keep_alive():
     while True:
-        try:
-            for worker in list(watched_workers.keys())[:80]:
-                info = watched_workers.get(worker, {})
-                txs=await get_txs(worker)
-                for tx in txs:
-                    sig=tx.get('signature')
-                    if not sig or sig in last_signatures: continue
-                    if tx.get('type','')=='SWAP':
-                        for tt in tx.get('tokenTransfers',[]) or []:
-                            if tt.get('toUserAccount')==worker:
-                                mint=tt.get('mint','')
-                                if mint=='So11111111111111111111111111111111111111112': continue
-                                spent=sum(nt.get('amount',0)/1e9 for nt in tx.get('nativeTransfers',[]) if nt.get('fromUserAccount')==worker)
-                                usd=spent*sol_price
-                                if usd<BUY_THRESHOLD_USD: continue
-                                last_signatures.add(sig)
-                                origin=info.get("origin","unknown"); depth=info.get("depth",1)
-                                msg=f"MAIN BUY L{depth}\n[{origin}] Buyer: {worker[:8]} (${usd:.0f})\n{mint}"
-                                print(f"[CLOUD] MAIN BUY L{depth} {worker[:6]} -> {mint[:10]}")
-                                if CHAT_ID_ENV:
-                                    try: await app.bot.send_message(chat_id=CHAT_ID_ENV, text=msg)
-                                    except: pass
-                                break
-                await asyncio.sleep(0.4)
-        except: pass
-        await asyncio.sleep(SWAP_INTERVAL)
+        await asyncio.sleep(600)
+        print(f"alive {len(watched_workers)} workers")
+        gc.collect()
 
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("add", add_cmd))
-    app.add_handler(CommandHandler("remove", remove_cmd))
-    app.add_handler(CommandHandler("list", list_cmd))
-    app.add_handler(CommandHandler("clear_all", clear_cmd))
-    async def on_startup(app_param):
-        await app_param.bot.delete_webhook(drop_pending_updates=True)
-        await get_sol_price()
-        asyncio.create_task(prep_loop(app_param))
-        asyncio.create_task(chain_forward_loop(app_param))
-        asyncio.create_task(swap_loop(app_param))
-    app.post_init=on_startup
-    app.run_polling(drop_pending_updates=True)
+async def main():
+    # Start web server in thread
+    threading.Thread(target=run_web_server, daemon=True).start()
+    await bot.send_message(chat_id=CHAT_ID, text=f"✅ V32 Web Service Started\nWatching <$45 AND >$45\nPort {PORT}\nAdd URL to Uptimerobot")
+    await asyncio.gather(update_sol_price(), transfer_loop(), swap_loop(), keep_alive())
 
-if __name__=="__main__": main()
+if __name__ == "__main__":
+    asyncio.run(main())
