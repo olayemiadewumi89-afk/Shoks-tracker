@@ -1,13 +1,10 @@
 """
-V33 SMART BUNDLE HUNTER - 4 logics for smart devs
-Logic1: Recursive depth 3 (not endless)
-Logic2: Fresh wallet detector (0 history)
-Logic3: Same-slot Jito bundle
-Logic4: Mixed amount cluster (5 wallets/5min any amount)
-Render Free + TG Commands FIXED
+V33.1 SMART BUNDLE HUNTER - FIXED LIVE SOL PRICE
+3 sources: Jupiter -> Dexscreener -> CoinGecko
+Auto-updates every 30s
 """
 import os, asyncio, time, gc, json, threading
-from collections import defaultdict, deque
+from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import websockets, httpx
 from dotenv import load_dotenv
@@ -22,41 +19,40 @@ ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY")
 PORT = int(os.getenv("PORT", 10000))
 
 THRESHOLD = 45.0
-MAX_DEPTH = 3 # Recursive cap - not endless
+MAX_DEPTH = 3
 
 ALCHEMY_WSS = f"wss://solana-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 ALCHEMY_HTTPS = f"https://solana-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 PUMP_FUN = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 RAYDIUM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 
-# Trackers
 dust_tracker = defaultdict(list)
 main_tracker = defaultdict(list)
-mixed_tracker = defaultdict(list) # Logic4 - any amount
+mixed_tracker = defaultdict(list)
 last_alert = defaultdict(float)
-watched_workers = {} # wallet -> {origin, level, time, fresh}
-factories = {} # address -> {label, level}
-bundle_buys = defaultdict(list) # mint -> [(time, wallet, slot)]
-slot_tracker = defaultdict(list) # slot -> [(mint, wallet)]
-sol_price = 150.0
+watched_workers = {}
+factories = {}
+bundle_buys = defaultdict(list)
+slot_tracker = defaultdict(list)
+sol_price = 0.0 # FIXED: start at 0 so you know if fetch fails
 recent_bundles = []
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(f"OK V33 Factories:{len(factories)} Workers:{len(watched_workers)} SOL:${sol_price}".encode())
+        self.wfile.write(f"OK V33.1 Factories:{len(factories)} Workers:{len(watched_workers)} SOL:${sol_price:.2f}".encode())
     def log_message(self, *args): pass
 
 def run_web_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
     server.serve_forever()
 
-# ---- TG COMMANDS ----
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    price_txt = f"${sol_price:.2f}" if sol_price > 0 else "FETCHING..."
     await update.message.reply_text(
-        f"✅ V33 SMART HUNTER RUNNING\n"
-        f"Factories: {len(factories)} Workers: {len(watched_workers)} SOL:${sol_price:.1f}\n"
+        f"✅ V33.1 SMART HUNTER RUNNING\n"
+        f"Factories: {len(factories)} Workers: {len(watched_workers)} SOL:{price_txt}\n"
         f"Logic1: Recursive depth {MAX_DEPTH}\n"
         f"Logic2: Fresh wallet (0 history)\n"
         f"Logic3: Same-slot Jito\n"
@@ -67,8 +63,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fresh = sum(1 for w in watched_workers.values() if w.get('fresh'))
+    price_txt = f"${sol_price:.2f}" if sol_price > 0 else "FETCHING..."
     await update.message.reply_text(
-        f"V33 STATUS\n"
+        f"V33.1 STATUS\n"
+        f"SOL Live: {price_txt}\n"
         f"Factories: {len(factories)} (levels 0-{MAX_DEPTH})\n"
         f"Workers: {len(watched_workers)} Fresh:{fresh}\n"
         f"Dust pending: {sum(len(v) for v in dust_tracker.values())}/15\n"
@@ -94,7 +92,7 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_clear_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     factories.clear(); watched_workers.clear()
     dust_tracker.clear(); main_tracker.clear(); mixed_tracker.clear(); bundle_buys.clear()
-    await update.message.reply_text("✅ V33 Cleared all")
+    await update.message.reply_text("✅ V33.1 Cleared all")
 
 async def cmd_label(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(ctx.args) < 2: return
@@ -102,16 +100,50 @@ async def cmd_label(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         factories[ctx.args[0]]["label"] = ctx.args[1]
     await update.message.reply_text(f"✅ Labeled {ctx.args[0][:4]} as {ctx.args[1]}")
 
-# ---- CORE LOGIC ----
+# ---- FIXED LIVE SOL PRICE ----
 async def update_sol_price():
     global sol_price
     while True:
+        price = None
+        # Try 1: Jupiter (most reliable)
         try:
             async with httpx.AsyncClient() as c:
-                r = await c.get("https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112", timeout=10)
-                sol_price = float(r.json()["pairs"][0]["priceUsd"])
-        except: pass
-        await asyncio.sleep(60)
+                r = await c.get("https://price.jup.ag/v6/price?ids=So11111111111111111111111111111111111111112", timeout=8)
+                data = r.json()
+                price = float(data["data"]["So11111111111111111111111111111111111111112"]["price"])
+                print(f"SOL Jupiter: {price}")
+        except Exception as e:
+            print(f"Jupiter fail {e}")
+
+        # Try 2: Dexscreener fixed parsing
+        if not price:
+            try:
+                async with httpx.AsyncClient() as c:
+                    r = await c.get("https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112", timeout=8)
+                    data = r.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        sol_pair = sorted(pairs, key=lambda x: float(x.get("liquidity", {}).get("usd", 0) or 0), reverse=True)[0]
+                        price = float(sol_pair["priceUsd"])
+                        print(f"SOL Dex: {price}")
+            except Exception as e:
+                print(f"Dex fail {e}")
+
+        # Try 3: CoinGecko
+        if not price:
+            try:
+                async with httpx.AsyncClient() as c:
+                    r = await c.get("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", timeout=8)
+                    price = float(r.json()["solana"]["usd"])
+                    print(f"SOL CG: {price}")
+            except Exception as e:
+                print(f"CG fail {e}")
+
+        if price and 10 < price < 1000:
+            sol_price = price
+            print(f"✅ SOL LIVE UPDATED: ${sol_price:.2f}")
+
+        await asyncio.sleep(30)
 
 async def get_token_info(mint):
     try:
@@ -122,33 +154,27 @@ async def get_token_info(mint):
     except: return mint[:6], 0, "0"
 
 async def is_fresh_wallet(wallet):
-    # Logic2: check if wallet has <3 prior txs (fresh)
     try:
         async with httpx.AsyncClient() as c:
             r = await c.post(ALCHEMY_HTTPS, json={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress","params":[wallet, {"limit": 5}]}, timeout=8)
             sigs = r.json().get("result", [])
-            return len(sigs) <= 3 # fresh if <=3 txs
-    except:
-        return False
+            return len(sigs) <= 3
+    except: return False
 
 async def handle_funding(factory, to_wallet, lamports, app):
-    usd = (lamports / 1e9) * sol_price
+    usd = (lamports / 1e9) * sol_price if sol_price > 0 else (lamports / 1e9) * 200
     if usd < 0.05: return
     now = time.time()
-
-    # Get factory level
     f_info = factories.get(factory, {"level": 0, "label": factory[:4]})
     f_level = f_info.get("level", 0) if isinstance(f_info, dict) else 0
 
-    # Logic4: Mixed tracker - ANY amount 5 wallets in 5 min
     mixed_tracker[factory].append((now, to_wallet, usd))
     mixed_tracker[factory] = [x for x in mixed_tracker[factory] if now - x[0] < 300]
     if len(mixed_tracker[factory]) >= 5 and now - last_alert.get(f"mix_{factory}", 0) > 300:
         total = sum(x[2] for x in mixed_tracker[factory])
-        msg = f"🧩 MIXED CLUSTER L{f_level} [{factory[:4]}] {len(mixed_tracker[factory])} wallets in 5min\nTotal ${total:.0f} Any amount\nWallets: {', '.join([w[:4] for _,w,_ in mixed_tracker[factory][:5]])}"
+        msg = f"🧩 MIXED CLUSTER L{f_level} [{factory[:4]}] {len(mixed_tracker[factory])} wallets in 5min\nTotal ${total:.0f} Any amount"
         await app.bot.send_message(chat_id=CHAT_ID, text=msg)
         last_alert[f"mix_{factory}"] = now
-        # Arm workers
         for _, w, _ in mixed_tracker[factory]:
             if w not in watched_workers and f_level < MAX_DEPTH:
                 fresh = await is_fresh_wallet(w)
@@ -157,7 +183,6 @@ async def handle_funding(factory, to_wallet, lamports, app):
                     factories[w] = {"label": f"sub_{factory[:4]}_L{f_level+1}", "level": f_level+1}
         mixed_tracker[factory].clear()
 
-    # Original Logic1: Dust/Main split
     is_dust = usd < THRESHOLD
     tracker = dust_tracker if is_dust else main_tracker
     key = f"{factory}_{'dust' if is_dust else 'main'}"
@@ -168,26 +193,22 @@ async def handle_funding(factory, to_wallet, lamports, app):
     limit = 15 if is_dust else 3
 
     if count >= limit and now - last_alert.get(key, 0) > 600:
-        # Logic1 + Logic2 combined
         fresh_wallets = []
         for _, w, _ in tracker[factory]:
             if w not in watched_workers:
                 fresh = await is_fresh_wallet(w) if count >= 3 else False
                 watched_workers[w] = {"origin": factory, "level": f_level+1, "time": now, "fresh": fresh}
                 if fresh: fresh_wallets.append(w[:4])
-                # Recursive: auto-add as factory if under max depth
                 if f_level+1 < MAX_DEPTH:
                     factories[w] = {"label": f"auto_L{f_level+1}_{factory[:4]}", "level": f_level+1}
 
         if is_dust:
-            msg = f"⚠️ DUST L{f_level} [{factory[:4]}] {count} wallets <${THRESHOLD:.0f} 10min\nTotal ${total:.0f}\nFresh: {len(fresh_wallets)}/{count} {','.join(fresh_wallets[:3])}\nRecursive to L{f_level+1}"
+            msg = f"⚠️ DUST L{f_level} [{factory[:4]}] {count} wallets <${THRESHOLD:.0f} 10min\nTotal ${total:.0f}\nFresh: {len(fresh_wallets)}/{count}"
         else:
             preview = ", ".join([w[:4] for _,w,_ in tracker[factory][:4]])
-            msg = f"💰 MAIN L{f_level} [{factory[:4]}] {count} wallets >${THRESHOLD:.0f} 10min\nTotal ${total:.0f} Wallets: {preview}\nFresh: {len(fresh_wallets)}\nAuto-armed to L{f_level+1}"
-
+            msg = f"💰 MAIN L{f_level} [{factory[:4]}] {count} wallets >${THRESHOLD:.0f} 10min\nTotal ${total:.0f} Wallets: {preview}\nFresh: {len(fresh_wallets)}"
         if fresh_wallets:
-            msg += f"\n🔥 FRESH DETECTED {len(fresh_wallets)} fresh wallets!"
-
+            msg += f"\n🔥 FRESH {len(fresh_wallets)}!"
         await app.bot.send_message(chat_id=CHAT_ID, text=msg)
         last_alert[key] = now
         tracker[factory].clear()
@@ -196,33 +217,24 @@ async def handle_buy(wallet, mint, usd, slot, app):
     if wallet not in watched_workers: return
     now = time.time()
     w_info = watched_workers[wallet]
-
-    # Logic3: Same-slot tracker
     slot_tracker[slot].append((mint, wallet, now))
-    # Clean old slots (>60 sec)
     for s in list(slot_tracker.keys()):
-        if now - slot_tracker[s][0][2] > 60:
+        if slot_tracker[s] and now - slot_tracker[s][0][2] > 60:
             del slot_tracker[s]
-
-    # Count same mint in same slot
     same_slot_wallets = [w for m,w,t in slot_tracker.get(slot, []) if m == mint]
-
     bundle_buys[mint].append((now, wallet, slot))
     bundle_buys[mint] = [x for x in bundle_buys[mint] if now - x[0] < 30]
     wc = len(bundle_buys[mint])
-    total = sum([50 for _ in bundle_buys[mint]]) # estimate
 
-    if wc >= 3 or len(same_slot_wallets) >= 2: # 3 in 30s OR 2 in same slot
+    if wc >= 3 or len(same_slot_wallets) >= 2:
         symbol, mcap, price = await get_token_info(mint)
         origin = w_info["origin"]
         level = w_info["level"]
         fresh_tag = "🔥 FRESH" if w_info.get("fresh") else ""
-
         if len(same_slot_wallets) >= 2:
-            msg = f"⚡ JITO BUNDLE L{level} {fresh_tag}\nToken: {symbol}\nMint: {mint}\nMCap: ${mcap:,.0f}\nSlot: {slot}\nWallets: {len(same_slot_wallets)} SAME SLOT!\n{', '.join([w[:4] for w in same_slot_wallets[:4]])}\nOrigin: {origin[:4]}\n{fresh_tag}"
+            msg = f"⚡ JITO BUNDLE L{level} {fresh_tag}\nToken: {symbol}\nMint: {mint}\nMCap: ${mcap:,.0f}\nSlot: {slot}\nWallets: {len(same_slot_wallets)} SAME SLOT!\nOrigin: {origin[:4]}"
         else:
-            msg = f"🔥 BUNDLE L{level} {fresh_tag}\nToken: {symbol}\nMint: {mint}\nPrice: ${price}\nMCap: ${mcap:,.0f}\nBuy: {wc} wallets 30s\nOrigin: {origin[:4]}\nLevel: {level}"
-
+            msg = f"🔥 BUNDLE L{level} {fresh_tag}\nToken: {symbol}\nMint: {mint}\nMCap: ${mcap:,.0f}\nBuy: {wc} wallets 30s\nOrigin: {origin[:4]}"
         recent_bundles.append({"symbol": symbol, "mcap": mcap, "mint": mint, "slot": slot})
         await app.bot.send_message(chat_id=CHAT_ID, text=msg)
         bundle_buys[mint].clear()
@@ -240,7 +252,7 @@ def parse_transfer(meta, keys):
         pre, post = meta.get("preBalances",[]), meta.get("postBalances",[])
         for i in range(len(pre)):
             diff = pre[i] - post[i]
-            if diff > 50_000: # 0.00005 SOL
+            if diff > 50_000:
                 for j in range(len(post)):
                     if post[j] - pre[j] > 50_000:
                         transfers.append((keys[i], keys[j], post[j]-pre[j]))
@@ -292,12 +304,11 @@ async def swap_loop(app):
 async def keep_alive():
     while True:
         await asyncio.sleep(600)
-        # Cleanup old workers >2h to prevent RAM growth but keep depth
         now = time.time()
         for w in list(watched_workers.keys()):
             if now - watched_workers[w]["time"] > 7200:
                 del watched_workers[w]
-        print(f"V33 alive {len(watched_workers)} workers {len(factories)} factories")
+        print(f"V33.1 alive {len(watched_workers)} workers {len(factories)} factories SOL ${sol_price}")
         gc.collect()
 
 async def main():
@@ -313,8 +324,9 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    print("V33 commands started")
-    await app.bot.send_message(chat_id=CHAT_ID, text=f"✅ V33 SMART HUNTER STARTED\n4 Logics | Depth {MAX_DEPTH}\n/bundle addr to add L0 factory\nAuto-recursive to L{MAX_DEPTH} | Fresh detect | Jito slot | Mixed cluster\nPort {PORT}")
+    print("V33.1 commands started")
+    price_init = f"${sol_price:.2f}" if sol_price>0 else "fetching..."
+    await app.bot.send_message(chat_id=CHAT_ID, text=f"✅ V33.1 FIXED LIVE SOL\nSOL: {price_init} live 30s\n4 Logics Depth {MAX_DEPTH}\n/bundle addr to add\nPort {PORT}")
     await asyncio.gather(update_sol_price(), transfer_loop(app), swap_loop(app), keep_alive())
 
 if __name__ == "__main__":
