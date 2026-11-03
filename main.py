@@ -32,6 +32,7 @@ FILTERS = {
     "take_profit_x": 2.0,
     "emergency_rug_pct": 50,
     "fake_vol_ratio": 1.2,
+    "rug_score_max": 5000,
 }
 
 open_positions = {}
@@ -85,8 +86,32 @@ def set_telegram_commands():
 def health(): 
     return {"status":"alive" if bot_running else "paused","open":len(open_positions),"watchlist":len(watchlist),"trades":trades_today,"pnl":pnl_today_sol,"wins":total_wins,"losses":total_losses},200
 @app.route("/")
-def home(): return "Shok STRICT REAL BOT v2 - 2X + RUG FIX",200
+def home(): return "Shok STRICT REAL BOT v3 - RUGCHECK + 2X FIX",200
 def run_flask(): app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)), debug=False)
+
+def get_rug_data(mint):
+    try:
+        r = requests.get(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report", timeout=6)
+        if r.status_code != 200: return None
+        j = r.json()
+        score = j.get("score", 0)
+        holders = j.get("totalHolders", 0)
+        top10 = 0
+        for h in j.get("topHolders", [])[:10]:
+            top10 += h.get("pct", 0)
+        bundle_pct = 0
+        insiders_pct = 0
+        risks = j.get("risks", [])
+        for rk in risks:
+            rn = rk.get("name","").lower()
+            if "bundle" in rn: bundle_pct = 20
+            if "insider" in rn: insiders_pct = 20
+            if "single holder" in rn: top10 = max(top10, 90)
+        is_rugged = score > FILTERS["rug_score_max"] or any("rugged" in rk.get("name","").lower() for rk in risks)
+        return {"score":score,"holders":holders,"top10_pct":top10,"bundle_pct":bundle_pct,"insiders_pct":insiders_pct,"is_rugged":is_rugged,"risks":[rk.get("name") for rk in risks[:2]]}
+    except Exception as e:
+        log(f"RugCheck fail {mint[:8]} {e}")
+        return None
 
 def fetch_token_data(mint):
     try:
@@ -125,14 +150,31 @@ def fetch_new_tokens():
                     if real["volume_5m"] > real["mcap"] * FILTERS["fake_vol_ratio"]:
                         log(f"SKIP FAKE VOL {real['symbol']} MC {real['mcap']/1000:.0f}K VOL {real['volume_5m']:.0f}")
                         continue
+                    # REAL RUG CHECK
+                    rug = get_rug_data(mint)
+                    if rug:
+                        if rug["is_rugged"]:
+                            log(f"RUG BLOCK {real['symbol']} score {rug['score']} {rug['risks']}")
+                            blacklist[mint]=time.time()+7200
+                            continue
+                        if rug["holders"] and rug["holders"] < FILTERS["holders_min"]:
+                            log(f"BLOCK holders {real['symbol']} {rug['holders']}")
+                            continue
+                        if rug["top10_pct"] > FILTERS["top10_max_pct"]:
+                            log(f"BLOCK top10 {real['symbol']} {rug['top10_pct']:.0f}%")
+                            continue
                     tokens.append({
                         "mint": mint,
                         "symbol": str(real.get("symbol") or c.get("symbol","?"))[:12],
                         "mcap": real["mcap"],
                         "liquidity": real["liquidity"],
                         "volume_5m": real["volume_5m"],
-                        "holders": 85, "bundle_pct": 0, "insiders_pct": 0, "top10_pct": 20,
-                        "buyers_5m": 12, "sellers_5m": 8, "lp_burnt_pct": 100, "lp_locked": True
+                        "holders": rug["holders"] if rug and rug["holders"] else 85,
+                        "bundle_pct": rug["bundle_pct"] if rug else 0,
+                        "insiders_pct": rug["insiders_pct"] if rug else 0,
+                        "top10_pct": rug["top10_pct"] if rug else 20,
+                        "buyers_5m": 12, "sellers_5m": 8, "lp_burnt_pct": 100, "lp_locked": True,
+                        "rug_score": rug["score"] if rug else 0
                     })
                 except: continue
             if tokens:
@@ -152,14 +194,20 @@ def fetch_new_tokens():
                     if not (FILTERS["mcap_min"] <= real["mcap"] <= FILTERS["mcap_max"]): continue
                     if not (FILTERS["liquidity_min"] <= real["liquidity"] <= FILTERS["liquidity_max"]): continue
                     if real["volume_5m"] > real["mcap"] * FILTERS["fake_vol_ratio"]: continue
+                    rug = get_rug_data(mint)
+                    if rug and rug["is_rugged"]: continue
                     tokens.append({
                         "mint": mint,
                         "symbol": str(c.get("symbol","?") or real["symbol"])[:12],
                         "mcap": real["mcap"],
                         "liquidity": real["liquidity"],
                         "volume_5m": real["volume_5m"],
-                        "holders": 85, "bundle_pct": 0, "insiders_pct": 0, "top10_pct": 20,
-                        "buyers_5m": 12, "sellers_5m": 8, "lp_burnt_pct": 100, "lp_locked": True
+                        "holders": rug["holders"] if rug and rug["holders"] else 85,
+                        "bundle_pct": rug["bundle_pct"] if rug else 0,
+                        "insiders_pct": rug["insiders_pct"] if rug else 0,
+                        "top10_pct": rug["top10_pct"] if rug else 20,
+                        "buyers_5m": 12, "sellers_5m": 8, "lp_burnt_pct": 100, "lp_locked": True,
+                        "rug_score": rug["score"] if rug else 0
                     })
                 except: continue
             if tokens:
@@ -171,14 +219,15 @@ def fetch_new_tokens():
 def passes_filters(t):
     if not (FILTERS["liquidity_min"] <= t["liquidity"] <= FILTERS["liquidity_max"]): return False, f"Liq {t['liquidity']:.0f}", False
     if not (FILTERS["mcap_min"] <= t["mcap"] <= FILTERS["mcap_max"]): return False, f"Mcap {t['mcap']:.0f}", False
-    if t["bundle_pct"] > FILTERS["bundle_max_pct"]: return False, f"Bundle", False
-    if t["insiders_pct"] > FILTERS["insiders_max_pct"]: return False, f"Insiders", False
+    if t["bundle_pct"] > FILTERS["bundle_max_pct"]: return False, f"Bundle {t['bundle_pct']}%", False
+    if t["insiders_pct"] > FILTERS["insiders_max_pct"]: return False, f"Insiders {t['insiders_pct']}%", False
     if t["holders"] < FILTERS["holders_min"]: return False, f"Holders {t['holders']}", False
-    if t["top10_pct"] > FILTERS["top10_max_pct"]: return False, f"Top10 {t['top10_pct']}%", False
+    if t["top10_pct"] > FILTERS["top10_max_pct"]: return False, f"Top10 {t['top10_pct']:.0f}%", False
     if t["volume_5m"] < FILTERS["volume_5m_min"]: return False, f"Vol5m {t['volume_5m']:.0f}", True
     if t["buyers_5m"] < t["sellers_5m"] * FILTERS["buyers_vs_sellers"]: return False, f"B/S", False
     if not (t["lp_locked"] or t["lp_burnt_pct"] >= FILTERS["lp_burnt_min_pct"]): return False, "LP", False
     if t["volume_5m"] > t["mcap"] * FILTERS["fake_vol_ratio"]: return False, f"FakeVol {t['volume_5m']/1000:.0f}K>{t['mcap']/1000:.0f}K", False
+    if t.get("rug_score",0) > FILTERS["rug_score_max"]: return False, f"RugScore {t['rug_score']}", False
     return True, "PASS", False
 
 def get_keypair():
@@ -250,7 +299,6 @@ def buy_token(mint):
             except: pass
             tx_bytes = base64.b64decode(b64)
             vtx = VersionedTransaction.from_bytes(tx_bytes)
-
         signed_vtx=VersionedTransaction(vtx.message,[kp])
         sig=send_tx_via_rpc(base64.b64encode(bytes(signed_vtx)).decode())
         if sig:
@@ -308,26 +356,36 @@ def check_positions():
         data=fetch_token_data(mint)
         if not data: continue
         curr=data["mcap"]; entry=pos["entry_mcap"]
+        pct = (curr/entry -1)*100 if entry else 0
+        log(f"CHECK {pos['symbol']} {entry/1000:.0f}K -> {curr/1000:.0f}K ({pct:+.0f}%)")
         if curr >= entry * FILTERS["take_profit_x"]:
-            sell_token(mint, slippage=30, tries=2)
-            pnl_today_sol+=BUY_AMOUNT_SOL; total_wins+=1
-            trade_history.append({"symbol":pos['symbol'],"entry":entry,"exit":curr,"pnl":BUY_AMOUNT_SOL,"result":"WIN","time":datetime.now().strftime("%H:%M")})
-            send_telegram(f"✅ 2X WIN {pos['symbol']}\n{entry/1000:.0f}K -> {curr/1000:.0f}K\n+{BUY_AMOUNT_SOL} SOL")
-            to_remove.append(mint)
+            log(f"2X HIT {pos['symbol']} TRY SELL")
+            sig = sell_token(mint, slippage=30, tries=3)
+            if sig:
+                pnl_today_sol+=BUY_AMOUNT_SOL; total_wins+=1
+                trade_history.append({"symbol":pos['symbol'],"entry":entry,"exit":curr,"pnl":BUY_AMOUNT_SOL,"result":"WIN","time":datetime.now().strftime("%H:%M")})
+                send_telegram(f"✅ 2X WIN {pos['symbol']}\n{entry/1000:.0f}K -> {curr/1000:.0f}K (+{pct:.0f}%)\n+{BUY_AMOUNT_SOL} SOL\nhttps://solscan.io/tx/{sig}")
+                to_remove.append(mint)
+            else:
+                send_telegram(f"⚠️ 2X HIT but SELL FAILED {pos['symbol']} - retrying in 2s")
         elif curr <= entry * (1 - FILTERS["emergency_rug_pct"]/100):
-            sell_token(mint, slippage=50, tries=3)
-            loss=BUY_AMOUNT_SOL*0.5; pnl_today_sol-=loss; total_losses+=1
-            blacklist[mint]=time.time()+7200
-            trade_history.append({"symbol":pos['symbol'],"entry":entry,"exit":curr,"pnl":-loss,"result":"RUG","time":datetime.now().strftime("%H:%M")})
-            send_telegram(f"🚨 RUG SELL {pos['symbol']}\n{entry/1000:.0f}K -> {curr/1000:.0f}K\n-{loss:.3f} SOL (saved from 2K)")
-            to_remove.append(mint)
+            log(f"RUG HIT {pos['symbol']}")
+            sig = sell_token(mint, slippage=50, tries=4)
+            if sig:
+                loss=BUY_AMOUNT_SOL*0.5; pnl_today_sol-=loss; total_losses+=1
+                blacklist[mint]=time.time()+7200
+                trade_history.append({"symbol":pos['symbol'],"entry":entry,"exit":curr,"pnl":-loss,"result":"RUG","time":datetime.now().strftime("%H:%M")})
+                send_telegram(f"🚨 RUG SELL {pos['symbol']}\n{entry/1000:.0f}K -> {curr/1000:.0f}K\n-{loss:.3f} SOL\nhttps://solscan.io/tx/{sig}")
+                to_remove.append(mint)
         elif curr <= entry * (1 - FILTERS["stop_loss_pct"]/100):
-            sell_token(mint, slippage=40, tries=3)
-            loss=BUY_AMOUNT_SOL*0.35; pnl_today_sol-=loss; total_losses+=1
-            blacklist[mint]=time.time()+7200
-            trade_history.append({"symbol":pos['symbol'],"entry":entry,"exit":curr,"pnl":-loss,"result":"LOSS","time":datetime.now().strftime("%H:%M")})
-            send_telegram(f"❌ SL {pos['symbol']}\n{entry/1000:.0f}K -> {curr/1000:.0f}K\n-{loss:.3f} SOL")
-            to_remove.append(mint)
+            log(f"SL HIT {pos['symbol']}")
+            sig = sell_token(mint, slippage=40, tries=3)
+            if sig:
+                loss=BUY_AMOUNT_SOL*0.35; pnl_today_sol-=loss; total_losses+=1
+                blacklist[mint]=time.time()+7200
+                trade_history.append({"symbol":pos['symbol'],"entry":entry,"exit":curr,"pnl":-loss,"result":"LOSS","time":datetime.now().strftime("%H:%M")})
+                send_telegram(f"❌ SL {pos['symbol']}\n{entry/1000:.0f}K -> {curr/1000:.0f}K\n-{loss:.3f} SOL\nhttps://solscan.io/tx/{sig}")
+                to_remove.append(mint)
     for m in to_remove: open_positions.pop(m,None)
 
 def positions_monitor_loop():
@@ -414,8 +472,8 @@ def handle_telegram_commands():
 def main_loop():
     global trades_today,pnl_today_sol,last_reset_date
     set_telegram_commands()
-    log(f"🚀 REAL BUY BOT v2.1 - 2X TP + RUG FIX - MC {FILTERS['mcap_min']/1000:.0f}K-{FILTERS['mcap_max']/1000:.0f}K VOL {FILTERS['volume_5m_min']/1000:.0f}K")
-    send_telegram(f"🚀 REAL BUY BOT v2.1 LIVE\nMC {FILTERS['mcap_min']/1000:.0f}K-{FILTERS['mcap_max']/1000:.0f}K LIQ {FILTERS['liquidity_min']/1000:.0f}K-{FILTERS['liquidity_max']/1000:.0f}K VOL {FILTERS['volume_5m_min']/1000:.0f}K\n✅ 2X TP kept\n✅ Rug filter: VOL>MC blocked\n✅ Fast monitor 2s\n\n<b>Commands:</b> /pnl /positions /watchlist /stats /balance")
+    log(f"🚀 REAL BUY BOT v3 - RUGCHECK + 2X FIX")
+    send_telegram(f"🚀 BOT v3 LIVE\nMC {FILTERS['mcap_min']/1000:.0f}K-{FILTERS['mcap_max']/1000:.0f}K VOL {FILTERS['volume_5m_min']/1000:.0f}K\n✅ Real RugCheck\n✅ 2X sell only if confirmed\n✅ FakeVol blocked")
     while True:
         try:
             if not bot_running: time.sleep(5); continue
@@ -432,14 +490,19 @@ def main_loop():
                 if now - watchlist[mint]["first_seen"] > 1800: del watchlist[mint]; continue
                 data=fetch_token_data(mint)
                 if not data: continue
+                rug = get_rug_data(mint)
                 t={
                     "mint": mint,
                     "symbol": watchlist[mint]["symbol"],
                     "mcap": data["mcap"],
                     "liquidity": data["liquidity"],
                     "volume_5m": data["volume_5m"],
-                    "holders": 85, "bundle_pct": 0, "insiders_pct": 0, "top10_pct": 20,
-                    "buyers_5m": 12, "sellers_5m": 8, "lp_burnt_pct": 100, "lp_locked": True
+                    "holders": rug["holders"] if rug and rug["holders"] else 85,
+                    "bundle_pct": rug["bundle_pct"] if rug else 0,
+                    "insiders_pct": rug["insiders_pct"] if rug else 0,
+                    "top10_pct": rug["top10_pct"] if rug else 20,
+                    "buyers_5m": 12, "sellers_5m": 8, "lp_burnt_pct": 100, "lp_locked": True,
+                    "rug_score": rug["score"] if rug else 0
                 }
                 ok,reason,is_vol_fail = passes_filters(t)
                 if ok:
@@ -462,12 +525,12 @@ def main_loop():
                             watchlist[t["mint"]]={"symbol":t["symbol"],"first_seen":time.time()}
                             log(f" -> WATCHLIST {t['symbol']} waiting VOL 10K (now {t['volume_5m']:.0f})")
                         continue
-                    log(f"PASS {t['symbol']} MC {t['mcap']/1000:.0f}K LIQ ${t['liquidity']/1000:.0f}K VOL {t['volume_5m']:.0f} -> BUYING")
+                    log(f"PASS {t['symbol']} MC {t['mcap']/1000:.0f}K LIQ ${t['liquidity']/1000:.0f}K VOL {t['volume_5m']:.0f} RUG {t.get('rug_score',0)} -> BUYING")
                     tx=buy_token(t["mint"])
                     if tx and len(tx) > 20:
                         open_positions[t["mint"]]={"entry_mcap":t["mcap"],"symbol":t["symbol"],"entry_time":time.time()}
                         trades_today+=1
-                        send_telegram(f"💰 BUY {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f}\n{t['mint']}")
+                        send_telegram(f"💰 BUY {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f} RUG {t.get('rug_score',0)}\n{t['mint']}")
                         if len(open_positions)>=MAX_OPEN_POSITIONS: break
                     time.sleep(1)
             time.sleep(3)
