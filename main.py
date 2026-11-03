@@ -188,14 +188,32 @@ def get_keypair():
 
 def send_tx_via_rpc(signed_tx_b64):
     try:
-        payload={"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":[signed_tx_b64,{"encoding":"base64","skipPreflight":True, "maxRetries": 2}]}
-        r=requests.post(RPC_URL, json=payload, timeout=12)
+        payload={"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":[signed_tx_b64,{"encoding":"base64","skipPreflight":False, "preflightCommitment":"confirmed"}]}
+        r=requests.post(RPC_URL, json=payload, timeout=15)
         j=r.json()
-        if "result" in j:
-            return j["result"]
-        else:
+        sig = j.get("result")
+        if not sig:
             log(f"RPC err {j}")
+            send_telegram(f"❌ RPC {j}")
             return None
+        log(f"Sent {sig[:20]} waiting confirm...")
+        for _ in range(12):
+            time.sleep(2)
+            try:
+                st = requests.post(RPC_URL, json={"jsonrpc":"2.0","id":1,"method":"getSignatureStatuses","params":[[sig],{"searchTransactionHistory":True}]}, timeout=8).json()
+                val = st.get("result",{}).get("value",[None])[0]
+                if val:
+                    if val.get("err"):
+                        log(f"TX FAILED {val.get('err')}")
+                        send_telegram(f"❌ TX Failed {val.get('err')}")
+                        return None
+                    if val.get("confirmationStatus") in ("confirmed","finalized"):
+                        log(f"TX CONFIRMED {val.get('confirmationStatus')}")
+                        return sig
+            except Exception as ce:
+                log(f"Confirm check err {ce}")
+        log("TX not confirmed after 24s - might be dropped but sig exists")
+        return sig
     except Exception as e:
         log(f"RPC fail {e}")
         return None
@@ -213,40 +231,33 @@ def buy_token(mint):
             "denominatedInSol": "true",
             "amount": BUY_AMOUNT_SOL,
             "slippage": 30,
-            "priorityFee": 0.00005,
+            "priorityFee": 0.001,
             "pool": "auto"
         }, timeout=15)
         if resp.status_code!=200:
-            log(f"Buy err {resp.status_code} {resp.text[:300]}")
-            send_telegram(f"❌ Buy {resp.status_code}: {resp.text[:200]}")
+            log(f"Buy err {resp.status_code} {resp.text[:500]}")
+            send_telegram(f"❌ Buy {resp.status_code}: {resp.text[:300]}")
             return None
-        
-        # FIXED: Try raw bytes first, then base64
-        vtx = None
         try:
             vtx = VersionedTransaction.from_bytes(resp.content)
         except:
+            b64 = resp.text.strip().strip('"')
+            b64 = ''.join(c for c in b64 if ord(c) < 128)
+            b64 = ''.join(b64.split())
             try:
-                b64_text = resp.text.strip().strip('"').strip()
-                # keep only ascii
-                b64_text = ''.join(c for c in b64_text if ord(c) < 128)
-                if b64_text.startswith('{'):
-                    try:
-                        jj = json.loads(b64_text)
-                        if "transaction" in jj: b64_text = jj["transaction"]
-                    except: pass
-                b64_text = ''.join(b64_text.split())
-                tx_bytes = base64.b64decode(b64_text)
-                vtx = VersionedTransaction.from_bytes(tx_bytes)
-            except Exception as parse_e:
-                log(f"Parse fail {parse_e}")
-                return None
+                jj = json.loads(resp.text)
+                if isinstance(jj, dict) and "transaction" in jj: b64 = jj["transaction"]
+            except: pass
+            tx_bytes = base64.b64decode(b64)
+            vtx = VersionedTransaction.from_bytes(tx_bytes)
 
         signed_vtx=VersionedTransaction(vtx.message,[kp])
         sig=send_tx_via_rpc(base64.b64encode(bytes(signed_vtx)).decode())
-        log(f"BUY TX {sig[:20] if sig else 'fail'}")
         if sig:
-            send_telegram(f"✅ BUY TX {sig[:30]}")
+            log(f"BUY TX {sig}")
+            send_telegram(f"✅ BUY\nhttps://solscan.io/tx/{sig}")
+        else:
+            log("BUY TX FAILED")
         return sig
     except Exception as e:
         log(f"Buy fail {e}\n{traceback.format_exc()}")
@@ -265,32 +276,25 @@ def sell_token(mint, slippage=30, tries=1):
                 "amount": "100%",
                 "denominatedInSol": "false",
                 "slippage": use_slip,
-                "priorityFee": 0.00005,
+                "priorityFee": 0.001,
                 "pool": "auto"
             }, timeout=15)
             if resp.status_code!=200: 
                 log(f"Sell err {resp.text[:200]} try {attempt}")
                 time.sleep(0.5)
                 continue
-            
-            vtx = None
             try:
                 vtx = VersionedTransaction.from_bytes(resp.content)
             except:
-                b64_text = resp.text.strip().strip('"')
-                b64_text = ''.join(c for c in b64_text if ord(c) < 128)
-                b64_text = ''.join(b64_text.split())
-                try:
-                    jj = json.loads(resp.text)
-                    if "transaction" in jj: b64_text = jj["transaction"]
-                except: pass
-                tx_bytes = base64.b64decode(b64_text)
+                b64 = resp.text.strip().strip('"')
+                b64 = ''.join(c for c in b64 if ord(c) < 128)
+                b64 = ''.join(b64.split())
+                tx_bytes = base64.b64decode(b64)
                 vtx = VersionedTransaction.from_bytes(tx_bytes)
-
             signed_vtx=VersionedTransaction(vtx.message,[kp])
             sig=send_tx_via_rpc(base64.b64encode(bytes(signed_vtx)).decode())
             if sig:
-                log(f"SELL TX {sig[:20]} slip {use_slip}% try {attempt}")
+                log(f"SELL TX {sig} slip {use_slip}%")
                 return sig
         except Exception as e: 
             log(f"Sell fail try {attempt} {e}")
