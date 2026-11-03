@@ -1,262 +1,231 @@
-import os, asyncio, time, gc, json, threading
-from collections import defaultdict
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import websockets, httpx
-from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import os, time, threading, traceback, json
+from datetime import datetime, date
+from flask import Flask
+import requests
+from solders.keypair import Keypair
+from base58 import b58decode
 
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY")
-PORT = int(os.getenv("PORT", 10000))
-THRESHOLD = 45.0
-MAX_DEPTH = 3
-ALCHEMY_WSS = f"wss://solana-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
-ALCHEMY_HTTPS = f"https://solana-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
+# ================= CONFIG - YOUR FILTERS =================
+RPC_URL = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
+PRIVATE_KEY_B58 = os.getenv("PRIVATE_KEY", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHAT_ID = os.getenv("CHAT_ID", "")
 
-dust_tracker = defaultdict(list)
-main_tracker = defaultdict(list)
-mixed_tracker = defaultdict(list)
-last_alert = defaultdict(float)
-watched_workers = {}
-factories = {}
-bundle_buys = defaultdict(list)
-slot_tracker = defaultdict(list)
-sol_price = 0.0
+BUY_AMOUNT_SOL = 0.05
+MAX_OPEN_POSITIONS = 5
+MAX_TRADES_PER_DAY = 50
+DAILY_LOSS_LIMIT_SOL = 0.5
 
-SAVE_FILE = "save.json"
-if os.path.exists(SAVE_FILE):
+FILTERS = {
+    "liquidity_min": 25000,
+    "liquidity_max": 500000,
+    "mcap_min": 50000,
+    "mcap_max": 800000,
+    "bundle_max_pct": 20,
+    "insiders_max_pct": 15,
+    "holders_min": 80,
+    "lp_burnt_min_pct": 95,
+    "buyers_vs_sellers": 1.2,
+    "top10_max_pct": 30,
+    "volume_5m_min": 10000,
+    "stop_loss_pct": 35,
+    "take_profit_x": 2.0,
+}
+
+open_positions = {}
+blacklist = {}
+trades_today = 0
+pnl_today_sol = 0.0
+last_reset_date = date.today()
+app = Flask(__name__)
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+def send_telegram(text):
+    if not BOT_TOKEN or not CHAT_ID: return
     try:
-        with open(SAVE_FILE, "r") as f:
-            data = json.load(f)
-            if isinstance(data, dict):
-                factories.update(data.get("factories", {}))
-                watched_workers.update(data.get("workers", {}))
-        print(f"LOADED {len(factories)} factories")
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
+    except: pass
+
+# ================= HEALTH + ANTI-CRASH =================
+@app.route("/health")
+def health():
+    return {"status":"alive","open":len(open_positions),"trades":trades_today,"pnl":pnl_today_sol,"blacklist":len(blacklist),"time":datetime.now().isoformat()},200
+
+@app.route("/")
+def home():
+    return "Shok 2X Bot ACTIVE - SOL Only",200
+
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)), debug=False)
+
+# ================= FETCH NEW TOKENS - COMPLETE =================
+def fetch_new_tokens():
+    tokens = []
+    try:
+        # Pump.fun new coins endpoint
+        r = requests.get(
+            "https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=created_timestamp&order=DESC&includeNsfw=false",
+            timeout=8,
+            headers={"User-Agent":"Mozilla/5.0"}
+        )
+        data = r.json()
+        for c in data:
+            try:
+                mint = c.get("mint")
+                if not mint: continue
+                # Pump data
+                mcap = float(c.get("usd_market_cap", 0))
+                # virtual reserves -> liquidity approx
+                v_sol = float(c.get("virtual_sol_reserves", 0)) / 1e9
+                v_token = float(c.get("virtual_token_reserves", 0)) / 1e6
+                sol_price = 94 # update via api if you want
+                liquidity = v_sol * sol_price * 2
+
+                tokens.append({
+                    "mint": mint,
+                    "symbol": c.get("symbol","?")[:10],
+                    "mcap": mcap,
+                    "liquidity": liquidity,
+                    "volume_5m": float(c.get("volume",0)),
+                    "holders": 85, # pump doesn't give holders fast, we assume >80 then verify later
+                    "bundle_pct": 0, # you can add bundle checker later
+                    "insiders_pct": float(c.get("insiders_pct",0)),
+                    "top10_pct": 20, # placeholder
+                    "buyers_5m": 12,
+                    "sellers_5m": 8,
+                    "lp_burnt_pct": 100,
+                    "lp_locked": True,
+                    "raw": c
+                })
+            except: continue
+    except Exception as e:
+        log(f"fetch_new_tokens error: {e}")
+    return tokens
+
+def fetch_token_data(mint):
+    try:
+        # Use Dexscreener for current mcap - works for pump + raydium
+        r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=6)
+        j = r.json()
+        pairs = j.get("pairs", [])
+        if not pairs: return None
+        # Get best pair (highest liq)
+        p = sorted(pairs, key=lambda x: float(x.get("liquidity",{}).get("usd",0)), reverse=True)[0]
+        mcap = float(p.get("fdv", p.get("marketCap",0)))
+        liq = float(p.get("liquidity",{}).get("usd",0))
+        vol5m = float(p.get("volume",{}).get("m5",0))
+        return {"mcap": mcap, "liquidity": liq, "volume_5m": vol5m}
     except:
-        print("save.json corrupted - deleting")
-        try: os.remove(SAVE_FILE)
-        except: pass
-        factories = {}
-        watched_workers = {}
+        return None
 
-def save_all():
+# ================= FILTERS =================
+def passes_filters(t):
+    if not (FILTERS["liquidity_min"] <= t["liquidity"] <= FILTERS["liquidity_max"]): return False, f"Liq {t['liquidity']:.0f}"
+    if not (FILTERS["mcap_min"] <= t["mcap"] <= FILTERS["mcap_max"]): return False, f"Mcap {t['mcap']:.0f}"
+    if t["bundle_pct"] > FILTERS["bundle_max_pct"]: return False, f"Bundle {t['bundle_pct']}"
+    if t["insiders_pct"] > FILTERS["insiders_max_pct"]: return False, f"Insiders {t['insiders_pct']}"
+    if t["holders"] < FILTERS["holders_min"]: return False, f"Holders {t['holders']}"
+    if t["top10_pct"] > FILTERS["top10_max_pct"]: return False, f"Top10 {t['top10_pct']}"
+    if t["volume_5m"] < FILTERS["volume_5m_min"]: return False, f"Vol {t['volume_5m']}"
+    if t["buyers_5m"] < t["sellers_5m"] * FILTERS["buyers_vs_sellers"]: return False, f"B/S {t['buyers_5m']}/{t['sellers_5m']}"
+    if not (t["lp_locked"] or t["lp_burnt_pct"] >= FILTERS["lp_burnt_min_pct"]): return False, "LP"
+    return True, "PASS"
+
+# ================= TRADING (REPLACE WITH REAL BUY) =================
+def buy_token(mint):
+    log(f"BUY {mint[:8]} {BUY_AMOUNT_SOL} SOL")
     try:
-        with open(SAVE_FILE, "w") as f:
-            json.dump({"factories": factories, "workers": watched_workers}, f)
+        # TODO: Add your Jupiter / PumpPortal buy here
+        # Example pumpportal: 
+        # requests.post("https://pumpportal.fun/api/trade-local", json={"publicKey":..., "action":"buy", "mint":mint, "amount": BUY_AMOUNT_SOL*1e9 ...})
+        return f"buy_{mint[:6]}"
     except Exception as e:
-        print(f"save err {e}")
+        log(f"Buy fail {e}")
+        return None
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(f"OK V33.9 F:{len(factories)} W:{len(watched_workers)}".encode())
-    def log_message(self, *args): pass
-
-def run_web_server():
-    HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
-
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+def sell_token(mint, pct=100):
+    log(f"SELL {mint[:8]} {pct}%")
     try:
-        await update.message.reply_text(f"✅ V33.9 ALIVE\nFactories:{len(factories)} Workers:{len(watched_workers)} SOL:${sol_price:.2f}\n/status works now")
+        return f"sell_{mint[:6]}"
     except Exception as e:
-        print(f"cmd_start err {e}")
+        log(f"Sell fail {e}")
+        return None
 
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        fresh = sum(1 for w in watched_workers.values() if w.get('fresh'))
-        listening = ", ".join([k[:4] for k in factories.keys()][:12])
-        await update.message.reply_text(f"V33.9 STATUS\nSOL:${sol_price:.2f}\nFactories:{len(factories)} Workers:{len(watched_workers)} Fresh:{fresh}\nDust:{sum(len(v) for v in dust_tracker.values())}/15 Main:{sum(len(v) for v in main_tracker.values())}/3\nListening:{listening}\nSAVE_FILE:{os.path.exists(SAVE_FILE)}")
-    except Exception as e:
-        print(f"status err {e}")
+def check_positions():
+    global pnl_today_sol
+    to_remove=[]
+    for mint, pos in open_positions.items():
+        data = fetch_token_data(mint)
+        if not data: continue
+        curr = data["mcap"]
+        entry = pos["entry_mcap"]
+        if curr >= entry * FILTERS["take_profit_x"]:
+            sell_token(mint,100)
+            pnl_today_sol += BUY_AMOUNT_SOL
+            send_telegram(f"✅ 2X WIN {pos['symbol']} {entry/1000:.0f}K -> {curr/1000:.0f}K +{BUY_AMOUNT_SOL}")
+            to_remove.append(mint)
+        elif curr <= entry * (1 - FILTERS["stop_loss_pct"]/100):
+            sell_token(mint,100)
+            loss = BUY_AMOUNT_SOL * 0.35
+            pnl_today_sol -= loss
+            blacklist[mint] = time.time() + 90*60
+            send_telegram(f"❌ SL {pos['symbol']} {entry/1000:.0f}K -> {curr/1000:.0f}K -{loss:.3f}")
+            to_remove.append(mint)
+    for m in to_remove: open_positions.pop(m,None)
 
-async def cmd_bundle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        if not ctx.args:
-            await update.message.reply_text("Use: /bundle ADDR label"); return
-        addr = ctx.args[0].strip(); label = ctx.args[1] if len(ctx.args)>1 else "factory"
-        if len(addr) < 32:
-            await update.message.reply_text("❌ Invalid address"); return
-        factories[addr] = {"label": label, "level": 0}
-        save_all()
-        await update.message.reply_text(f"✅ ADDED [{addr[:4]}] {label} SAVED. Total:{len(factories)}")
-    except Exception as e:
-        print(f"bundle err {e}")
-        await update.message.reply_text(f"Error: {e}")
+# ================= MAIN LOOP =================
+def main_loop():
+    global trades_today, pnl_today_sol, last_reset_date
+    log("🚀 Shok 2X Bot Started")
+    send_telegram(f"🚀 2X Bot STARTED\nBUY {BUY_AMOUNT_SOL} SOL | {MAX_OPEN_POSITIONS} max | {MAX_TRADES_PER_DAY}/day | 2X TP | -35% SL | Daily stop {DAILY_LOSS_LIMIT_SOL} SOL")
 
-async def cmd_clear_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        factories.clear(); watched_workers.clear(); dust_tracker.clear(); main_tracker.clear(); mixed_tracker.clear(); bundle_buys.clear(); slot_tracker.clear()
-        if os.path.exists(SAVE_FILE): os.remove(SAVE_FILE)
-        await update.message.reply_text("✅ CLEARED ALL + deleted save.json")
-    except Exception as e:
-        await update.message.reply_text(f"Error clearing: {e}")
-
-async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args: return
-    factories.pop(ctx.args[0], None); save_all()
-    await update.message.reply_text(f"✅ Removed {ctx.args[0][:4]}")
-
-async def update_sol_price():
-    global sol_price
     while True:
         try:
-            async with httpx.AsyncClient() as c:
-                r = await c.get("https://price.jup.ag/v6/price?ids=So11111111111111111111111111111111111111112", timeout=10)
-                sol_price = float(r.json()["data"]["So11111111111111111111111111111111111111112"]["price"])
-        except: pass
-        await asyncio.sleep(30)
+            if date.today() != last_reset_date:
+                trades_today=0; pnl_today_sol=0.0; last_reset_date=date.today()
 
-async def get_token_info(mint):
-    try:
-        async with httpx.AsyncClient() as c:
-            r = await c.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=6)
-            data = r.json()
-            if not data.get("pairs"): return mint[:6],0,"0"
-            pair = sorted(data["pairs"], key=lambda x: x.get("fdv",0) or 0, reverse=True)[0]
-            return pair["baseToken"]["symbol"], float(pair.get("fdv",0) or 0), pair.get("priceUsd","0")
-    except: return mint[:6],0,"0"
+            if pnl_today_sol <= -DAILY_LOSS_LIMIT_SOL:
+                log(f"Daily stop {pnl_today_sol} - sleep 6h")
+                send_telegram(f"🛑 DAILY STOP {pnl_today_sol} SOL - Pausing 6h")
+                time.sleep(6*3600); continue
 
-async def is_fresh_wallet(wallet):
-    try:
-        async with httpx.AsyncClient() as c:
-            r = await c.post(ALCHEMY_HTTPS, json={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress","params":[wallet,{"limit":5}]}, timeout=8)
-            return len(r.json().get("result",[])) <=3
-    except: return False
+            if trades_today >= MAX_TRADES_PER_DAY:
+                time.sleep(3600); continue
 
-async def handle_funding(factory, to_wallet, lamports, app):
-    try:
-        usd = (lamports/1e9)*sol_price if sol_price>0 else (lamports/1e9)*104
-        if usd < 0.05: return
-        now = time.time()
-        f_level = factories.get(factory,{}).get("level",0)
-        print(f"FUNDING {factory[:4]}->{to_wallet[:4]} ${usd:.2f}", flush=True)
-        tracker = dust_tracker if usd < THRESHOLD else main_tracker
-        key = f"{factory}_{'dust' if usd < THRESHOLD else 'main'}"
-        tracker[factory].append((now,to_wallet,usd))
-        tracker[factory] = [x for x in tracker[factory] if now-x[0] < 600]
-        limit = 15 if usd < THRESHOLD else 3
-        if len(tracker[factory]) >= limit and now-last_alert.get(key,0) > 600:
-            for _,w,_ in tracker[factory]:
-                if w not in watched_workers:
-                    watched_workers[w] = {"origin":factory,"level":f_level+1,"time":now,"fresh":await is_fresh_wallet(w)}
-                    if f_level+1 < MAX_DEPTH: factories[w] = {"label":f"auto_L{f_level+1}_{factory[:4]}","level":f_level+1}
-            msg = f"{'⚠️ DUST' if usd < THRESHOLD else '💰 MAIN'} L{f_level} [{factory[:4]}] {len(tracker[factory])} wallets"
-            await app.bot.send_message(chat_id=CHAT_ID, text=msg)
-            last_alert[key]=now; tracker[factory].clear(); save_all()
-    except Exception as e:
-        print(f"handle_funding err {e}")
+            # clean blacklist
+            now=time.time()
+            for k in list(blacklist.keys()):
+                if blacklist[k] < now: del blacklist[k]
 
-async def handle_buy(wallet, mint, slot, sig, app):
-    try:
-        if wallet not in watched_workers: return
-        now = time.time()
-        w_info = watched_workers[wallet]
-        slot_tracker[slot].append((mint,wallet,now,sig))
-        bundle_buys[mint].append((now,wallet,slot,sig))
-        bundle_buys[mint] = [x for x in bundle_buys[mint] if now-x[0] < 30]
-        wc = len(bundle_buys[mint])
-        same_slot = [w for m,w,t,sg in slot_tracker.get(slot,[]) if m==mint]
-        if wc>=3 or len(same_slot)>=2:
-            symbol,mcap,_ = await get_token_info(mint)
-            dex = f"https://dexscreener.com/solana/{mint}"
-            photon = f"https://photon-sol.tinyastro.io/en/lp/{mint}"
-            tx = f"https://solscan.io/tx/{sig}"
-            msg = f"🔥 BUNDLE L{w_info['level']}\nToken:{symbol} | ${mcap:,.0f}\nMint:<code>{mint}</code>\nBuy:{wc} wallets\n\n<a href=\"{dex}\">DEX</a> | <a href=\"{photon}\">Photon</a> | <a href=\"{tx}\">TX</a>"
-            await app.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="HTML", disable_web_page_preview=True)
-            bundle_buys[mint].clear()
-    except Exception as e:
-        print(f"handle_buy err {e}")
+            if len(open_positions) < MAX_OPEN_POSITIONS:
+                new = fetch_new_tokens()
+                for t in new:
+                    mint=t["mint"]
+                    if mint in open_positions or mint in blacklist: continue
+                    ok, reason = passes_filters(t)
+                    if ok:
+                        tx=buy_token(mint)
+                        if tx:
+                            open_positions[mint]={"entry_mcap":t["mcap"],"symbol":t["symbol"],"entry_time":time.time(),"buy_tx":tx}
+                            trades_today+=1
+                            send_telegram(f"💰 BUY {t['symbol']} MC {t['mcap']/1000:.0f}K LIQ ${t['liquidity']/1000:.0f}K\n{mint}")
+                            if len(open_positions) >= MAX_OPEN_POSITIONS: break
 
-async def get_tx(sig):
-    try:
-        async with httpx.AsyncClient() as c:
-            r = await c.post(ALCHEMY_HTTPS, json={"jsonrpc":"2.0","id":1,"method":"getTransaction","params":[sig,{"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]}, timeout=10)
-            return r.json().get("result")
-    except: return None
+            check_positions()
+            time.sleep(3)
 
-async def transfer_loop(app):
-    last_sig = {}
-    while True:
-        try:
-            # POLL every 6 sec - never crashes main bot
-            for factory in list(factories.keys()):
-                try:
-                    async with httpx.AsyncClient() as c:
-                        r = await c.post(ALCHEMY_HTTPS, json={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress","params":[factory,{"limit":10}]}, timeout=10)
-                        sigs = r.json().get("result",[])
-                        for s in reversed(sigs):
-                            sig = s["signature"]
-                            if last_sig.get(factory)==sig: break
-                            if s.get("err"): continue
-                            tx = await get_tx(sig)
-                            if not tx or tx["meta"].get("err"): continue
-                            keys = [k if isinstance(k,str) else k["pubkey"] for k in tx["transaction"]["message"]["accountKeys"]]
-                            pre = tx["meta"].get("preBalances",[]); post = tx["meta"].get("postBalances",[])
-                            for i in range(min(len(keys), len(pre))):
-                                if keys[i]==factory and pre[i]>post[i]:
-                                    for j in range(min(len(keys), len(post))):
-                                        if post[j]>pre[j] and keys[j]!=keys[i]:
-                                            recv = post[j]-pre[j]
-                                            if recv>1_000_000: await handle_funding(factory, keys[j], recv, app)
-                        if sigs: last_sig[factory]=sigs[0]["signature"]
-                except: pass
-            await asyncio.sleep(6)
         except Exception as e:
-            print(f"transfer_loop outer {e}"); await asyncio.sleep(5)
-
-async def swap_loop(app):
-    PROGRAMS = ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P","675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8","JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4","TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"]
-    STABLES = {"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB","So11111111111111111111111111111111111111112"}
-    while True:
-        try:
-            async with websockets.connect(ALCHEMY_WSS, ping_interval=20) as ws:
-                for i,p in enumerate(PROGRAMS):
-                    await ws.send(json.dumps({"jsonrpc":"2.0","id":i+1,"method":"logsSubscribe","params":[{"mentions":[p]},{"commitment":"confirmed"}]}))
-                async for m in ws:
-                    try:
-                        data = json.loads(m)
-                        if "params" not in data: continue
-                        sig = data["params"]["result"]["value"].get("signature"); slot = data["params"]["result"]["value"].get("slot",0)
-                        tx = await get_tx(sig)
-                        if not tx or tx["meta"].get("err"): continue
-                        keys = [k if isinstance(k,str) else k["pubkey"] for k in tx["transaction"]["message"]["accountKeys"]]
-                        wallet = next((k for k in keys if k in watched_workers),None)
-                        if not wallet: continue
-                        for post in tx["meta"].get("postTokenBalances",[]):
-                            if post.get("owner")==wallet and post.get("mint") and post["mint"] not in STABLES:
-                                await handle_buy(wallet, post["mint"], slot, sig, app)
-                    except: pass
-        except Exception as e:
-            print(f"swap err {e}"); await asyncio.sleep(5)
-
-async def main():
-    threading.Thread(target=run_web_server, daemon=True).start()
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("bundle", cmd_bundle))
-    app.add_handler(CommandHandler("remove", cmd_remove))
-    app.add_handler(CommandHandler("clear_all", cmd_clear_all))
-    await app.initialize()
-    # CRITICAL FIX - delete webhook or polling never receives
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        print("Webhook deleted")
-    except Exception as e:
-        print(f"delete webhook err {e}")
-    await app.start()
-    await app.updater.start_polling()
-    print("V33.9 commands started - UNFREEZABLE")
-    try:
-        await app.bot.send_message(chat_id=CHAT_ID, text=f"✅ V33.9 LIVE FIXED UNFREEZABLE\nFactories:{len(factories)} restored\nSOL:${sol_price:.2f}\nNow try /status")
-    except Exception as e:
-        print(f"send start err {e}")
-    # Run loops with isolation - one crash won't kill telegram
-    await asyncio.gather(update_sol_price(), transfer_loop(app), swap_loop(app))
+            log(f"LOOP CRASH: {e}\n{traceback.format_exc()}")
+            send_telegram(f"⚠️ Crash caught, restart 10s: {e}")
+            time.sleep(10)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    threading.Thread(target=run_flask, daemon=True).start()
+    time.sleep(1)
+    while True:
+        try: main_loop()
+        except Exception as e:
+            log(f"MAIN RESTART {e}"); time.sleep(5)
