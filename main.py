@@ -1,4 +1,4 @@
-import os, time, threading, traceback, base64
+import os, time, threading, traceback, base64, json
 from datetime import datetime, date
 from flask import Flask
 import requests
@@ -204,41 +204,49 @@ def buy_token(mint):
     log(f"BUY {mint[:8]} {BUY_AMOUNT_SOL} SOL")
     try:
         kp=get_keypair()
-        if not kp:
-            log("No keypair")
-            return None
+        if not kp: return None
         pubkey=str(kp.pubkey())
         resp=requests.post("https://pumpportal.fun/api/trade-local", json={
             "publicKey": pubkey,
             "action": "buy",
             "mint": mint,
-            "denominatedInSol": "true",  # STRING - per official docs
+            "denominatedInSol": "true",
             "amount": BUY_AMOUNT_SOL,
             "slippage": 30,
-            "priorityFee": 0.00005,  # lower - 0.002 causes 400
-            "pool": "auto"  # auto not pump - fixes migrated tokens
+            "priorityFee": 0.00005,
+            "pool": "auto"
         }, timeout=15)
         if resp.status_code!=200:
-            log(f"Buy err {resp.status_code} {resp.text[:500]}")
-            send_telegram(f"❌ Buy {resp.status_code}: {resp.text[:300]}")
+            log(f"Buy err {resp.status_code} {resp.text[:300]}")
+            send_telegram(f"❌ Buy {resp.status_code}: {resp.text[:200]}")
             return None
         
-        # Parse transaction - can be raw base64 or json
-        tx_b64 = resp.text.strip().strip('"')
+        # FIXED: Try raw bytes first, then base64
+        vtx = None
         try:
-            j = resp.json()
-            if isinstance(j, dict) and "transaction" in j:
-                tx_b64 = j["transaction"]
-            elif isinstance(j, str):
-                tx_b64 = j
+            vtx = VersionedTransaction.from_bytes(resp.content)
         except:
-            pass
+            try:
+                b64_text = resp.text.strip().strip('"').strip()
+                # keep only ascii
+                b64_text = ''.join(c for c in b64_text if ord(c) < 128)
+                if b64_text.startswith('{'):
+                    try:
+                        jj = json.loads(b64_text)
+                        if "transaction" in jj: b64_text = jj["transaction"]
+                    except: pass
+                b64_text = ''.join(b64_text.split())
+                tx_bytes = base64.b64decode(b64_text)
+                vtx = VersionedTransaction.from_bytes(tx_bytes)
+            except Exception as parse_e:
+                log(f"Parse fail {parse_e}")
+                return None
 
-        tx_bytes = base64.b64decode(tx_b64)
-        vtx=VersionedTransaction.from_bytes(tx_bytes)
         signed_vtx=VersionedTransaction(vtx.message,[kp])
         sig=send_tx_via_rpc(base64.b64encode(bytes(signed_vtx)).decode())
         log(f"BUY TX {sig[:20] if sig else 'fail'}")
+        if sig:
+            send_telegram(f"✅ BUY TX {sig[:30]}")
         return sig
     except Exception as e:
         log(f"Buy fail {e}\n{traceback.format_exc()}")
@@ -248,15 +256,14 @@ def buy_token(mint):
 def sell_token(mint, slippage=30, tries=1):
     for attempt in range(tries):
         try:
-            kp=get_keypair()
-            pubkey=str(kp.pubkey())
+            kp=get_keypair(); pubkey=str(kp.pubkey())
             use_slip = 50 if attempt>0 else slippage
             resp=requests.post("https://pumpportal.fun/api/trade-local", json={
                 "publicKey": pubkey,
                 "action": "sell",
                 "mint": mint,
                 "amount": "100%",
-                "denominatedInSol": "false",  # STRING
+                "denominatedInSol": "false",
                 "slippage": use_slip,
                 "priorityFee": 0.00005,
                 "pool": "auto"
@@ -265,15 +272,21 @@ def sell_token(mint, slippage=30, tries=1):
                 log(f"Sell err {resp.text[:200]} try {attempt}")
                 time.sleep(0.5)
                 continue
-            tx_b64 = resp.text.strip().strip('"')
+            
+            vtx = None
             try:
-                j = resp.json()
-                if isinstance(j, dict) and "transaction" in j:
-                    tx_b64 = j["transaction"]
+                vtx = VersionedTransaction.from_bytes(resp.content)
             except:
-                pass
-            tx_bytes = base64.b64decode(tx_b64)
-            vtx=VersionedTransaction.from_bytes(tx_bytes)
+                b64_text = resp.text.strip().strip('"')
+                b64_text = ''.join(c for c in b64_text if ord(c) < 128)
+                b64_text = ''.join(b64_text.split())
+                try:
+                    jj = json.loads(resp.text)
+                    if "transaction" in jj: b64_text = jj["transaction"]
+                except: pass
+                tx_bytes = base64.b64decode(b64_text)
+                vtx = VersionedTransaction.from_bytes(tx_bytes)
+
             signed_vtx=VersionedTransaction(vtx.message,[kp])
             sig=send_tx_via_rpc(base64.b64encode(bytes(signed_vtx)).decode())
             if sig:
@@ -399,7 +412,6 @@ def main_loop():
     set_telegram_commands()
     log(f"🚀 REAL BUY BOT v2.1 - 2X TP + RUG FIX - MC {FILTERS['mcap_min']/1000:.0f}K-{FILTERS['mcap_max']/1000:.0f}K VOL {FILTERS['volume_5m_min']/1000:.0f}K")
     send_telegram(f"🚀 REAL BUY BOT v2.1 LIVE\nMC {FILTERS['mcap_min']/1000:.0f}K-{FILTERS['mcap_max']/1000:.0f}K LIQ {FILTERS['liquidity_min']/1000:.0f}K-{FILTERS['liquidity_max']/1000:.0f}K VOL {FILTERS['volume_5m_min']/1000:.0f}K\n✅ 2X TP kept\n✅ Rug filter: VOL>MC blocked\n✅ Fast monitor 2s\n\n<b>Commands:</b> /pnl /positions /watchlist /stats /balance")
-
     while True:
         try:
             if not bot_running: time.sleep(5); continue
@@ -408,11 +420,9 @@ def main_loop():
             if pnl_today_sol <= -DAILY_LOSS_LIMIT_SOL:
                 log("Daily limit sleep 6h"); time.sleep(6*3600); continue
             if trades_today >= MAX_TRADES_PER_DAY: time.sleep(3600); continue
-
             now=time.time()
             for k in list(blacklist.keys()):
                 if blacklist[k] < now: del blacklist[k]
-
             for mint in list(watchlist.keys()):
                 if mint in open_positions or mint in blacklist: del watchlist[mint]; continue
                 if now - watchlist[mint]["first_seen"] > 1800: del watchlist[mint]; continue
@@ -437,7 +447,6 @@ def main_loop():
                         send_telegram(f"💰 BUY (REVISIT) {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f}\n{t['mint']}")
                 elif not is_vol_fail:
                     del watchlist[mint]
-
             if len(open_positions) < MAX_OPEN_POSITIONS:
                 tokens=fetch_new_tokens()
                 for t in tokens:
@@ -457,7 +466,6 @@ def main_loop():
                         send_telegram(f"💰 BUY {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f}\n{t['mint']}")
                         if len(open_positions)>=MAX_OPEN_POSITIONS: break
                     time.sleep(1)
-
             time.sleep(3)
         except Exception as e:
             log(f"CRASH {e}\n{traceback.format_exc()}"); time.sleep(10)
