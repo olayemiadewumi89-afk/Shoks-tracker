@@ -1,4 +1,5 @@
-python-telegram-bot
-websockets
-httpx
-python-dotenv
+flask
+requests
+solders
+base58
+solana
