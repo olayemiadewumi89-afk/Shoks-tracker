@@ -61,6 +61,26 @@ def get_balance_sol():
         return lamports/1e9
     except: return 0
 
+# === FIX FOR YOUR SCREENSHOT - OVERWRITE OLD /bundle MENU ===
+def set_telegram_commands():
+    try:
+        if not BOT_TOKEN: return
+        cmds = [
+            {"command":"pnl","description":"📊 PnL + balance + winrate"},
+            {"command":"positions","description":"📦 Open positions"},
+            {"command":"watchlist","description":"👀 Tokens waiting for 10K vol"},
+            {"command":"stats","description":"📈 Winrate + history"},
+            {"command":"balance","description":"💰 Wallet balance"},
+            {"command":"trades","description":"Last 10 trades"},
+            {"command":"stop","description":"⏸️ Pause bot"},
+            {"command":"start","description":"▶️ Resume bot"},
+            {"command":"help","description":"Show commands"}
+        ]
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands", json={"commands": cmds}, timeout=10)
+        log("TG menu overwritten - old /bundle cleared")
+    except Exception as e:
+        log(f"setMyCommands fail {e}")
+
 @app.route("/health")
 def health(): 
     return {
@@ -159,7 +179,7 @@ def passes_filters(t):
     if t["insiders_pct"] > FILTERS["insiders_max_pct"]: return False, f"Insiders", False
     if t["holders"] < FILTERS["holders_min"]: return False, f"Holders {t['holders']}", False
     if t["top10_pct"] > FILTERS["top10_max_pct"]: return False, f"Top10 {t['top10_pct']}%", False
-    if t["volume_5m"] < FILTERS["volume_5m_min"]: return False, f"Vol5m {t['volume_5m']:.0f}", True  # VOL = revisit
+    if t["volume_5m"] < FILTERS["volume_5m_min"]: return False, f"Vol5m {t['volume_5m']:.0f}", True
     if t["buyers_5m"] < t["sellers_5m"] * FILTERS["buyers_vs_sellers"]: return False, f"B/S", False
     if not (t["lp_locked"] or t["lp_burnt_pct"] >= FILTERS["lp_burnt_min_pct"]): return False, "LP", False
     return True, "PASS", False
@@ -237,7 +257,6 @@ def handle_telegram_commands():
                 if chat_id!=str(CHAT_ID): continue
                 text=(msg.get("text") or "").strip().lower()
                 if not text.startswith("/"): continue
-                # Commands
                 if text.startswith("/pnl"):
                     bal=get_balance_sol()
                     winrate = (total_wins/(total_wins+total_losses)*100) if (total_wins+total_losses)>0 else 0
@@ -295,6 +314,7 @@ def handle_telegram_commands():
 
 def main_loop():
     global trades_today,pnl_today_sol,last_reset_date
+    set_telegram_commands() # FIX: Overwrite old menu immediately
     log(f"🚀 REAL BUY BOT v2 - MC {FILTERS['mcap_min']/1000:.0f}K-{FILTERS['mcap_max']/1000:.0f}K VOL {FILTERS['volume_5m_min']/1000:.0f}K REVISIT")
     send_telegram(f"🚀 REAL BUY BOT v2 LIVE\nMC {FILTERS['mcap_min']/1000:.0f}K-{FILTERS['mcap_max']/1000:.0f}K LIQ {FILTERS['liquidity_min']/1000:.0f}K-{FILTERS['liquidity_max']/1000:.0f}K VOL {FILTERS['volume_5m_min']/1000:.0f}K\n✅ Watchlist REVISIT ON\n2X TP -35% SL\n\n<b>Commands:</b> /pnl /positions /watchlist /stats /balance")
 
@@ -311,7 +331,6 @@ def main_loop():
             for k in list(blacklist.keys()):
                 if blacklist[k] < now: del blacklist[k]
 
-            # 1. REVISIT WATCHLIST (real buy logic)
             for mint in list(watchlist.keys()):
                 if mint in open_positions or mint in blacklist: del watchlist[mint]; continue
                 if now - watchlist[mint]["first_seen"] > 1800: del watchlist[mint]; continue
@@ -337,7 +356,6 @@ def main_loop():
                 elif not is_vol_fail:
                     del watchlist[mint]
 
-            # 2. NEW TOKENS
             if len(open_positions) < MAX_OPEN_POSITIONS:
                 tokens=fetch_new_tokens()
                 for t in tokens:
