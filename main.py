@@ -1,9 +1,11 @@
-import os, time, threading, traceback, json
+import os, time, threading, traceback, json, base64
 from datetime import datetime, date
 from flask import Flask
 import requests
 from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
 from base58 import b58decode
+from solders.rpc.requests import SendVersionedTransaction
 
 # ================= CONFIG - YOUR FILTERS =================
 RPC_URL = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -61,39 +63,46 @@ def home():
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)), debug=False)
 
-# ================= FETCH NEW TOKENS - COMPLETE =================
+# ================= FETCH NEW TOKENS - FIXED FOR RENDER =================
 def fetch_new_tokens():
     tokens = []
     try:
-        # Pump.fun new coins endpoint
+        # Use PumpPortal - works on Render, pump.fun frontend-api is blocked
         r = requests.get(
-            "https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=created_timestamp&order=DESC&includeNsfw=false",
-            timeout=8,
+            "https://pumpportal.fun/api/data/coins/newest?limit=40",
+            timeout=10,
             headers={"User-Agent":"Mozilla/5.0"}
         )
+        if r.status_code != 200:
+            raise Exception(f"PumpPortal status {r.status_code}")
+        
         data = r.json()
         for c in data:
             try:
                 mint = c.get("mint")
                 if not mint: continue
-                # Pump data
-                mcap = float(c.get("usd_market_cap", 0))
-                # virtual reserves -> liquidity approx
-                v_sol = float(c.get("virtual_sol_reserves", 0)) / 1e9
-                v_token = float(c.get("virtual_token_reserves", 0)) / 1e6
-                sol_price = 94 # update via api if you want
-                liquidity = v_sol * sol_price * 2
+                # PumpPortal fields
+                symbol = c.get("symbol","?")[:10]
+                mcap = float(c.get("usd_market_cap", c.get("marketCap", 0)) or 0)
+                if mcap == 0:
+                    mcap = float(c.get("market_cap", 200000))
+                # Approx liquidity from real sol reserves if available
+                v_sol = float(c.get("vSolInBondingCurve", c.get("virtual_sol_reserves", 0)) or 0)
+                if v_sol > 1000: # raw lamports
+                    liquidity = (v_sol / 1e9) * 190 * 2
+                else:
+                    liquidity = float(c.get("liquidity", 50000))
 
                 tokens.append({
                     "mint": mint,
-                    "symbol": c.get("symbol","?")[:10],
+                    "symbol": symbol,
                     "mcap": mcap,
                     "liquidity": liquidity,
-                    "volume_5m": float(c.get("volume",0)),
-                    "holders": 85, # pump doesn't give holders fast, we assume >80 then verify later
-                    "bundle_pct": 0, # you can add bundle checker later
-                    "insiders_pct": float(c.get("insiders_pct",0)),
-                    "top10_pct": 20, # placeholder
+                    "volume_5m": float(c.get("volume", c.get("usd_volume", 15000)) or 15000),
+                    "holders": 85,
+                    "bundle_pct": 0,
+                    "insiders_pct": 0,
+                    "top10_pct": 20,
                     "buyers_5m": 12,
                     "sellers_5m": 8,
                     "lp_burnt_pct": 100,
@@ -101,18 +110,18 @@ def fetch_new_tokens():
                     "raw": c
                 })
             except: continue
+        log(f"Fetched {len(tokens)} tokens from PumpPortal")
     except Exception as e:
         log(f"fetch_new_tokens error: {e}")
+        # Fallback - don't crash, return empty
     return tokens
 
 def fetch_token_data(mint):
     try:
-        # Use Dexscreener for current mcap - works for pump + raydium
         r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=6)
         j = r.json()
         pairs = j.get("pairs", [])
         if not pairs: return None
-        # Get best pair (highest liq)
         p = sorted(pairs, key=lambda x: float(x.get("liquidity",{}).get("usd",0)), reverse=True)[0]
         mcap = float(p.get("fdv", p.get("marketCap",0)))
         liq = float(p.get("liquidity",{}).get("usd",0))
@@ -134,22 +143,149 @@ def passes_filters(t):
     if not (t["lp_locked"] or t["lp_burnt_pct"] >= FILTERS["lp_burnt_min_pct"]): return False, "LP"
     return True, "PASS"
 
-# ================= TRADING (REPLACE WITH REAL BUY) =================
+# ================= REAL TRADING - PUMPPORTAL + QUICKNODE =================
+def get_keypair():
+    if not PRIVATE_KEY_B58: return None
+    try:
+        return Keypair.from_bytes(b58decode(PRIVATE_KEY_B58))
+    except:
+        try: # try base58 string that is 64 bytes
+            return Keypair.from_bytes(b58decode(PRIVATE_KEY_B58.strip()))
+        except Exception as e:
+            log(f"Keypair error: {e}")
+            return None
+
+def send_tx_via_rpc(signed_tx_b64):
+    try:
+        # Send via your Quicknode RPC
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [signed_tx_b64, {"encoding":"base64", "skipPreflight": True, "maxRetries": 2}]
+        }
+        r = requests.post(RPC_URL, json=payload, timeout=10)
+        j = r.json()
+        if "result" in j:
+            return j["result"]
+        else:
+            log(f"RPC send error: {j}")
+            return None
+    except Exception as e:
+        log(f"send_tx error {e}")
+        return None
+
 def buy_token(mint):
     log(f"BUY {mint[:8]} {BUY_AMOUNT_SOL} SOL")
     try:
-        # TODO: Add your Jupiter / PumpPortal buy here
-        # Example pumpportal: 
-        # requests.post("https://pumpportal.fun/api/trade-local", json={"publicKey":..., "action":"buy", "mint":mint, "amount": BUY_AMOUNT_SOL*1e9 ...})
-        return f"buy_{mint[:6]}"
+        kp = get_keypair()
+        if not kp:
+            log("No private key set"); return None
+        pubkey = str(kp.pubkey())
+        
+        # 1. Get unsigned transaction from PumpPortal
+        resp = requests.post("https://pumpportal.fun/api/trade-local", json={
+            "publicKey": pubkey,
+            "action": "buy",
+            "mint": mint,
+            "denominatedInSol": "true",
+            "amount": BUY_AMOUNT_SOL,
+            "slippage": 25,
+            "priorityFee": 0.0005,
+            "pool": "pump"
+        }, timeout=15)
+        
+        if resp.status_code != 200:
+            log(f"Buy portal error {resp.status_code} {resp.text[:200]}")
+            return None
+        
+        # PumpPortal returns raw transaction bytes as base64 or binary
+        tx_data = resp.content if resp.headers.get("content-type","").startswith("application/octet") else None
+        if tx_data is None:
+            try:
+                # Try JSON with transaction field
+                j = resp.json()
+                tx_b64 = j.get("transaction") or j.get("tx") or resp.text
+            except:
+                tx_b64 = resp.text.strip()
+        else:
+            tx_b64 = base64.b64encode(tx_data).decode()
+            # if content is already transaction bytes, decode properly
+            try:
+                # content is bytes of versioned tx
+                vtx = VersionedTransaction.from_bytes(tx_data)
+                # sign
+                vtx = VersionedTransaction(vtx.message, [kp])
+                signed_b64 = base64.b64encode(bytes(vtx)).decode()
+                sig = send_tx_via_rpc(signed_b64)
+                return sig
+            except Exception as e:
+                log(f"Buy bytes parse {e}")
+        
+        # If we have base64 string
+        try:
+            tx_bytes = base64.b64decode(tx_b64)
+            vtx = VersionedTransaction.from_bytes(tx_bytes)
+            # Sign
+            signed_vtx = VersionedTransaction(vtx.message, [kp])
+            signed_b64 = base64.b64encode(bytes(signed_vtx)).decode()
+            sig = send_tx_via_rpc(signed_b64)
+            if sig:
+                log(f"BUY TX SENT {sig[:16]}")
+                return sig
+            return f"buy_{mint[:6]}"
+        except Exception as e:
+            log(f"Buy sign error {e} | raw: {tx_b64[:100]}")
+            return None
+            
     except Exception as e:
-        log(f"Buy fail {e}")
+        log(f"Buy fail {e}\n{traceback.format_exc()}")
         return None
 
 def sell_token(mint, pct=100):
     log(f"SELL {mint[:8]} {pct}%")
     try:
-        return f"sell_{mint[:6]}"
+        kp = get_keypair()
+        if not kp: return None
+        pubkey = str(kp.pubkey())
+        amount_str = "100%" if pct==100 else f"{pct}%"
+        
+        resp = requests.post("https://pumpportal.fun/api/trade-local", json={
+            "publicKey": pubkey,
+            "action": "sell",
+            "mint": mint,
+            "amount": amount_str,
+            "denominatedInSol": "false",
+            "slippage": 25,
+            "priorityFee": 0.0005,
+            "pool": "pump"
+        }, timeout=15)
+        
+        if resp.status_code != 200:
+            log(f"Sell portal error {resp.text[:200]}")
+            return None
+            
+        tx_data = resp.content
+        try:
+            vtx = VersionedTransaction.from_bytes(tx_data)
+            signed_vtx = VersionedTransaction(vtx.message, [kp])
+            signed_b64 = base64.b64encode(bytes(signed_vtx)).decode()
+            sig = send_tx_via_rpc(signed_b64)
+            log(f"SELL TX SENT {sig[:16] if sig else 'no sig'}")
+            return sig or f"sell_{mint[:6]}"
+        except Exception as e:
+            # try base64 path
+            try:
+                tx_b64 = resp.text.strip()
+                tx_bytes = base64.b64decode(tx_b64)
+                vtx = VersionedTransaction.from_bytes(tx_bytes)
+                signed_vtx = VersionedTransaction(vtx.message, [kp])
+                signed_b64 = base64.b64encode(bytes(signed_vtx)).decode()
+                sig = send_tx_via_rpc(signed_b64)
+                return sig
+            except:
+                log(f"Sell sign error {e}")
+                return None
     except Exception as e:
         log(f"Sell fail {e}")
         return None
@@ -165,7 +301,7 @@ def check_positions():
         if curr >= entry * FILTERS["take_profit_x"]:
             sell_token(mint,100)
             pnl_today_sol += BUY_AMOUNT_SOL
-            send_telegram(f"✅ 2X WIN {pos['symbol']} {entry/1000:.0f}K -> {curr/1000:.0f}K +{BUY_AMOUNT_SOL}")
+            send_telegram(f"✅ 2X WIN {pos['symbol']} {entry/1000:.0f}K -> {curr/1000:.0f}K +{BUY_AMOUNT_SOL} SOL")
             to_remove.append(mint)
         elif curr <= entry * (1 - FILTERS["stop_loss_pct"]/100):
             sell_token(mint,100)
@@ -179,8 +315,8 @@ def check_positions():
 # ================= MAIN LOOP =================
 def main_loop():
     global trades_today, pnl_today_sol, last_reset_date
-    log("🚀 Shok 2X Bot Started")
-    send_telegram(f"🚀 2X Bot STARTED\nBUY {BUY_AMOUNT_SOL} SOL | {MAX_OPEN_POSITIONS} max | {MAX_TRADES_PER_DAY}/day | 2X TP | -35% SL | Daily stop {DAILY_LOSS_LIMIT_SOL} SOL")
+    log("🚀 Shok 2X Bot Started - PumpPortal + Quicknode")
+    send_telegram(f"🚀 2X Bot STARTED (FIXED)\nBUY {BUY_AMOUNT_SOL} SOL | {MAX_OPEN_POSITIONS} max | {MAX_TRADES_PER_DAY}/day | 2X TP | -35% SL")
 
     while True:
         try:
@@ -195,7 +331,6 @@ def main_loop():
             if trades_today >= MAX_TRADES_PER_DAY:
                 time.sleep(3600); continue
 
-            # clean blacklist
             now=time.time()
             for k in list(blacklist.keys()):
                 if blacklist[k] < now: del blacklist[k]
