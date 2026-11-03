@@ -208,35 +208,33 @@ def buy_token(mint):
             log("No keypair")
             return None
         pubkey=str(kp.pubkey())
-        # FIXED: boolean True, not "true", priorityFee lowered, proper error log
         resp=requests.post("https://pumpportal.fun/api/trade-local", json={
-            "publicKey":pubkey,
-            "action":"buy",
-            "mint":mint,
-            "denominatedInSol": True,  # FIX 1: was "true"
+            "publicKey": pubkey,
+            "action": "buy",
+            "mint": mint,
+            "denominatedInSol": "true",  # STRING - per official docs
             "amount": BUY_AMOUNT_SOL,
             "slippage": 30,
-            "priorityFee": 0.0001,  # FIX 2: was 0.002 too high
-            "pool":"pump"
+            "priorityFee": 0.00005,  # lower - 0.002 causes 400
+            "pool": "auto"  # auto not pump - fixes migrated tokens
         }, timeout=15)
         if resp.status_code!=200:
-            log(f"Buy err {resp.status_code} {resp.text[:200]}")
-            send_telegram(f"❌ Buy err {resp.status_code} {resp.text[:100]}")
+            log(f"Buy err {resp.status_code} {resp.text[:500]}")
+            send_telegram(f"❌ Buy {resp.status_code}: {resp.text[:300]}")
             return None
-        # FIX 3: handle both binary and base64 json response
-        tx_bytes = None
+        
+        # Parse transaction - can be raw base64 or json
+        tx_b64 = resp.text.strip().strip('"')
         try:
-            # try json with base64 inside
             j = resp.json()
             if isinstance(j, dict) and "transaction" in j:
-                tx_bytes = base64.b64decode(j["transaction"])
+                tx_b64 = j["transaction"]
             elif isinstance(j, str):
-                tx_bytes = base64.b64decode(j)
-            else:
-                tx_bytes = resp.content
+                tx_b64 = j
         except:
-            tx_bytes = resp.content
+            pass
 
+        tx_bytes = base64.b64decode(tx_b64)
         vtx=VersionedTransaction.from_bytes(tx_bytes)
         signed_vtx=VersionedTransaction(vtx.message,[kp])
         sig=send_tx_via_rpc(base64.b64encode(bytes(signed_vtx)).decode())
@@ -244,6 +242,7 @@ def buy_token(mint):
         return sig
     except Exception as e:
         log(f"Buy fail {e}\n{traceback.format_exc()}")
+        send_telegram(f"❌ Buy crash {e}")
         return None
 
 def sell_token(mint, slippage=30, tries=1):
@@ -252,33 +251,28 @@ def sell_token(mint, slippage=30, tries=1):
             kp=get_keypair()
             pubkey=str(kp.pubkey())
             use_slip = 50 if attempt>0 else slippage
-            # FIXED: boolean False not "false"
             resp=requests.post("https://pumpportal.fun/api/trade-local", json={
-                "publicKey":pubkey,
-                "action":"sell",
-                "mint":mint,
-                "amount":"100%",
-                "denominatedInSol": False,  # FIX 4: was "false"
-                "slippage":use_slip,
-                "priorityFee":0.0005,
-                "pool":"pump"
+                "publicKey": pubkey,
+                "action": "sell",
+                "mint": mint,
+                "amount": "100%",
+                "denominatedInSol": "false",  # STRING
+                "slippage": use_slip,
+                "priorityFee": 0.00005,
+                "pool": "auto"
             }, timeout=15)
             if resp.status_code!=200: 
-                log(f"Sell err {resp.text[:120]} try {attempt}")
+                log(f"Sell err {resp.text[:200]} try {attempt}")
                 time.sleep(0.5)
                 continue
-            tx_bytes = None
+            tx_b64 = resp.text.strip().strip('"')
             try:
                 j = resp.json()
                 if isinstance(j, dict) and "transaction" in j:
-                    tx_bytes = base64.b64decode(j["transaction"])
-                elif isinstance(j, str):
-                    tx_bytes = base64.b64decode(j)
-                else:
-                    tx_bytes = resp.content
+                    tx_b64 = j["transaction"]
             except:
-                tx_bytes = resp.content
-
+                pass
+            tx_bytes = base64.b64decode(tx_b64)
             vtx=VersionedTransaction.from_bytes(tx_bytes)
             signed_vtx=VersionedTransaction(vtx.message,[kp])
             sig=send_tx_via_rpc(base64.b64encode(bytes(signed_vtx)).decode())
@@ -437,7 +431,7 @@ def main_loop():
                 if ok:
                     log(f"REVISIT PASS {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f} -> BUYING")
                     tx=buy_token(mint)
-                    if tx and len(tx) > 20:  # FIX 5: only add if real sig
+                    if tx and len(tx) > 20:
                         open_positions[mint]={"entry_mcap":t["mcap"],"symbol":t["symbol"],"entry_time":time.time()}
                         del watchlist[mint]; trades_today+=1
                         send_telegram(f"💰 BUY (REVISIT) {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f}\n{t['mint']}")
@@ -457,7 +451,7 @@ def main_loop():
                         continue
                     log(f"PASS {t['symbol']} MC {t['mcap']/1000:.0f}K LIQ ${t['liquidity']/1000:.0f}K VOL {t['volume_5m']:.0f} -> BUYING")
                     tx=buy_token(t["mint"])
-                    if tx and len(tx) > 20:  # FIX 5: only add if real sig
+                    if tx and len(tx) > 20:
                         open_positions[t["mint"]]={"entry_mcap":t["mcap"],"symbol":t["symbol"],"entry_time":time.time()}
                         trades_today+=1
                         send_telegram(f"💰 BUY {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f}\n{t['mint']}")
