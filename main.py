@@ -87,7 +87,7 @@ def set_telegram_commands():
 def health(): 
     return {"status":"alive" if bot_running else "paused","open":len(open_positions),"watchlist":len(watchlist),"trades":trades_today,"pnl":pnl_today_sol,"wins":total_wins,"losses":total_losses,"bought_ever":len(bought_ever)},200
 @app.route("/")
-def home(): return "Shok v5 - REAL NAME + PUMP+RAYDIUM + NO REBUY",200
+def home(): return "Shok v6 - FIX 6063 + ? + NO LOOP",200
 def run_flask(): app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)), debug=False)
 
 def get_rug_data(mint):
@@ -115,29 +115,32 @@ def get_rug_data(mint):
         return None
 
 def fetch_token_data(mint):
-    # FIX FOR ? NAME + LAG: pump.fun first (instant name + mcap)
+    # 1. Pump.fun PRIMARY - instant symbol + mcap (fixes ?)
     try:
         r=requests.get(f"https://frontend-api-v3.pump.fun/coins/{mint}", timeout=4, headers={"User-Agent":"Mozilla/5.0","Origin":"https://pump.fun"})
         if r.status_code==200:
             j=r.json()
             mcap=float(j.get("usd_market_cap",0) or 0)
             symbol=str(j.get("symbol","?"))[:12]
-            if mcap>1000:
-                return {"mcap":mcap,"liquidity":30000,"volume_5m":0,"symbol":symbol}
+            if mcap>1000 and symbol!="?":
+                return {"mcap":mcap,"liquidity":35000,"volume_5m":0,"symbol":symbol, "source":"pump"}
     except: pass
-    # Fallback Dexscreener
+    # 2. Dexscreener fallback for Raydium
     try:
         r=requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=4)
         j=r.json()
         pairs=j.get("pairs",[])
         if pairs:
             p=sorted(pairs, key=lambda x: float(x.get("liquidity",{}).get("usd",0)), reverse=True)[0]
-            return {
-                "mcap": float(p.get("fdv", p.get("marketCap",0)) or 0),
-                "liquidity": float(p.get("liquidity",{}).get("usd",0) or 0),
-                "volume_5m": float(p.get("volume",{}).get("m5",0) or 0),
-                "symbol": str(p.get("baseToken",{}).get("symbol","?"))[:12]
-            }
+            sym = str(p.get("baseToken",{}).get("symbol","?"))[:12]
+            if sym and sym!="?":
+                return {
+                    "mcap": float(p.get("fdv", p.get("marketCap",0)) or 0),
+                    "liquidity": float(p.get("liquidity",{}).get("usd",0) or 0),
+                    "volume_5m": float(p.get("volume",{}).get("m5",0) or 0),
+                    "symbol": sym,
+                    "source":"dex"
+                }
     except: pass
     return None
 
@@ -153,49 +156,44 @@ def fetch_new_tokens():
                 try:
                     mint=c.get("mint")
                     if not mint or mint in BIG or mint in blacklist or mint in open_positions or mint in bought_ever: continue
-                    # FIX: get REAL name from pump.fun directly, not Dex
                     pump_symbol=str(c.get("symbol","?"))[:12]
+                    if pump_symbol=="?" or len(pump_symbol)<1: continue
                     mcap=float(c.get("usd_market_cap",0) or 0)
                     if mcap==0: continue
-                    # use pump data for speed, Dex for liquidity check
-                    real=fetch_token_data(mint)
-                    if not real:
-                        real={"mcap":mcap,"liquidity":30000,"volume_5m":0,"symbol":pump_symbol}
-                    else:
-                        # keep pump symbol if Dex returns ?
-                        if real["symbol"]=="?" and pump_symbol!="?":
-                            real["symbol"]=pump_symbol
-                    if not (FILTERS["mcap_min"] <= real["mcap"] <= FILTERS["mcap_max"]): continue
-                    if not (FILTERS["liquidity_min"] <= real["liquidity"] <= FILTERS["liquidity_max"]): continue
-                    if real["volume_5m"]>0 and real["volume_5m"] > real["mcap"] * FILTERS["fake_vol_ratio"]:
-                        log(f"SKIP FAKE VOL {real['symbol']} MC {real['mcap']/1000:.0f}K VOL {real['volume_5m']:.0f}")
-                        continue
+                    if not (FILTERS["mcap_min"] <= mcap <= FILTERS["mcap_max"]): continue
+                    
+                    # Use pump data directly for speed + name
+                    data_pf = {"mcap":mcap,"liquidity":35000,"volume_5m":0,"symbol":pump_symbol, "source":"pump"}
+                    
                     rug = get_rug_data(mint)
                     if rug:
                         if rug["is_rugged"]:
-                            log(f"RUG BLOCK {real['symbol']} score {rug['score']} {rug['risks']}")
+                            log(f"RUG BLOCK {pump_symbol} score {rug['score']}")
                             blacklist[mint]=time.time()+7200
                             continue
                         if rug["holders"] and rug["holders"] < FILTERS["holders_min"]: continue
                         if rug["top10_pct"] > FILTERS["top10_max_pct"]: continue
+                    
                     tokens.append({
                         "mint": mint,
-                        "symbol": real["symbol"],
-                        "mcap": real["mcap"],
-                        "liquidity": real["liquidity"],
-                        "volume_5m": real["volume_5m"],
+                        "symbol": pump_symbol,
+                        "mcap": data_pf["mcap"],
+                        "liquidity": data_pf["liquidity"],
+                        "volume_5m": data_pf["volume_5m"],
                         "holders": rug["holders"] if rug and rug["holders"] else 85,
                         "bundle_pct": rug["bundle_pct"] if rug else 0,
                         "insiders_pct": rug["insiders_pct"] if rug else 0,
                         "top10_pct": rug["top10_pct"] if rug else 20,
                         "buyers_5m": 12, "sellers_5m": 8, "lp_burnt_pct": 100, "lp_locked": True,
-                        "rug_score": rug["score"] if rug else 0
+                        "rug_score": rug["score"] if rug else 0,
+                        "is_pump": True
                     })
                 except: continue
             if tokens:
                 log(f"Found {len(tokens)} NEW from pump.fun")
                 return tokens
     except Exception as e: log(f"pump v3 fail {e}")
+    
     try:
         r=requests.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=10)
         if r.status_code==200:
@@ -204,15 +202,16 @@ def fetch_new_tokens():
                     mint=c.get("tokenAddress")
                     if not mint or mint in BIG or mint in blacklist or mint in open_positions or mint in bought_ever: continue
                     if c.get("chainId")!="solana": continue
-                    # Dex profiles - try pump.fun for real name first
-                    pf = fetch_token_data(mint)
-                    real = pf
-                    if not real: continue
+                    if mint.endswith("pump"): continue # already handled above, skip to avoid 6063
+                    
+                    real = fetch_token_data(mint)
+                    if not real or real.get("symbol","?")=="?": continue
                     if not (FILTERS["mcap_min"] <= real["mcap"] <= FILTERS["mcap_max"]): continue
                     if not (FILTERS["liquidity_min"] <= real["liquidity"] <= FILTERS["liquidity_max"]): continue
-                    if real["volume_5m"]>0 and real["volume_5m"] > real["mcap"] * FILTERS["fake_vol_ratio"]: continue
+                    
                     rug = get_rug_data(mint)
                     if rug and rug["is_rugged"]: continue
+                    
                     tokens.append({
                         "mint": mint,
                         "symbol": real["symbol"],
@@ -224,7 +223,8 @@ def fetch_new_tokens():
                         "insiders_pct": rug["insiders_pct"] if rug else 0,
                         "top10_pct": rug["top10_pct"] if rug else 20,
                         "buyers_5m": 12, "sellers_5m": 8, "lp_burnt_pct": 100, "lp_locked": True,
-                        "rug_score": rug["score"] if rug else 0
+                        "rug_score": rug["score"] if rug else 0,
+                        "is_pump": False
                     })
                 except: continue
             if tokens:
@@ -240,11 +240,15 @@ def passes_filters(t):
     if t["insiders_pct"] > FILTERS["insiders_max_pct"]: return False, f"Insiders {t['insiders_pct']}%", False
     if t["holders"] < FILTERS["holders_min"]: return False, f"Holders {t['holders']}", False
     if t["top10_pct"] > FILTERS["top10_max_pct"]: return False, f"Top10 {t['top10_pct']:.0f}%", False
-    if t["volume_5m"]>0 and t["volume_5m"] < FILTERS["volume_5m_min"]: return False, f"Vol5m {t['volume_5m']:.0f}", True
+    # FIX: fresh pump tokens have vol 0 - allow them, don't send to watchlist
+    if t.get("is_pump") and t["volume_5m"]==0:
+        pass
+    elif t["volume_5m"] < FILTERS["volume_5m_min"]:
+        return False, f"Vol5m {t['volume_5m']:.0f}", True
     if t["buyers_5m"] < t["sellers_5m"] * FILTERS["buyers_vs_sellers"]: return False, f"B/S", False
     if not (t["lp_locked"] or t["lp_burnt_pct"] >= FILTERS["lp_burnt_min_pct"]): return False, "LP", False
-    if t["volume_5m"]>0 and t["volume_5m"] > t["mcap"] * FILTERS["fake_vol_ratio"]: return False, f"FakeVol {t['volume_5m']/1000:.0f}K>{t['mcap']/1000:.0f}K", False
-    if t.get("rug_score",0) > FILTERS["rug_score_max"]: return False, f"RugScore {t['rug_score']}", False
+    if t["volume_5m"]>0 and t["volume_5m"] > t["mcap"] * FILTERS["fake_vol_ratio"]: return False, f"FakeVol", False
+    if t.get("rug_score",0) > FILTERS["rug_score_max"]: return False, f"RugScore", False
     return True, "PASS", False
 
 def get_keypair():
@@ -260,7 +264,9 @@ def send_tx_via_rpc(signed_tx_b64):
         sig = j.get("result")
         if not sig:
             log(f"RPC err {j}")
-            send_telegram(f"❌ RPC {j}")
+            # Don't spam telegram for simulation fails (6063)
+            if "6063" not in str(j) and "Unsupported" not in str(j):
+                send_telegram(f"❌ RPC {str(j)[:300]}")
             return None
         log(f"Sent {sig[:20]} waiting confirm...")
         for _ in range(12):
@@ -271,7 +277,6 @@ def send_tx_via_rpc(signed_tx_b64):
                 if val:
                     if val.get("err"):
                         log(f"TX FAILED {val.get('err')}")
-                        send_telegram(f"❌ TX Failed {val.get('err')}")
                         return None
                     if val.get("confirmationStatus") in ("confirmed","finalized"):
                         log(f"TX CONFIRMED {val.get('confirmationStatus')}")
@@ -283,15 +288,21 @@ def send_tx_via_rpc(signed_tx_b64):
         log(f"RPC fail {e}")
         return None
 
-def buy_token(mint):
-    log(f"BUY {mint[:8]} {BUY_AMOUNT_SOL} SOL trying pump+raydium")
+def buy_token(mint, is_pump=True):
+    log(f"BUY {mint[:8]} {BUY_AMOUNT_SOL} SOL is_pump={is_pump}")
     try:
         kp=get_keypair()
         if not kp: return None
         pubkey=str(kp.pubkey())
-        for pool_type in ["auto", "pump", "raydium"]:
+        
+        # FIX 6063: select pool based on token type
+        if is_pump or mint.endswith("pump"):
+            pools = [("pump", 35), ("auto", 40)]  # pump first
+        else:
+            pools = [("raydium", 60), ("auto", 60)]  # raydium only, high slippage
+        
+        for pool_type, slippage in pools:
             try:
-                slippage = 30 if pool_type=="pump" else 40
                 resp=requests.post("https://pumpportal.fun/api/trade-local", json={
                     "publicKey": pubkey,
                     "action": "buy",
@@ -299,9 +310,10 @@ def buy_token(mint):
                     "denominatedInSol": "true",
                     "amount": BUY_AMOUNT_SOL,
                     "slippage": slippage,
-                    "priorityFee": 0.001,
+                    "priorityFee": 0.002,
                     "pool": pool_type
-                }, timeout=15)
+                }, timeout=20)
+                
                 if resp.status_code==200:
                     try:
                         vtx = VersionedTransaction.from_bytes(resp.content)
@@ -319,20 +331,30 @@ def buy_token(mint):
                     sig=send_tx_via_rpc(base64.b64encode(bytes(signed_vtx)).decode())
                     if sig:
                         log(f"BUY TX {sig} pool={pool_type}")
-                        send_telegram(f"✅ BUY {pool_type}\nhttps://solscan.io/tx/{sig}")
+                        send_telegram(f"✅ BUY {pool_type} {mint[:4]}\nhttps://solscan.io/tx/{sig}")
                         return sig
-                else:
-                    err=resp.text[:500]
-                    log(f"Buy {pool_type} err {resp.status_code} {err} {mint[:8]}")
-                    if resp.status_code==400 and pool_type!="raydium":
-                        time.sleep(0.5)
-                        continue
                     else:
-                        if resp.status_code==400:
-                            blacklist[mint]=time.time()+1200
+                        # simulation failed (likely 6063), try next pool
+                        log(f"Buy sim fail pool={pool_type}, trying next")
+                        continue
+                else:
+                    err=resp.text[:800]
+                    log(f"Buy {pool_type} err {resp.status_code} {err[:300]} {mint[:8]}")
+                    # 6063 = wrong pool, try next
+                    if "6063" in err or "UnsupportedQuoteMint" in err:
+                        log(f"6063 detected, switching pool")
+                        time.sleep(0.3)
+                        continue
+                    if resp.status_code==400:
+                        # Dead Raydium token - blacklist permanently
+                        if not is_pump:
+                            log(f"Dead Raydium {mint[:8]} -> permanent blacklist")
+                            blacklist[mint]=time.time()+9999999
+                            bought_ever.add(mint)
+                        else:
+                            blacklist[mint]=time.time()+1800
                         send_telegram(f"❌ Buy {pool_type} {mint[:8]}: {err[:200]}")
-                        if pool_type=="raydium":
-                            return None
+                        return None
             except Exception as e:
                 log(f"Buy pool {pool_type} exception {e}")
                 continue
@@ -342,12 +364,14 @@ def buy_token(mint):
         send_telegram(f"❌ Buy crash {e}")
         return None
 
-def sell_token(mint, slippage=30, tries=1):
+def sell_token(mint, slippage=30, tries=2):
+    is_pump = mint.endswith("pump")
+    pools = ["pump","auto"] if is_pump else ["raydium","auto"]
     for attempt in range(tries):
-        for pool_type in ["auto", "pump", "raydium"]:
+        for pool_type in pools:
             try:
                 kp=get_keypair(); pubkey=str(kp.pubkey())
-                use_slip = 50 if attempt>0 else (40 if pool_type=="raydium" else slippage)
+                use_slip = 70 if not is_pump else (50 if attempt>0 else slippage)
                 resp=requests.post("https://pumpportal.fun/api/trade-local", json={
                     "publicKey": pubkey,
                     "action": "sell",
@@ -355,9 +379,9 @@ def sell_token(mint, slippage=30, tries=1):
                     "amount": "100%",
                     "denominatedInSol": "false",
                     "slippage": use_slip,
-                    "priorityFee": 0.001,
+                    "priorityFee": 0.002,
                     "pool": pool_type
-                }, timeout=15)
+                }, timeout=20)
                 if resp.status_code!=200:
                     log(f"Sell {pool_type} err {resp.text[:200]} try {attempt}")
                     continue
@@ -376,7 +400,7 @@ def sell_token(mint, slippage=30, tries=1):
                     return sig
             except Exception as e:
                 log(f"Sell {pool_type} fail {attempt} {e}")
-        time.sleep(0.5)
+        time.sleep(1)
     return None
 
 def check_positions():
@@ -385,7 +409,6 @@ def check_positions():
     for mint,pos in list(open_positions.items()):
         data=fetch_token_data(mint)
         if not data: continue
-        # FIX ? NAME: update if was ?
         if pos["symbol"]=="?" and data["symbol"]!="?":
             pos["symbol"]=data["symbol"]
             log(f"Symbol resolved {mint[:4]} -> {data['symbol']}")
@@ -394,7 +417,7 @@ def check_positions():
         log(f"CHECK {pos['symbol']} {entry/1000:.0f}K -> {curr/1000:.0f}K ({pct:+.0f}%)")
         if curr >= entry * FILTERS["take_profit_x"]:
             log(f"2X HIT {pos['symbol']} TRY SELL")
-            sig = sell_token(mint, slippage=30, tries=3)
+            sig = sell_token(mint, slippage=40, tries=3)
             if sig:
                 pnl_today_sol+=BUY_AMOUNT_SOL; total_wins+=1
                 trade_history.append({"symbol":pos['symbol'],"entry":entry,"exit":curr,"pnl":BUY_AMOUNT_SOL,"result":"WIN","time":datetime.now().strftime("%H:%M")})
@@ -403,9 +426,9 @@ def check_positions():
                 bought_ever.add(mint)
                 blacklist[mint]=time.time()+9999999
             else:
-                send_telegram(f"⚠️ 2X HIT but SELL FAILED {pos['symbol']} - retrying...")
+                send_telegram(f"⚠️ 2X HIT but SELL FAILED {pos['symbol']}")
         elif curr <= entry * (1 - FILTERS["emergency_rug_pct"]/100):
-            sig = sell_token(mint, slippage=50, tries=4)
+            sig = sell_token(mint, slippage=60, tries=4)
             if sig:
                 loss=BUY_AMOUNT_SOL*0.5; pnl_today_sol-=loss; total_losses+=1
                 blacklist[mint]=time.time()+9999999; bought_ever.add(mint)
@@ -413,7 +436,7 @@ def check_positions():
                 send_telegram(f"🚨 RUG SELL {pos['symbol']}\n{entry/1000:.0f}K -> {curr/1000:.0f}K\n-{loss:.3f} SOL\nhttps://solscan.io/tx/{sig}")
                 to_remove.append(mint)
         elif curr <= entry * (1 - FILTERS["stop_loss_pct"]/100):
-            sig = sell_token(mint, slippage=40, tries=3)
+            sig = sell_token(mint, slippage=50, tries=3)
             if sig:
                 loss=BUY_AMOUNT_SOL*0.35; pnl_today_sol-=loss; total_losses+=1
                 blacklist[mint]=time.time()+9999999; bought_ever.add(mint)
@@ -507,8 +530,8 @@ def handle_telegram_commands():
 def main_loop():
     global trades_today,pnl_today_sol,last_reset_date
     set_telegram_commands()
-    log(f"🚀 BOT v5 - REAL NAME + PUMP+RAYDIUM")
-    send_telegram(f"🚀 BOT v5 LIVE\n✅ Real name (no ?)\n✅ Pump+Raydium\n✅ Never rebuy\n✅ 400 loop fixed")
+    log(f"🚀 BOT v6 - FIX 6063 + ? + NO LOOP")
+    send_telegram(f"🚀 BOT v6 LIVE\n✅ Real name fix\n✅ 6063 fix (smart pool)\n✅ No rebuy\n✅ No 400 loop")
     while True:
         try:
             if not bot_running: time.sleep(5); continue
@@ -528,17 +551,17 @@ def main_loop():
                 data=fetch_token_data(mint)
                 if not data: continue
                 rug = get_rug_data(mint)
-                t={"mint":mint,"symbol":watchlist[mint]["symbol"],"mcap":data["mcap"],"liquidity":data["liquidity"],"volume_5m":data["volume_5m"],"holders":rug["holders"] if rug and rug["holders"] else 85,"bundle_pct":rug["bundle_pct"] if rug else 0,"insiders_pct":rug["insiders_pct"] if rug else 0,"top10_pct":rug["top10_pct"] if rug else 20,"buyers_5m":12,"sellers_5m":8,"lp_burnt_pct":100,"lp_locked":True,"rug_score":rug["score"] if rug else 0}
+                t={"mint":mint,"symbol":watchlist[mint]["symbol"],"mcap":data["mcap"],"liquidity":data["liquidity"],"volume_5m":data["volume_5m"],"holders":rug["holders"] if rug and rug["holders"] else 85,"bundle_pct":rug["bundle_pct"] if rug else 0,"insiders_pct":rug["insiders_pct"] if rug else 0,"top10_pct":rug["top10_pct"] if rug else 20,"buyers_5m":12,"sellers_5m":8,"lp_burnt_pct":100,"lp_locked":True,"rug_score":rug["score"] if rug else 0, "is_pump": mint.endswith("pump")}
                 ok,reason,is_vol_fail = passes_filters(t)
                 if ok:
-                    log(f"REVISIT PASS {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f} -> BUYING")
-                    tx=buy_token(mint)
+                    log(f"REVISIT PASS {t['symbol']} MC {t['mcap']/1000:.0f}K -> BUYING")
+                    tx=buy_token(mint, is_pump=t["is_pump"])
                     if tx and len(tx) > 20:
                         open_positions[mint]={"entry_mcap":t["mcap"],"symbol":t["symbol"],"entry_time":time.time()}
                         bought_ever.add(mint)
                         blacklist[mint]=time.time()+9999999
                         del watchlist[mint]; trades_today+=1
-                        send_telegram(f"💰 BUY (REVISIT) {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f}\n{t['mint']}")
+                        send_telegram(f"💰 BUY (REVISIT) {t['symbol']} MC {t['mcap']/1000:.0f}K\n{t['mint']}")
                 elif not is_vol_fail:
                     del watchlist[mint]
             if len(open_positions) < MAX_OPEN_POSITIONS:
@@ -547,19 +570,18 @@ def main_loop():
                     if t["mint"] in open_positions or t["mint"] in blacklist or t["mint"] in watchlist or t["mint"] in bought_ever: continue
                     ok,reason,is_vol_fail = passes_filters(t)
                     if not ok:
-                        log(f"Filter fail {t['symbol']} {t['mcap']/1000:.0f}K - {reason}")
-                        if is_vol_fail and t["mcap"] >= 80000:
+                        if is_vol_fail:
                             if t["mint"] not in bought_ever:
                                 watchlist[t["mint"]]={"symbol":t["symbol"],"first_seen":time.time()}
                         continue
-                    log(f"PASS {t['symbol']} MC {t['mcap']/1000:.0f}K LIQ ${t['liquidity']/1000:.0f}K VOL {t['volume_5m']:.0f} RUG {t.get('rug_score',0)} -> BUYING")
-                    tx=buy_token(t["mint"])
+                    log(f"PASS {t['symbol']} MC {t['mcap']/1000:.0f}K LIQ ${t['liquidity']/1000:.0f}K RUG {t.get('rug_score',0)} -> BUYING")
+                    tx=buy_token(t["mint"], is_pump=t.get("is_pump", True))
                     if tx and len(tx) > 20:
                         open_positions[t["mint"]]={"entry_mcap":t["mcap"],"symbol":t["symbol"],"entry_time":time.time()}
                         bought_ever.add(t["mint"])
                         blacklist[t["mint"]]=time.time()+9999999
                         trades_today+=1
-                        send_telegram(f"💰 BUY {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f} RUG {t.get('rug_score',0)}\n{t['mint']}")
+                        send_telegram(f"💰 BUY {t['symbol']} MC {t['mcap']/1000:.0f}K RUG {t.get('rug_score',0)}\n{t['mint']}")
                         if len(open_positions)>=MAX_OPEN_POSITIONS: break
                     time.sleep(1)
             time.sleep(3)
