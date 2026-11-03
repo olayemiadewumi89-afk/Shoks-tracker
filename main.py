@@ -45,6 +45,7 @@ total_wins = 0
 total_losses = 0
 bot_running = True
 last_reset_date = date.today()
+bought_ever = set()  # <-- FIX 1: permanent memory
 app = Flask(__name__)
 
 def log(msg): print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -84,9 +85,9 @@ def set_telegram_commands():
 
 @app.route("/health")
 def health(): 
-    return {"status":"alive" if bot_running else "paused","open":len(open_positions),"watchlist":len(watchlist),"trades":trades_today,"pnl":pnl_today_sol,"wins":total_wins,"losses":total_losses},200
+    return {"status":"alive" if bot_running else "paused","open":len(open_positions),"watchlist":len(watchlist),"trades":trades_today,"pnl":pnl_today_sol,"wins":total_wins,"losses":total_losses,"bought_ever":len(bought_ever)},200
 @app.route("/")
-def home(): return "Shok STRICT REAL BOT v3 - RUGCHECK + 2X FIX",200
+def home(): return "Shok v4 - NEVER REBUY FIX",200
 def run_flask(): app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)), debug=False)
 
 def get_rug_data(mint):
@@ -139,7 +140,7 @@ def fetch_new_tokens():
             for c in data:
                 try:
                     mint=c.get("mint")
-                    if not mint or mint in BIG or mint in blacklist or mint in open_positions: continue
+                    if not mint or mint in BIG or mint in blacklist or mint in open_positions or mint in bought_ever: continue  # <-- FIX 2
                     real=fetch_token_data(mint)
                     if not real or real["mcap"]==0: 
                         mcap=float(c.get("usd_market_cap",0) or 0)
@@ -150,7 +151,6 @@ def fetch_new_tokens():
                     if real["volume_5m"] > real["mcap"] * FILTERS["fake_vol_ratio"]:
                         log(f"SKIP FAKE VOL {real['symbol']} MC {real['mcap']/1000:.0f}K VOL {real['volume_5m']:.0f}")
                         continue
-                    # REAL RUG CHECK
                     rug = get_rug_data(mint)
                     if rug:
                         if rug["is_rugged"]:
@@ -187,7 +187,7 @@ def fetch_new_tokens():
             for c in r.json()[:50]:
                 try:
                     mint=c.get("tokenAddress")
-                    if not mint or mint in BIG or mint in blacklist or mint in open_positions: continue
+                    if not mint or mint in BIG or mint in blacklist or mint in open_positions or mint in bought_ever: continue  # <-- FIX 2
                     if c.get("chainId")!="solana": continue
                     real=fetch_token_data(mint)
                     if not real or real["mcap"]==0: continue
@@ -366,6 +366,8 @@ def check_positions():
                 trade_history.append({"symbol":pos['symbol'],"entry":entry,"exit":curr,"pnl":BUY_AMOUNT_SOL,"result":"WIN","time":datetime.now().strftime("%H:%M")})
                 send_telegram(f"✅ 2X WIN {pos['symbol']}\n{entry/1000:.0f}K -> {curr/1000:.0f}K (+{pct:.0f}%)\n+{BUY_AMOUNT_SOL} SOL\nhttps://solscan.io/tx/{sig}")
                 to_remove.append(mint)
+                bought_ever.add(mint)  # <-- FIX 3 keep blocked
+                blacklist[mint]=time.time()+9999999  # permanent
             else:
                 send_telegram(f"⚠️ 2X HIT but SELL FAILED {pos['symbol']} - retrying in 2s")
         elif curr <= entry * (1 - FILTERS["emergency_rug_pct"]/100):
@@ -373,7 +375,8 @@ def check_positions():
             sig = sell_token(mint, slippage=50, tries=4)
             if sig:
                 loss=BUY_AMOUNT_SOL*0.5; pnl_today_sol-=loss; total_losses+=1
-                blacklist[mint]=time.time()+7200
+                blacklist[mint]=time.time()+9999999  # <-- FIX 3 permanent
+                bought_ever.add(mint)
                 trade_history.append({"symbol":pos['symbol'],"entry":entry,"exit":curr,"pnl":-loss,"result":"RUG","time":datetime.now().strftime("%H:%M")})
                 send_telegram(f"🚨 RUG SELL {pos['symbol']}\n{entry/1000:.0f}K -> {curr/1000:.0f}K\n-{loss:.3f} SOL\nhttps://solscan.io/tx/{sig}")
                 to_remove.append(mint)
@@ -382,7 +385,8 @@ def check_positions():
             sig = sell_token(mint, slippage=40, tries=3)
             if sig:
                 loss=BUY_AMOUNT_SOL*0.35; pnl_today_sol-=loss; total_losses+=1
-                blacklist[mint]=time.time()+7200
+                blacklist[mint]=time.time()+9999999  # <-- FIX 3 permanent
+                bought_ever.add(mint)
                 trade_history.append({"symbol":pos['symbol'],"entry":entry,"exit":curr,"pnl":-loss,"result":"LOSS","time":datetime.now().strftime("%H:%M")})
                 send_telegram(f"❌ SL {pos['symbol']}\n{entry/1000:.0f}K -> {curr/1000:.0f}K\n-{loss:.3f} SOL\nhttps://solscan.io/tx/{sig}")
                 to_remove.append(mint)
@@ -417,7 +421,7 @@ def handle_telegram_commands():
                 if text.startswith("/pnl"):
                     bal=get_balance_sol()
                     winrate = (total_wins/(total_wins+total_losses)*100) if (total_wins+total_losses)>0 else 0
-                    send_telegram(f"<b>📊 PnL</b>\nToday: {pnl_today_sol:+.4f} SOL\nBalance: {bal:.4f} SOL\nWins: {total_wins} Losses: {total_losses}\nWinRate: {winrate:.1f}%\nTrades today: {trades_today}/{MAX_TRADES_PER_DAY}")
+                    send_telegram(f"<b>📊 PnL</b>\nToday: {pnl_today_sol:+.4f} SOL\nBalance: {bal:.4f} SOL\nWins: {total_wins} Losses: {total_losses}\nWinRate: {winrate:.1f}%\nTrades today: {trades_today}/{MAX_TRADES_PER_DAY}\nBought ever: {len(bought_ever)}")
                 elif text.startswith("/positions") or text.startswith("/pos"):
                     if not open_positions:
                         send_telegram("No open positions")
@@ -442,7 +446,7 @@ def handle_telegram_commands():
                 elif text.startswith("/stats") or text.startswith("/winrate"):
                     total=total_wins+total_losses
                     winrate = (total_wins/total*100) if total>0 else 0
-                    txt=f"<b>📈 Stats</b>\nTotal trades: {total}\nWins: {total_wins} Losses: {total_losses}\nWinRate: {winrate:.1f}%\nPnL today: {pnl_today_sol:+.4f} SOL\n"
+                    txt=f"<b>📈 Stats</b>\nTotal trades: {total}\nWins: {total_wins} Losses: {total_losses}\nWinRate: {winrate:.1f}%\nPnL today: {pnl_today_sol:+.4f} SOL\nBought ever: {len(bought_ever)}\n"
                     if trade_history:
                         txt+="\nLast 5:\n"
                         for t in trade_history[-5:]:
@@ -472,8 +476,8 @@ def handle_telegram_commands():
 def main_loop():
     global trades_today,pnl_today_sol,last_reset_date
     set_telegram_commands()
-    log(f"🚀 REAL BUY BOT v3 - RUGCHECK + 2X FIX")
-    send_telegram(f"🚀 BOT v3 LIVE\nMC {FILTERS['mcap_min']/1000:.0f}K-{FILTERS['mcap_max']/1000:.0f}K VOL {FILTERS['volume_5m_min']/1000:.0f}K\n✅ Real RugCheck\n✅ 2X sell only if confirmed\n✅ FakeVol blocked")
+    log(f"🚀 BOT v4 NEVER REBUY")
+    send_telegram(f"🚀 BOT v4 LIVE - NEVER REBUY\nMC {FILTERS['mcap_min']/1000:.0f}K-{FILTERS['mcap_max']/1000:.0f}K VOL {FILTERS['volume_5m_min']/1000:.0f}K\n✅ Never rebuy same mint")
     while True:
         try:
             if not bot_running: time.sleep(5); continue
@@ -484,9 +488,11 @@ def main_loop():
             if trades_today >= MAX_TRADES_PER_DAY: time.sleep(3600); continue
             now=time.time()
             for k in list(blacklist.keys()):
-                if blacklist[k] < now: del blacklist[k]
+                if blacklist[k] < now and k not in bought_ever:  # <-- FIX 4 don't delete bought_ever
+                    del blacklist[k]
             for mint in list(watchlist.keys()):
-                if mint in open_positions or mint in blacklist: del watchlist[mint]; continue
+                if mint in open_positions or mint in blacklist or mint in bought_ever:  # <-- FIX 5
+                    del watchlist[mint]; continue
                 if now - watchlist[mint]["first_seen"] > 1800: del watchlist[mint]; continue
                 data=fetch_token_data(mint)
                 if not data: continue
@@ -510,6 +516,8 @@ def main_loop():
                     tx=buy_token(mint)
                     if tx and len(tx) > 20:
                         open_positions[mint]={"entry_mcap":t["mcap"],"symbol":t["symbol"],"entry_time":time.time()}
+                        bought_ever.add(mint)  # <-- FIX 5
+                        blacklist[mint]=time.time()+9999999
                         del watchlist[mint]; trades_today+=1
                         send_telegram(f"💰 BUY (REVISIT) {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f}\n{t['mint']}")
                 elif not is_vol_fail:
@@ -517,18 +525,21 @@ def main_loop():
             if len(open_positions) < MAX_OPEN_POSITIONS:
                 tokens=fetch_new_tokens()
                 for t in tokens:
-                    if t["mint"] in open_positions or t["mint"] in blacklist or t["mint"] in watchlist: continue
+                    if t["mint"] in open_positions or t["mint"] in blacklist or t["mint"] in watchlist or t["mint"] in bought_ever: continue  # <-- FIX 5
                     ok,reason,is_vol_fail = passes_filters(t)
                     if not ok:
                         log(f"Filter fail {t['symbol']} {t['mcap']/1000:.0f}K - {reason}")
                         if is_vol_fail and t["mcap"] >= 80000:
-                            watchlist[t["mint"]]={"symbol":t["symbol"],"first_seen":time.time()}
-                            log(f" -> WATCHLIST {t['symbol']} waiting VOL 10K (now {t['volume_5m']:.0f})")
+                            if t["mint"] not in bought_ever:
+                                watchlist[t["mint"]]={"symbol":t["symbol"],"first_seen":time.time()}
+                                log(f" -> WATCHLIST {t['symbol']} waiting VOL 10K (now {t['volume_5m']:.0f})")
                         continue
                     log(f"PASS {t['symbol']} MC {t['mcap']/1000:.0f}K LIQ ${t['liquidity']/1000:.0f}K VOL {t['volume_5m']:.0f} RUG {t.get('rug_score',0)} -> BUYING")
                     tx=buy_token(t["mint"])
                     if tx and len(tx) > 20:
                         open_positions[t["mint"]]={"entry_mcap":t["mcap"],"symbol":t["symbol"],"entry_time":time.time()}
+                        bought_ever.add(t["mint"])  # <-- FIX 5
+                        blacklist[t["mint"]]=time.time()+9999999
                         trades_today+=1
                         send_telegram(f"💰 BUY {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f} RUG {t.get('rug_score',0)}\n{t['mint']}")
                         if len(open_positions)>=MAX_OPEN_POSITIONS: break
