@@ -29,13 +29,15 @@ FILTERS = {
     "top10_max_pct": 30,
     "volume_5m_min": 10000,
     "stop_loss_pct": 35,
-    "take_profit_x": 2.0,
+    "take_profit_x": 2.0,  # LEFT AT 2X AS YOU ASKED
+    "emergency_rug_pct": 50,  # NEW: if -50% instant sell
+    "fake_vol_ratio": 1.2, # NEW: block VOL > MC*1.2
 }
 
 open_positions = {}
 blacklist = {}
-watchlist = {}  # mint -> {symbol, first_seen, last_vol}
-trade_history = [] # {symbol, entry, exit, pnl, result, time}
+watchlist = {}
+trade_history = []
 trades_today = 0
 pnl_today_sol = 0.0
 total_wins = 0
@@ -57,11 +59,9 @@ def get_balance_sol():
         if not kp: return 0
         payload={"jsonrpc":"2.0","id":1,"method":"getBalance","params":[str(kp.pubkey())]}
         r=requests.post(RPC_URL, json=payload, timeout=8).json()
-        lamports = r.get("result",{}).get("value",0)
-        return lamports/1e9
+        return r.get("result",{}).get("value",0)/1e9
     except: return 0
 
-# === FIX FOR YOUR SCREENSHOT - OVERWRITE OLD /bundle MENU ===
 def set_telegram_commands():
     try:
         if not BOT_TOKEN: return
@@ -77,28 +77,20 @@ def set_telegram_commands():
             {"command":"help","description":"Show commands"}
         ]
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands", json={"commands": cmds}, timeout=10)
-        log("TG menu overwritten - old /bundle cleared")
+        log("TG menu fixed")
     except Exception as e:
         log(f"setMyCommands fail {e}")
 
 @app.route("/health")
 def health(): 
-    return {
-        "status":"alive" if bot_running else "paused",
-        "open":len(open_positions),
-        "watchlist":len(watchlist),
-        "trades":trades_today,
-        "pnl":pnl_today_sol,
-        "wins":total_wins,
-        "losses":total_losses
-    },200
+    return {"status":"alive" if bot_running else "paused","open":len(open_positions),"watchlist":len(watchlist),"trades":trades_today,"pnl":pnl_today_sol,"wins":total_wins,"losses":total_losses},200
 @app.route("/")
-def home(): return "Shok STRICT REAL BOT v2",200
+def home(): return "Shok STRICT REAL BOT v2 - 2X + RUG FIX",200
 def run_flask(): app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)), debug=False)
 
 def fetch_token_data(mint):
     try:
-        r=requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=6)
+        r=requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=4)
         j=r.json()
         pairs=j.get("pairs",[])
         if not pairs: return None
@@ -130,6 +122,10 @@ def fetch_new_tokens():
                         real={"mcap":mcap,"liquidity":30000,"volume_5m":0,"symbol":c.get("symbol","?")}
                     if not (FILTERS["mcap_min"] <= real["mcap"] <= FILTERS["mcap_max"]): continue
                     if not (FILTERS["liquidity_min"] <= real["liquidity"] <= FILTERS["liquidity_max"]): continue
+                    # NEW: fake vol block
+                    if real["volume_5m"] > real["mcap"] * FILTERS["fake_vol_ratio"]:
+                        log(f"SKIP FAKE VOL {real['symbol']} MC {real['mcap']/1000:.0f}K VOL {real['volume_5m']:.0f}")
+                        continue
                     tokens.append({
                         "mint": mint,
                         "symbol": str(real.get("symbol") or c.get("symbol","?"))[:12],
@@ -156,6 +152,7 @@ def fetch_new_tokens():
                     if not real or real["mcap"]==0: continue
                     if not (FILTERS["mcap_min"] <= real["mcap"] <= FILTERS["mcap_max"]): continue
                     if not (FILTERS["liquidity_min"] <= real["liquidity"] <= FILTERS["liquidity_max"]): continue
+                    if real["volume_5m"] > real["mcap"] * FILTERS["fake_vol_ratio"]: continue
                     tokens.append({
                         "mint": mint,
                         "symbol": str(c.get("symbol","?") or real["symbol"])[:12],
@@ -182,6 +179,8 @@ def passes_filters(t):
     if t["volume_5m"] < FILTERS["volume_5m_min"]: return False, f"Vol5m {t['volume_5m']:.0f}", True
     if t["buyers_5m"] < t["sellers_5m"] * FILTERS["buyers_vs_sellers"]: return False, f"B/S", False
     if not (t["lp_locked"] or t["lp_burnt_pct"] >= FILTERS["lp_burnt_min_pct"]): return False, "LP", False
+    # NEW: fake vol inside filter too
+    if t["volume_5m"] > t["mcap"] * FILTERS["fake_vol_ratio"]: return False, f"FakeVol {t['volume_5m']/1000:.0f}K>{t['mcap']/1000:.0f}K", False
     return True, "PASS", False
 
 def get_keypair():
@@ -208,32 +207,52 @@ def buy_token(mint):
         log(f"BUY TX {sig[:20] if sig else 'fail'}"); return sig
     except Exception as e: log(f"Buy fail {e}"); return None
 
-def sell_token(mint):
-    try:
-        kp=get_keypair(); pubkey=str(kp.pubkey())
-        resp=requests.post("https://pumpportal.fun/api/trade-local", json={"publicKey":pubkey,"action":"sell","mint":mint,"amount":"100%","denominatedInSol":"false","slippage":30,"priorityFee":0.002,"pool":"pump"}, timeout=15)
-        if resp.status_code!=200: return None
-        vtx=VersionedTransaction.from_bytes(resp.content)
-        signed_vtx=VersionedTransaction(vtx.message,[kp])
-        sig=send_tx_via_rpc(base64.b64encode(bytes(signed_vtx)).decode())
-        log(f"SELL TX {sig[:20] if sig else 'fail'}"); return sig
-    except Exception as e: log(f"Sell fail {e}"); return None
+def sell_token(mint, slippage=30, tries=1):
+    # IMPROVED: retry + higher slippage for rugs
+    for attempt in range(tries):
+        try:
+            kp=get_keypair(); pubkey=str(kp.pubkey())
+            use_slip = 50 if attempt>0 else slippage
+            resp=requests.post("https://pumpportal.fun/api/trade-local", json={"publicKey":pubkey,"action":"sell","mint":mint,"amount":"100%","denominatedInSol":"false","slippage":use_slip,"priorityFee":0.005,"pool":"pump"}, timeout=15)
+            if resp.status_code!=200: 
+                log(f"Sell err {resp.text[:120]} try {attempt}")
+                time.sleep(0.5)
+                continue
+            vtx=VersionedTransaction.from_bytes(resp.content)
+            signed_vtx=VersionedTransaction(vtx.message,[kp])
+            sig=send_tx_via_rpc(base64.b64encode(bytes(signed_vtx)).decode())
+            if sig:
+                log(f"SELL TX {sig[:20]} slip {use_slip}% try {attempt}")
+                return sig
+        except Exception as e: 
+            log(f"Sell fail try {attempt} {e}")
+            time.sleep(0.5)
+    return None
 
 def check_positions():
     global pnl_today_sol, total_wins, total_losses
     to_remove=[]
-    for mint,pos in open_positions.items():
+    for mint,pos in list(open_positions.items()):
         data=fetch_token_data(mint)
         if not data: continue
         curr=data["mcap"]; entry=pos["entry_mcap"]
+        # 2X WIN - LEFT AT 2X
         if curr >= entry * FILTERS["take_profit_x"]:
-            sell_token(mint)
+            sell_token(mint, slippage=30, tries=2)
             pnl_today_sol+=BUY_AMOUNT_SOL; total_wins+=1
             trade_history.append({"symbol":pos['symbol'],"entry":entry,"exit":curr,"pnl":BUY_AMOUNT_SOL,"result":"WIN","time":datetime.now().strftime("%H:%M")})
             send_telegram(f"✅ 2X WIN {pos['symbol']}\n{entry/1000:.0f}K -> {curr/1000:.0f}K\n+{BUY_AMOUNT_SOL} SOL")
             to_remove.append(mint)
+        # EMERGENCY RUG - NEW: -50% instant
+        elif curr <= entry * (1 - FILTERS["emergency_rug_pct"]/100):
+            sell_token(mint, slippage=50, tries=3)
+            loss=BUY_AMOUNT_SOL*0.5; pnl_today_sol-=loss; total_losses+=1
+            blacklist[mint]=time.time()+7200
+            trade_history.append({"symbol":pos['symbol'],"entry":entry,"exit":curr,"pnl":-loss,"result":"RUG","time":datetime.now().strftime("%H:%M")})
+            send_telegram(f"🚨 RUG SELL {pos['symbol']}\n{entry/1000:.0f}K -> {curr/1000:.0f}K\n-{loss:.3f} SOL (saved from 2K)")
+            to_remove.append(mint)
         elif curr <= entry * (1 - FILTERS["stop_loss_pct"]/100):
-            sell_token(mint)
+            sell_token(mint, slippage=40, tries=3)
             loss=BUY_AMOUNT_SOL*0.35; pnl_today_sol-=loss; total_losses+=1
             blacklist[mint]=time.time()+7200
             trade_history.append({"symbol":pos['symbol'],"entry":entry,"exit":curr,"pnl":-loss,"result":"LOSS","time":datetime.now().strftime("%H:%M")})
@@ -241,7 +260,17 @@ def check_positions():
             to_remove.append(mint)
     for m in to_remove: open_positions.pop(m,None)
 
-# ========== TELEGRAM COMMANDS ==========
+def positions_monitor_loop():
+    log("Fast monitor 2s started")
+    while True:
+        try:
+            if bot_running and open_positions:
+                check_positions()
+            time.sleep(2)
+        except Exception as e:
+            log(f"monitor err {e}")
+            time.sleep(2)
+
 def handle_telegram_commands():
     offset=0
     log("TG Command listener started")
@@ -314,9 +343,9 @@ def handle_telegram_commands():
 
 def main_loop():
     global trades_today,pnl_today_sol,last_reset_date
-    set_telegram_commands() # FIX: Overwrite old menu immediately
-    log(f"🚀 REAL BUY BOT v2 - MC {FILTERS['mcap_min']/1000:.0f}K-{FILTERS['mcap_max']/1000:.0f}K VOL {FILTERS['volume_5m_min']/1000:.0f}K REVISIT")
-    send_telegram(f"🚀 REAL BUY BOT v2 LIVE\nMC {FILTERS['mcap_min']/1000:.0f}K-{FILTERS['mcap_max']/1000:.0f}K LIQ {FILTERS['liquidity_min']/1000:.0f}K-{FILTERS['liquidity_max']/1000:.0f}K VOL {FILTERS['volume_5m_min']/1000:.0f}K\n✅ Watchlist REVISIT ON\n2X TP -35% SL\n\n<b>Commands:</b> /pnl /positions /watchlist /stats /balance")
+    set_telegram_commands()
+    log(f"🚀 REAL BUY BOT v2.1 - 2X TP + RUG FIX - MC {FILTERS['mcap_min']/1000:.0f}K-{FILTERS['mcap_max']/1000:.0f}K VOL {FILTERS['volume_5m_min']/1000:.0f}K")
+    send_telegram(f"🚀 REAL BUY BOT v2.1 LIVE\nMC {FILTERS['mcap_min']/1000:.0f}K-{FILTERS['mcap_max']/1000:.0f}K LIQ {FILTERS['liquidity_min']/1000:.0f}K-{FILTERS['liquidity_max']/1000:.0f}K VOL {FILTERS['volume_5m_min']/1000:.0f}K\n✅ 2X TP kept\n✅ Rug filter: VOL>MC blocked\n✅ Fast monitor 2s\n\n<b>Commands:</b> /pnl /positions /watchlist /stats /balance")
 
     while True:
         try:
@@ -376,14 +405,14 @@ def main_loop():
                         if len(open_positions)>=MAX_OPEN_POSITIONS: break
                     time.sleep(1)
 
-            check_positions()
-            time.sleep(6)
+            time.sleep(3) # main loop slower, monitor does fast checks
         except Exception as e:
             log(f"CRASH {e}\n{traceback.format_exc()}"); time.sleep(10)
 
 if __name__=="__main__":
     threading.Thread(target=run_flask,daemon=True).start()
     threading.Thread(target=handle_telegram_commands,daemon=True).start()
+    threading.Thread(target=positions_monitor_loop,daemon=True).start() # NEW FAST LOOP
     time.sleep(1)
     while True:
         try: main_loop()
