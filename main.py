@@ -88,7 +88,7 @@ def set_telegram_commands():
 def health(): 
     return {"status":"alive" if bot_running else "paused","open":len(open_positions),"watchlist":len(watchlist),"trades":trades_today,"pnl":pnl_today_sol,"wins":total_wins,"losses":total_losses,"bought_ever":len(bought_ever)},200
 @app.route("/")
-def home(): return "Shok v7.6 - FULL LIVE FIX",200
+def home(): return "Shok v7.7 - Render 429 FIX",200
 def run_flask(): app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)), debug=False)
 
 def get_rug_data(mint):
@@ -148,8 +148,7 @@ def fetch_token_data_batch(mints):
                     for p in pairs:
                         try:
                             mint = p.get("baseToken",{}).get("address")
-                            if not mint or mint in result: 
-                                continue
+                            if not mint or mint in result: continue
                             mcap = float(p.get("fdv", p.get("marketCap",0)) or 0)
                             vol5 = float(p.get("volume",{}).get("m5",0) or 0)
                             liq = float(p.get("liquidity",{}).get("usd",0) or 0)
@@ -201,62 +200,97 @@ def fetch_token_data(mint):
 
 def fetch_new_tokens():
     global last_429_time
-    if time.time() - last_429_time < 25:
-        log(f"Cooldown after 429 - wait")
-        time.sleep(10)
+    if time.time() - last_429_time < 60:
+        log(f"Cooldown after 429 - wait {60 - (time.time() - last_429_time):.0f}s")
+        time.sleep(15)
         return []
     
     tokens=[]
     BIG = {"pumpCmXqMfrsAkQ5r2W9FmXof6eH9sSVJ7vuy1uxs4Hz"}
-    sess = requests.Session()
-    sess.headers.update({"User-Agent":"Mozilla/5.0"})
-
     mints=[]
+    
+    # PRIMARY SOURCE: pump.fun directly - NO 429 on Render
     try:
-        r=sess.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=10)
-        log(f"Dex profiles status {r.status_code}")
-        if r.status_code==429:
-            last_429_time = time.time()
-            log("Dex profiles 429 - cooldown 30s")
-            time.sleep(30)
-            return []
+        r = requests.get(
+            "https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false",
+            timeout=12,
+            headers={
+                "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Origin":"https://pump.fun",
+                "Referer":"https://pump.fun/",
+                "Accept":"application/json"
+            }
+        )
+        log(f"Pump.fun new coins status {r.status_code}")
         if r.status_code==200:
-            data=r.json()
-            for c in data[:45]:
+            data = r.json()
+            coins = data if isinstance(data, list) else data.get("coins", [])
+            for c in coins[:40]:
                 try:
-                    if c.get("chainId")!="solana": continue
-                    mint=c.get("tokenAddress")
-                    if not mint or mint in BIG or mint in blacklist or mint in open_positions or mint in bought_ever: continue
+                    mint = c.get("mint")
+                    if not mint or mint in BIG or mint in blacklist or mint in open_positions or mint in bought_ever:
+                        continue
+                    pump_mcap = float(c.get("usd_market_cap",0) or 0)
+                    if pump_mcap>0 and not (FILTERS["mcap_min"] <= pump_mcap <= FILTERS["mcap_max"]*2.5):
+                        continue
                     mints.append(mint)
                 except: continue
-    except Exception as e: log(f"profiles fail {e}")
+            if mints:
+                log(f"Got {len(mints)} mints from pump.fun direct")
+    except Exception as e:
+        log(f"Pump.fun direct fail {e}")
 
-    if len(mints)<5:
+    # FALLBACK: Only if pump.fun gave <10 mints, try Dex profiles
+    if len(mints) < 10:
         try:
-            r=sess.get("https://api.dexscreener.com/token-boosts/latest/v1", timeout=10)
+            time.sleep(random.uniform(0.5, 2.0))
+            r=requests.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=10, headers={"User-Agent":"Mozilla/5.0"})
+            log(f"Dex profiles status {r.status_code}")
+            if r.status_code==429:
+                last_429_time = time.time()
+                log("Dex profiles 429 - cooldown 60s (Render shared IP)")
+            elif r.status_code==200:
+                for c in r.json()[:30]:
+                    try:
+                        if c.get("chainId")!="solana": continue
+                        mint=c.get("tokenAddress")
+                        if mint and mint not in mints and mint not in BIG and mint not in blacklist and mint not in open_positions and mint not in bought_ever:
+                            mints.append(mint)
+                    except: continue
+        except Exception as e: log(f"profiles fail {e}")
+
+    if len(mints) < 5:
+        try:
+            r=requests.get("https://api.dexscreener.com/token-boosts/latest/v1", timeout=10, headers={"User-Agent":"Mozilla/5.0"})
             log(f"Dex boosts status {r.status_code}")
             if r.status_code==200:
-                for c in r.json()[:30]:
+                for c in r.json()[:20]:
                     try:
                         if c.get("chainId")!="solana": continue
                         mint=c.get("tokenAddress")
                         if mint and mint not in mints and mint not in BIG and mint not in blacklist and mint not in bought_ever:
                             mints.append(mint)
                     except: continue
-        except Exception as e: log(f"boosts fail {e}")
+        except: pass
 
     if not mints:
-        log("Found 0 mints from profiles/boosts")
+        log("Found 0 mints from all sources - sleep 15s")
+        time.sleep(10)
         return []
 
-    log(f"Got {len(mints)} mints, batch fetching...")
+    mints = list(dict.fromkeys(mints))[:35]
+    log(f"Got {len(mints)} total mints, batch fetching Dex data...")
+    
     batch_data = fetch_token_data_batch(mints)
     log(f"Batch got {len(batch_data)} with Dex data")
 
     for mint, real in batch_data.items():
         try:
             if not (FILTERS["mcap_min"] <= real["mcap"] <= FILTERS["mcap_max"]): continue
-            if not (FILTERS["liquidity_min"] <= real["liquidity"] <= FILTERS["liquidity_max"]): continue
+            if real["liquidity"] < 8000: continue
+            if not (FILTERS["liquidity_min"] <= real["liquidity"] <= FILTERS["liquidity_max"]*1.5): 
+                if real["liquidity"] < FILTERS["liquidity_min"] - 5000:
+                    continue
             rug = get_rug_data(mint)
             if rug is None: continue
             if rug["is_rugged"]: 
@@ -286,7 +320,8 @@ def fetch_new_tokens():
     return tokens
 
 def passes_filters(t):
-    if not (FILTERS["liquidity_min"] <= t["liquidity"] <= FILTERS["liquidity_max"]): return False, f"Liq {t['liquidity']:.0f}", False
+    if not (FILTERS["liquidity_min"] <= t["liquidity"] <= FILTERS["liquidity_max"]*1.5): 
+        if t["liquidity"] < 8000: return False, f"Liq {t['liquidity']:.0f}", False
     if not (FILTERS["mcap_min"] <= t["mcap"] <= FILTERS["mcap_max"]): return False, f"Mcap {t['mcap']:.0f}", False
     if t["bundle_pct"] > FILTERS["bundle_max_pct"]: return False, f"Bundle {t['bundle_pct']}%", False
     if t["insiders_pct"] > FILTERS["insiders_max_pct"]: return False, f"Insiders {t['insiders_pct']}%", False
@@ -449,7 +484,6 @@ def check_positions():
         if not data: continue
         if pos["symbol"]=="?" and data["symbol"]!="?":
             pos["symbol"]=data["symbol"]
-        # LIVE CACHE for /positions command
         pos["curr_mcap"] = data["mcap"]
         pos["curr_symbol"] = data["symbol"]
         pos["curr_volume"] = data["volume_5m"]
@@ -611,8 +645,8 @@ def handle_telegram_commands():
 def main_loop():
     global trades_today,pnl_today_sol,last_reset_date
     set_telegram_commands()
-    log(f"🚀 BOT v7.6 - FULL LIVE FIX")
-    send_telegram(f"🚀 BOT v7.6 LIVE\n✅ Batch fetch (no 429)\n✅ Live positions cache\n✅ Slippage 50/80/100 fix\n✅ All commands safe")
+    log(f"🚀 BOT v7.7 - Render 429 FIX LIVE")
+    send_telegram(f"🚀 BOT v7.7 LIVE\n✅ Pump.fun primary (no 429)\n✅ Batch Dex\n✅ Live positions cache\n✅ All commands safe")
     while True:
         try:
             if not bot_running: time.sleep(5); continue
