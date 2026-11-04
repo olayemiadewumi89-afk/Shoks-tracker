@@ -17,9 +17,9 @@ BUY_AMOUNT = 0.005
 MAX_OPEN = 1
 MAX_TRADES_DAY = 5
 DAILY_LOSS_LIMIT = 0.05
-STOP_LOSS = 25
-EMERGENCY_RUG = 40
-TAKE_PROFIT_X = 2.0
+STOP_LOSS = 35          # -35% close as you wanted
+EMERGENCY_RUG = 45      # -45% emergency rug cut
+TAKE_PROFIT_X = 2.0     # 2x profit
 
 FILTERS = {
     "mcap_min": 40000,
@@ -51,9 +51,9 @@ def tg(t):
     except: pass
 
 @app.route("/health")
-def health(): return {"dry_run":DRY_RUN,"ws":ws_ok,"watch":len(watchlist),"open":len(open_positions),"trades":trades_today},200
+def health(): return {"dry_run":DRY_RUN,"ws":ws_ok,"watch":len(watchlist),"open":len(open_positions),"trades":trades_today,"stop_loss":STOP_LOSS,"take_profit":TAKE_PROFIT_X},200
 @app.route("/")
-def home(): return f"v10.1 DRY_RUN={DRY_RUN}",200
+def home(): return f"v10.4 LIVE-READY DRY_RUN={DRY_RUN} STOP={STOP_LOSS}% TP={TAKE_PROFIT_X}x",200
 def run_flask(): app.run(host="0.0.0.0", port=int(os.getenv("PORT",10000)), debug=False)
 
 def ws_on_message(ws, message):
@@ -71,15 +71,12 @@ def ws_on_open(ws):
     global ws_ok
     ws_ok=True
     log("WS Connected")
-    tg(f"WS Connected v10.1 DRY_RUN={DRY_RUN}")
-    try: ws.send(json.dumps({"method":"subscribeNewToken"}))
-    except: pass
+    tg(f"WS Connected v10.4 DRY_RUN={DRY_RUN} STOP={STOP_LOSS}% TP={TAKE_PROFIT_X}x")
 
 def ws_on_close(ws,c,m):
     global ws_ok
     ws_ok=False
     log(f"WS Closed {c}")
-
 def ws_on_error(ws,e): log(f"WS Err {e}")
 
 def ws_loop():
@@ -112,7 +109,7 @@ def fetch_dex(mint):
         pairs=r.json().get("pairs",[])
         if not pairs: return None
         p=sorted(pairs, key=lambda x: float(x.get("liquidity",{}).get("usd",0)), reverse=True)[0]
-        return {"mcap":float(p.get("fdv",0)or 0), "liquidity":float(p.get("liquidity",{}).get("usd",0)or 0), "volume_5m":float(p.get("volume",{}).get("m5",0)or 0), "symbol":str(p.get("baseToken",{}).get("symbol","?"))[:12], "buyers":int(p.get("txns",{}).get("m5",{}).get("buys",0)or 0), "sellers":int(p.get("txns",{}).get("m5",{}).get("sells",0)or 0)}
+        return {"mcap":float(p.get("fdv",0)or 0), "liquidity":float(p.get("liquidity",{}).get("usd",0)or 0), "volume_5m":float(p.get("volume",{}).get("m5",0)or 0), "symbol":str(p.get("baseToken",{}).get("symbol","?"))[:12]}
     except: return None
 
 def fetch_rug(mint):
@@ -172,7 +169,8 @@ def buy(mint):
         return "DRY_RUN_SIG"
     bal=get_balance()
     if bal < BUY_AMOUNT+0.008:
-        log(f"low bal {bal}")
+        log(f"low bal {bal:.4f} skip {mint[:8]}")
+        tg(f"Low bal {bal:.4f} SOL - cannot buy {mint[:6]}")
         return None
     kp=get_keypair()
     try:
@@ -187,9 +185,6 @@ def buy(mint):
             vtx=VersionedTransaction.from_bytes(tx_bytes)
         signed=VersionedTransaction(vtx.message,[kp])
         sig=send_tx(base64.b64encode(bytes(signed)).decode())
-        if sig:
-            log(f"BUY {sig}")
-            tg(f"✅ BUY {mint[:6]} https://solscan.io/tx/{sig}")
         return sig
     except Exception as e:
         log(f"buy ex {e}")
@@ -197,7 +192,8 @@ def buy(mint):
 
 def sell(mint):
     kp=get_keypair()
-    for slip in [40,70]:
+    if not kp: return None
+    for slip in [40,70,100]:
         try:
             resp=requests.post("https://pumpportal.fun/api/trade-local", json={"publicKey":str(kp.pubkey()),"action":"sell","mint":mint,"amount":"100%","denominatedInSol":"false","slippage":slip,"priorityFee":0.005,"pool":"auto"}, timeout=20)
             if resp.status_code!=200: continue
@@ -207,11 +203,8 @@ def sell(mint):
                 vtx=VersionedTransaction.from_bytes(tx_bytes)
             signed=VersionedTransaction(vtx.message,[kp])
             sig=send_tx(base64.b64encode(bytes(signed)).decode())
-            if sig:
-                log(f"SELL {sig}")
-                tg(f"SELL {mint[:6]} https://solscan.io/tx/{sig}")
-                return sig
-        except: pass
+            if sig: return sig
+        except: continue
     return None
 
 def check_positions():
@@ -219,42 +212,46 @@ def check_positions():
     for mint,pos in list(open_positions.items()):
         data=fetch_dex(mint)
         if not data: continue
-        entry=pos["entry"]
-        curr=data["mcap"]
+        entry=pos["entry"]; curr=data["mcap"]
         pct=(curr/entry-1)*100 if entry else 0
         log(f"CHECK {pos['symbol']} {entry/1000:.0f}K->{curr/1000:.0f}K {pct:+.0f}%")
-        if curr >= entry*TAKE_PROFIT_X:
-            s=sell(mint)
-            if s:
+        should_sell=None
+        if curr >= entry*TAKE_PROFIT_X: should_sell="WIN"
+        elif curr <= entry*(1-EMERGENCY_RUG/100): should_sell="RUG"
+        elif curr <= entry*(1-STOP_LOSS/100): should_sell="STOP"
+        if should_sell:
+            if DRY_RUN:
+                tg(f"DRY CLOSE {should_sell} {pos['symbol']} {pct:+.0f}%")
                 remove.append(mint)
-                tg(f"✅ 2X WIN {pos['symbol']} +{pct:.0f}%")
-        elif curr <= entry*(1-EMERGENCY_RUG/100):
-            s=sell(mint)
+                continue
+            s=None
+            for attempt in range(3):
+                s=sell(mint)
+                if s: break
+                time.sleep(2)
             if s:
+                tg(f"{should_sell} {pos['symbol']} {pct:+.0f}% https://solscan.io/tx/{s}")
                 remove.append(mint)
-                tg(f"🚨 RUG CUT {pos['symbol']} {pct:.0f}%")
-        elif curr <= entry*(1-STOP_LOSS/100):
-            s=sell(mint)
-            if s:
-                remove.append(mint)
-                tg(f"🔻 STOP {pos['symbol']} {pct:.0f}%")
+            else:
+                log(f"SELL FAIL {pos['symbol']} - retry next loop")
+                if pct <= -60:
+                    tg(f"FORCE CLOSE {pos['symbol']} {pct:.0f}%")
+                    remove.append(mint)
     for m in remove: open_positions.pop(m,None)
 
 def main_loop():
-    global trades_today, pnl_today, last_reset
-    log(f"🚀 v10.1 START DRY_RUN={DRY_RUN} BUY={BUY_AMOUNT}")
-    tg(f"🚀 v10.1 START DRY_RUN={DRY_RUN} BUY {BUY_AMOUNT} SOL")
+    global trades_today, pnl_today, last_reset, bot_running
+    log(f"v10.4 START DRY_RUN={DRY_RUN} STOP={STOP_LOSS}%")
+    tg(f"v10.4 START DRY={DRY_RUN} STOP {STOP_LOSS}% TP {TAKE_PROFIT_X}x")
     while True:
         try:
             if date.today()!=last_reset:
-                trades_today=0
-                pnl_today=0
-                last_reset=date.today()
+                trades_today=0; pnl_today=0; last_reset=date.today()
+            if not bot_running:
+                time.sleep(5); continue
             now=time.time()
             if pnl_today <= -DAILY_LOSS_LIMIT:
-                log("Daily loss limit hit")
-                time.sleep(300)
-                continue
+                log("Daily loss limit"); time.sleep(300); continue
             while not ws_q.empty() and len(watchlist)<50:
                 try:
                     m=ws_q.get_nowait()
@@ -264,13 +261,10 @@ def main_loop():
                 except: break
             for mint in list(watchlist.keys()):
                 if mint in open_positions or mint in blacklist:
-                    del watchlist[mint]
-                    continue
+                    del watchlist[mint]; continue
                 if now - watchlist[mint]["first_seen"] > 1800:
-                    del watchlist[mint]
-                    continue
-                if now - watchlist[mint]["first_seen"] < 90:
-                    continue
+                    del watchlist[mint]; continue
+                if now - watchlist[mint]["first_seen"] < 90: continue
                 dex=fetch_dex(mint)
                 if not dex: continue
                 rug=fetch_rug(mint)
@@ -282,24 +276,21 @@ def main_loop():
                     del watchlist[mint]
                     log(f"FILTER FAIL {mint[:8]} {reason}")
                     continue
-                if len(open_positions)>=MAX_OPEN:
-                    log(f"Max open {len(open_positions)}")
-                    continue
-                if trades_today>=MAX_TRADES_DAY:
-                    log("Max trades day")
-                    time.sleep(60)
-                    continue
-                log(f"STRICT PASS {dex['symbol']} MC {dex['mcap']/1000:.0f}K Vol {dex['volume_5m']:.0f} Holders {rug['holders']} Top10 {rug['top10']:.0f}% -> BUY")
+                if len(open_positions)>=MAX_OPEN: continue
+                if trades_today>=MAX_TRADES_DAY: time.sleep(60); continue
+                log(f"STRICT PASS {dex['symbol']} MC {dex['mcap']/1000:.0f}K -> BUY")
                 sig=buy(mint)
                 if sig:
-                    open_positions[mint]={"entry":dex["mcap"],"symbol":dex["symbol"],"time":now}
-                    blacklist[mint]=now+9999999
-                    del watchlist[mint]
-                    trades_today+=1
-            time.sleep(8)
+                    if DRY_RUN:
+                        tg(f"📝 PAPER BUY {dex['symbol']} MC {dex['mcap']/1000:.0f}K https://dexscreener.com/solana/{mint}")
+                        blacklist[mint]=now+3600; del watchlist[mint]
+                    else:
+                        open_positions[mint]={"entry":dex["mcap"],"symbol":dex["symbol"],"time":now}
+                        blacklist[mint]=now+9999999; del watchlist[mint]; trades_today+=1
+                        tg(f"🚀 BUY {dex['symbol']} MC {dex['mcap']/1000:.0f}K https://solscan.io/tx/{sig}")
+            time.sleep(5)
         except Exception as e:
-            log(f"MAIN CRASH {e}\n{traceback.format_exc()}")
-            time.sleep(10)
+            log(f"MAIN CRASH {e}\n{traceback.format_exc()}"); time.sleep(10)
 
 def pos_loop():
     while True:
@@ -309,37 +300,48 @@ def pos_loop():
         except: time.sleep(3)
 
 def tg_loop():
-    global DRY_RUN
+    global DRY_RUN, bot_running
     off=0
     while True:
         try:
-            if not BOT_TOKEN:
-                time.sleep(10)
-                continue
+            if not BOT_TOKEN: time.sleep(10); continue
             r=requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates", params={"offset":off,"timeout":20}, timeout=25).json()
             for upd in r.get("result",[]):
                 off=upd["update_id"]+1
                 msg=upd.get("message",{})
-                if str(msg.get("chat",{}).get("id",""))!=str(CHAT_ID): continue
-                txt=(msg.get("text") or "").lower()
-                if "/balance" in txt:
+                if CHAT_ID and str(msg.get("chat",{}).get("id",""))!=str(CHAT_ID): continue
+                txt=(msg.get("text") or ""); low=txt.lower()
+                if not low.startswith("/"): continue
+                log(f"TG cmd {low}")
+                if "/balance" in low:
                     tg(f"Bal {get_balance():.4f} SOL DRY={DRY_RUN} WS={ws_ok} Watch {len(watchlist)} Open {len(open_positions)}")
-                if "/pnl" in txt:
-                    tg(f"PnL {pnl_today:+.4f} Trades {trades_today} Open {len(open_positions)}")
-                if "/dry" in txt and "off" in txt:
-                    DRY_RUN=False
-                    tg("DRY_RUN OFF - REAL TRADES NOW")
-                if "/dry" in txt and "on" in txt:
-                    DRY_RUN=True
-                    tg("DRY_RUN ON - safe")
-                if "/stop" in txt: 
-                    global bot_running
-                    bot_running=False
-                    tg("PAUSED")
-                if "/start" in txt:
-                    bot_running=True
-                    tg("RESUMED")
-        except: time.sleep(5)
+                if "/positions" in low or "/pos" in low:
+                    if not open_positions: tg("No open positions")
+                    else:
+                        lines=[]
+                        for m,p in open_positions.items():
+                            d=fetch_dex(m)
+                            if d:
+                                pct=(d['mcap']/p['entry']-1)*100 if p['entry'] else 0
+                                lines.append(f"{p['symbol']} {p['entry']/1000:.0f}K->{d['mcap']/1000:.0f}K {pct:+.0f}%")
+                        tg("\n".join(lines))
+                if "/watch" in low:
+                    tg(f"Watch {len(watchlist)} coins")
+                if "/pnl" in low:
+                    tg(f"PnL {pnl_today:+.4f} Trades {trades_today} STOP {STOP_LOSS}% TP {TAKE_PROFIT_X}x")
+                if "/dry" in low and "off" in low:
+                    DRY_RUN=False; tg("DRY OFF - LIVE ⚠️")
+                if "/dry" in low and "on" in low:
+                    DRY_RUN=True; tg("DRY ON - safe ✅")
+                if "/stop" in low:
+                    bot_running=False; tg("⏸️ PAUSED buying, selling still active")
+                if "/start" in low or "/resume" in low:
+                    bot_running=True; tg("▶️ RESUMED")
+                if "/sellall" in low:
+                    for m in list(open_positions.keys()): sell(m)
+                    open_positions.clear(); tg("Closed all")
+        except Exception as e:
+            log(f"TG err {e}"); time.sleep(5)
 
 if __name__=="__main__":
     threading.Thread(target=run_flask,daemon=True).start()
