@@ -11,7 +11,7 @@ RPC_URL = os.getenv("RPC_URL","")
 PRIVATE_KEY_B58 = os.getenv("PRIVATE_KEY","")
 BOT_TOKEN = os.getenv("BOT_TOKEN","")
 CHAT_ID = os.getenv("CHAT_ID","")
-DRY_RUN = os.getenv("DRY_RUN","true").lower() == "true"  # true = no real buys, safe test
+DRY_RUN = os.getenv("DRY_RUN","true").lower() == "true"
 
 BUY_AMOUNT = 0.005
 MAX_OPEN = 1
@@ -53,7 +53,7 @@ def tg(t):
 @app.route("/health")
 def health(): return {"dry_run":DRY_RUN,"ws":ws_ok,"watch":len(watchlist),"open":len(open_positions),"trades":trades_today},200
 @app.route("/")
-def home(): return f"v10 DRY_RUN={DRY_RUN}",200
+def home(): return f"v10.1 DRY_RUN={DRY_RUN}",200
 def run_flask(): app.run(host="0.0.0.0", port=int(os.getenv("PORT",10000)), debug=False)
 
 def ws_on_message(ws, message):
@@ -68,22 +68,37 @@ def ws_on_message(ws, message):
     except: pass
 
 def ws_on_open(ws):
-    global ws_ok; ws_ok=True; log("WS Connected"); tg(f"WS Connected v10 DRY_RUN={DRY_RUN}")
+    global ws_ok
+    ws_ok=True
+    log("WS Connected")
+    tg(f"WS Connected v10.1 DRY_RUN={DRY_RUN}")
     try: ws.send(json.dumps({"method":"subscribeNewToken"}))
     except: pass
-def ws_on_close(ws,c,m): global ws_ok; ws_ok=False; log(f"WS Closed {c}")
+
+def ws_on_close(ws,c,m):
+    global ws_ok
+    ws_ok=False
+    log(f"WS Closed {c}")
+
 def ws_on_error(ws,e): log(f"WS Err {e}")
+
 def ws_loop():
     global ws_ok
     while True:
         try:
             w=websocket.WebSocketApp("wss://pumpportal.fun/api/data", on_open=ws_on_open, on_message=ws_on_message, on_error=ws_on_error, on_close=ws_on_close)
-            w.run_forever(ping_interval=20, ping_timeout=15); ws_ok=False; time.sleep(5)
-        except: ws_ok=False; time.sleep(5)
+            w.run_forever(ping_interval=20, ping_timeout=15)
+            ws_ok=False
+            time.sleep(5)
+        except:
+            ws_ok=False
+            time.sleep(5)
 
 def get_balance():
     try:
-        kp=Keypair.from_bytes(b58decode(PRIVATE_KEY_B58.strip())); r=requests.post(RPC_URL, json={"jsonrpc":"2.0","id":1,"method":"getBalance","params":[str(kp.pubkey())]}, timeout=8).json(); return r.get("result",{}).get("value",0)/1e9
+        kp=Keypair.from_bytes(b58decode(PRIVATE_KEY_B58.strip()))
+        r=requests.post(RPC_URL, json={"jsonrpc":"2.0","id":1,"method":"getBalance","params":[str(kp.pubkey())]}, timeout=8).json()
+        return r.get("result",{}).get("value",0)/1e9
     except: return 0
 
 def get_keypair():
@@ -105,7 +120,9 @@ def fetch_rug(mint):
         r=requests.get(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report", timeout=6, headers={"User-Agent":"Mozilla/5.0"})
         if r.status_code in (429,403): return None
         if r.status_code!=200: return None
-        j=r.json(); score=j.get("score",0); holders=j.get("totalHolders",0)
+        j=r.json()
+        score=j.get("score",0)
+        holders=j.get("totalHolders",0)
         top10=sum([h.get("pct",0) for h in j.get("topHolders",[])[:10]])
         bundle=0; insiders=0
         for rk in j.get("risks",[]):
@@ -130,33 +147,53 @@ def strict_pass(t):
 def send_tx(b64):
     try:
         pl={"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":[b64,{"encoding":"base64","skipPreflight":False}]}
-        r=requests.post(RPC_URL, json=pl, timeout=15).json(); sig=r.get("result")
-        if not sig: log(f"send err {r}"); return None
+        r=requests.post(RPC_URL, json=pl, timeout=15).json()
+        sig=r.get("result")
+        if not sig:
+            log(f"send err {r}")
+            return None
         for _ in range(12):
             time.sleep(2)
             st=requests.post(RPC_URL, json={"jsonrpc":"2.0","id":1,"method":"getSignatureStatuses","params":[[sig],{"searchTransactionHistory":True}]}, timeout=8).json()
             v=st.get("result",{}).get("value",[None])[0]
-            if v and v.get("confirmationStatus") in ("confirmed","finalized") and not v.get("err"): return sig
-            if v and v.get("err"): log(f"tx failed {v.get('err')}"); return None
+            if v and v.get("confirmationStatus") in ("confirmed","finalized") and not v.get("err"):
+                return sig
+            if v and v.get("err"):
+                log(f"tx failed {v.get('err')}")
+                return None
         return sig
-    except Exception as e: log(f"send_tx {e}"); return None
+    except Exception as e:
+        log(f"send_tx {e}")
+        return None
 
 def buy(mint):
     if DRY_RUN:
-        log(f"DRY RUN WOULD BUY {mint[:8]} - no tx sent"); return "DRY_RUN_SIG"
+        log(f"DRY RUN WOULD BUY {mint[:8]} - no tx sent")
+        return "DRY_RUN_SIG"
     bal=get_balance()
-    if bal < BUY_AMOUNT+0.008: log(f"low bal {bal}"); return None
+    if bal < BUY_AMOUNT+0.008:
+        log(f"low bal {bal}")
+        return None
     kp=get_keypair()
     try:
         resp=requests.post("https://pumpportal.fun/api/trade-local", json={"publicKey":str(kp.pubkey()),"action":"buy","mint":mint,"denominatedInSol":"true","amount":BUY_AMOUNT,"slippage":50,"priorityFee":0.005,"pool":"auto"}, timeout=20)
-        if resp.status_code!=200: log(f"buy portal {resp.status_code} {resp.text[:150]}"); return None
+        if resp.status_code!=200:
+            log(f"buy portal {resp.status_code} {resp.text[:150]}")
+            return None
         try: vtx=VersionedTransaction.from_bytes(resp.content)
         except:
-            b64=''.join(resp.text.strip().split()); tx_bytes=base64.b64decode(b64); vtx=VersionedTransaction.from_bytes(tx_bytes)
-        signed=VersionedTransaction(vtx.message,[kp]); sig=send_tx(base64.b64encode(bytes(signed)).decode())
-        if sig: log(f"BUY {sig}"); tg(f"✅ BUY {mint[:6]} https://solscan.io/tx/{sig}")
+            b64=''.join(resp.text.strip().split())
+            tx_bytes=base64.b64decode(b64)
+            vtx=VersionedTransaction.from_bytes(tx_bytes)
+        signed=VersionedTransaction(vtx.message,[kp])
+        sig=send_tx(base64.b64encode(bytes(signed)).decode())
+        if sig:
+            log(f"BUY {sig}")
+            tg(f"✅ BUY {mint[:6]} https://solscan.io/tx/{sig}")
         return sig
-    except Exception as e: log(f"buy ex {e}"); return None
+    except Exception as e:
+        log(f"buy ex {e}")
+        return None
 
 def sell(mint):
     kp=get_keypair()
@@ -165,42 +202,59 @@ def sell(mint):
             resp=requests.post("https://pumpportal.fun/api/trade-local", json={"publicKey":str(kp.pubkey()),"action":"sell","mint":mint,"amount":"100%","denominatedInSol":"false","slippage":slip,"priorityFee":0.005,"pool":"auto"}, timeout=20)
             if resp.status_code!=200: continue
             try: vtx=VersionedTransaction.from_bytes(resp.content)
-            except: tx_bytes=base64.b64decode(''.join(resp.text.strip().split())); vtx=VersionedTransaction.from_bytes(tx_bytes)
-            signed=VersionedTransaction(vtx.message,[kp]); sig=send_tx(base64.b64encode(bytes(signed)).decode())
-            if sig: log(f"SELL {sig}"); tg(f"SELL {mint[:6]} https://solscan.io/tx/{sig}"); return sig
+            except:
+                tx_bytes=base64.b64decode(''.join(resp.text.strip().split()))
+                vtx=VersionedTransaction.from_bytes(tx_bytes)
+            signed=VersionedTransaction(vtx.message,[kp])
+            sig=send_tx(base64.b64encode(bytes(signed)).decode())
+            if sig:
+                log(f"SELL {sig}")
+                tg(f"SELL {mint[:6]} https://solscan.io/tx/{sig}")
+                return sig
         except: pass
     return None
 
 def check_positions():
-    global pnl_today
     remove=[]
     for mint,pos in list(open_positions.items()):
         data=fetch_dex(mint)
         if not data: continue
-        entry=pos["entry"]; curr=data["mcap"]; pct=(curr/entry-1)*100 if entry else 0
+        entry=pos["entry"]
+        curr=data["mcap"]
+        pct=(curr/entry-1)*100 if entry else 0
         log(f"CHECK {pos['symbol']} {entry/1000:.0f}K->{curr/1000:.0f}K {pct:+.0f}%")
         if curr >= entry*TAKE_PROFIT_X:
-            s=sell(mint); 
-            if s: remove.append(mint); tg(f"✅ 2X WIN {pos['symbol']} +{pct:.0f}%")
+            s=sell(mint)
+            if s:
+                remove.append(mint)
+                tg(f"✅ 2X WIN {pos['symbol']} +{pct:.0f}%")
         elif curr <= entry*(1-EMERGENCY_RUG/100):
-            s=sell(mint);
-            if s: remove.append(mint); tg(f"🚨 RUG CUT {pos['symbol']} {pct:.0f}%")
+            s=sell(mint)
+            if s:
+                remove.append(mint)
+                tg(f"🚨 RUG CUT {pos['symbol']} {pct:.0f}%")
         elif curr <= entry*(1-STOP_LOSS/100):
-            s=sell(mint);
-            if s: remove.append(mint); tg(f"🔻 STOP {pos['symbol']} {pct:.0f}%")
+            s=sell(mint)
+            if s:
+                remove.append(mint)
+                tg(f"🔻 STOP {pos['symbol']} {pct:.0f}%")
     for m in remove: open_positions.pop(m,None)
 
 def main_loop():
-    global trades_today, pnl_today, last_reset, bot_running
-    log(f"🚀 v10 START DRY_RUN={DRY_RUN} BUY={BUY_AMOUNT} MAX_OPEN={MAX_OPEN}")
-    tg(f"🚀 v10 START\nDRY_RUN={DRY_RUN}\nBUY {BUY_AMOUNT} SOL\nFilters STRICT\nWatch 90 sec")
+    global trades_today, pnl_today, last_reset
+    log(f"🚀 v10.1 START DRY_RUN={DRY_RUN} BUY={BUY_AMOUNT}")
+    tg(f"🚀 v10.1 START DRY_RUN={DRY_RUN} BUY {BUY_AMOUNT} SOL")
     while True:
         try:
-            if date.today()!=last_reset: trades_today=0; pnl_today=0; last_reset=date.today()
+            if date.today()!=last_reset:
+                trades_today=0
+                pnl_today=0
+                last_reset=date.today()
             now=time.time()
-            # daily loss stop
-            if pnl_today <= -DAILY_LOSS_LIMIT: log("Daily loss limit hit, pause"); time.sleep(300); continue
-            # move WS queue to watchlist
+            if pnl_today <= -DAILY_LOSS_LIMIT:
+                log("Daily loss limit hit")
+                time.sleep(300)
+                continue
             while not ws_q.empty() and len(watchlist)<50:
                 try:
                     m=ws_q.get_nowait()
@@ -208,31 +262,44 @@ def main_loop():
                         watchlist[m]={"first_seen":now,"symbol":f"WS-{m[:4]}"}
                         log(f"WATCHLIST ADD {m[:8]} total {len(watchlist)}")
                 except: break
-            # check watchlist
             for mint in list(watchlist.keys()):
-                if mint in open_positions or mint in blacklist: del watchlist[mint]; continue
-                if now - watchlist[mint]["first_seen"] > 1800: del watchlist[mint]; continue  # expire 30 min
-                if now - watchlist[mint]["first_seen"] < 90: continue  # wait 90 sec for price stabilize
+                if mint in open_positions or mint in blacklist:
+                    del watchlist[mint]
+                    continue
+                if now - watchlist[mint]["first_seen"] > 1800:
+                    del watchlist[mint]
+                    continue
+                if now - watchlist[mint]["first_seen"] < 90:
+                    continue
                 dex=fetch_dex(mint)
-                if not dex: continue  # if 429, skip, don't use fake
+                if not dex: continue
                 rug=fetch_rug(mint)
                 if not rug: continue
                 t={"mcap":dex["mcap"],"liquidity":dex["liquidity"],"volume_5m":dex["volume_5m"],"holders":rug["holders"],"bundle":rug["bundle"],"insiders":rug["insiders"],"top10":rug["top10"],"rug_score":rug["score"]}
                 ok,reason=strict_pass(t)
                 if not ok:
-                    # if fails only vol, keep watching
                     if "vol" in reason: continue
-                    del watchlist[mint]; log(f"FILTER FAIL {mint[:8]} {reason}"); continue
-                # PASS
-                if len(open_positions)>=MAX_OPEN: log(f"Max open {len(open_positions)}, skip {dex['symbol']}"); continue
-                if trades_today>=MAX_TRADES_DAY: log("Max trades day"); time.sleep(60); continue
+                    del watchlist[mint]
+                    log(f"FILTER FAIL {mint[:8]} {reason}")
+                    continue
+                if len(open_positions)>=MAX_OPEN:
+                    log(f"Max open {len(open_positions)}")
+                    continue
+                if trades_today>=MAX_TRADES_DAY:
+                    log("Max trades day")
+                    time.sleep(60)
+                    continue
                 log(f"STRICT PASS {dex['symbol']} MC {dex['mcap']/1000:.0f}K Vol {dex['volume_5m']:.0f} Holders {rug['holders']} Top10 {rug['top10']:.0f}% -> BUY")
                 sig=buy(mint)
                 if sig:
                     open_positions[mint]={"entry":dex["mcap"],"symbol":dex["symbol"],"time":now}
-                    blacklist[mint]=now+9999999; del watchlist[mint]; trades_today+=1
+                    blacklist[mint]=now+9999999
+                    del watchlist[mint]
+                    trades_today+=1
             time.sleep(8)
-        except Exception as e: log(f"MAIN CRASH {e}\n{traceback.format_exc()}"); time.sleep(10)
+        except Exception as e:
+            log(f"MAIN CRASH {e}\n{traceback.format_exc()}")
+            time.sleep(10)
 
 def pos_loop():
     while True:
@@ -242,23 +309,36 @@ def pos_loop():
         except: time.sleep(3)
 
 def tg_loop():
+    global DRY_RUN
     off=0
     while True:
         try:
-            if not BOT_TOKEN: time.sleep(10); continue
+            if not BOT_TOKEN:
+                time.sleep(10)
+                continue
             r=requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates", params={"offset":off,"timeout":20}, timeout=25).json()
             for upd in r.get("result",[]):
-                off=upd["update_id"]+1; msg=upd.get("message",{}); 
+                off=upd["update_id"]+1
+                msg=upd.get("message",{})
                 if str(msg.get("chat",{}).get("id",""))!=str(CHAT_ID): continue
                 txt=(msg.get("text") or "").lower()
-                if "/balance" in txt: tg(f"Bal {get_balance():.4f} SOL DRY={DRY_RUN} WS={ws_ok} Watch {len(watchlist)} Open {len(open_positions)}")
-                if "/pnl" in txt: tg(f"PnL {pnl_today:+.4f} Trades {trades_today} Open {len(open_positions)}")
-                if "/dry" in txt and "off" in txt: 
-                    global DRY_RUN; DRY_RUN=False; tg("DRY_RUN OFF - REAL TRADES NOW")
-                if "/dry" in txt and "on" in txt: DRY_RUN=True; tg("DRY_RUN ON - safe")
+                if "/balance" in txt:
+                    tg(f"Bal {get_balance():.4f} SOL DRY={DRY_RUN} WS={ws_ok} Watch {len(watchlist)} Open {len(open_positions)}")
+                if "/pnl" in txt:
+                    tg(f"PnL {pnl_today:+.4f} Trades {trades_today} Open {len(open_positions)}")
+                if "/dry" in txt and "off" in txt:
+                    DRY_RUN=False
+                    tg("DRY_RUN OFF - REAL TRADES NOW")
+                if "/dry" in txt and "on" in txt:
+                    DRY_RUN=True
+                    tg("DRY_RUN ON - safe")
                 if "/stop" in txt: 
-                    global bot_running; bot_running=False; tg("PAUSED")
-                if "/start" in txt: bot_running=True; tg("RESUMED")
+                    global bot_running
+                    bot_running=False
+                    tg("PAUSED")
+                if "/start" in txt:
+                    bot_running=True
+                    tg("RESUMED")
         except: time.sleep(5)
 
 if __name__=="__main__":
