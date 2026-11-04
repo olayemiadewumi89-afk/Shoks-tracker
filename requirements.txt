@@ -3,3 +3,4 @@ requests
 solders
 base58
 solana
+websocket-client==1.7.0
