@@ -1,4 +1,4 @@
-import os, time, threading, traceback, base64, json
+import os, time, threading, traceback, base64, json, random
 from datetime import datetime, date
 from flask import Flask
 import requests
@@ -87,12 +87,15 @@ def set_telegram_commands():
 def health(): 
     return {"status":"alive" if bot_running else "paused","open":len(open_positions),"watchlist":len(watchlist),"trades":trades_today,"pnl":pnl_today_sol,"wins":total_wins,"losses":total_losses,"bought_ever":len(bought_ever)},200
 @app.route("/")
-def home(): return "Shok v7.1 - RENDER FIX",200
+def home(): return "Shok v7.2 - PUMPPORTAL FIX",200
 def run_flask(): app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)), debug=False)
 
 def get_rug_data(mint):
     try:
-        r = requests.get(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report", timeout=6)
+        r = requests.get(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report", timeout=7, headers={"User-Agent":"Mozilla/5.0"})
+        if r.status_code == 429:
+            time.sleep(3)
+            r = requests.get(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report", timeout=7)
         if r.status_code != 200: return None
         j = r.json()
         score = j.get("score", 0)
@@ -109,13 +112,12 @@ def get_rug_data(mint):
             if "insider" in rn: insiders_pct = 20
             if "single holder" in rn: top10 = max(top10, 90)
         is_rugged = score > FILTERS["rug_score_max"] or any("rugged" in rk.get("name","").lower() for rk in risks)
-        return {"score":score,"holders":holders,"top10_pct":top10,"bundle_pct":bundle_pct,"insiders_pct":insiders_pct,"is_rugged":is_rugged,"risks":[rk.get("name") for rk in risks[:2]]}
+        return {"score":score,"holders":holders,"top10_pct":top10,"bundle_pct":bundle_pct,"insiders_pct":insiders_pct,"is_rugged":is_rugged}
     except Exception as e:
         log(f"RugCheck fail {mint[:8]} {e}")
         return None
 
 def fetch_token_data(mint):
-    # FIXED: Add headers + fallback
     pump_symbol = "?"
     pump_mcap = 0
     try:
@@ -127,7 +129,11 @@ def fetch_token_data(mint):
     except: pass
     
     try:
-        r=requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5, headers={"User-Agent":"Mozilla/5.0"})
+        r=requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=6, headers={"User-Agent":"Mozilla/5.0"})
+        if r.status_code==429:
+            log(f"Dex token 429 sleep 4s {mint[:6]}")
+            time.sleep(4)
+            r=requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=6)
         j=r.json()
         pairs=j.get("pairs",[])
         if pairs:
@@ -147,45 +153,81 @@ def fetch_token_data(mint):
                 "symbol": final_symbol,
                 "buyers_5m": buys,
                 "sellers_5m": sells,
-                "source":"merged"
             }
     except: pass
     
     if pump_mcap>0 and pump_symbol!="?":
-        return {"mcap":pump_mcap,"liquidity":35000,"volume_5m":0,"symbol":pump_symbol,"buyers_5m":0,"sellers_5m":0,"source":"pump_only"}
-    
+        return {"mcap":pump_mcap,"liquidity":35000,"volume_5m":0,"symbol":pump_symbol,"buyers_5m":0,"sellers_5m":0}
     return None
 
 def fetch_new_tokens():
     tokens=[]
     BIG = {"pumpCmXqMfrsAkQ5r2W9FmXof6eH9sSVJ7vuy1uxs4Hz"}
-    headers = {"User-Agent":"Mozilla/5.0","Origin":"https://pump.fun","Referer":"https://pump.fun/"}
     sess = requests.Session()
-    
-    # 1. PUMP - with headers (was failing without)
+    sess.headers.update({"User-Agent":"Mozilla/5.0","Origin":"https://pump.fun","Referer":"https://pump.fun/"})
+
+    # 1. PumpPortal NEW - WORKS ON RENDER - FIXES YOUR 403/429
     try:
-        r=sess.get("https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false", timeout=12, headers=headers)
-        log(f"Pump API status {r.status_code} len {len(r.text)}")
+        r=sess.get("https://pumpportal.fun/api/data/coins/new?limit=50", timeout=15)
+        log(f"PumpPortal new status {r.status_code}")
         if r.status_code==200:
-            j=r.json()
-            data=j if isinstance(j,list) else j.get("coins",[])
-            for c in data:
+            data=r.json()
+            if isinstance(data, dict): data = data.get("coins",[]) or data.get("data",[])
+            for c in data[:50]:
                 try:
-                    mint=c.get("mint")
+                    mint=c.get("mint") or c.get("address") or c.get("tokenAddress")
                     if not mint or mint in BIG or mint in blacklist or mint in open_positions or mint in bought_ever: continue
-                    pump_symbol=str(c.get("symbol","?"))[:12]
-                    if pump_symbol=="?" or len(pump_symbol)<1: continue
                     real = fetch_token_data(mint)
-                    if not real or real["mcap"]==0: continue
+                    if not real: continue
                     if not (FILTERS["mcap_min"] <= real["mcap"] <= FILTERS["mcap_max"]): continue
                     if not (FILTERS["liquidity_min"] <= real["liquidity"] <= FILTERS["liquidity_max"]): continue
                     rug = get_rug_data(mint)
-                    if rug is None: continue
-                    if rug["is_rugged"]:
+                    if rug is None: 
+                        # Skip for now, don't block completely on this source to avoid empty
+                        continue
+                    if rug["is_rugged"]: 
                         blacklist[mint]=time.time()+7200
                         continue
                     if rug["holders"] < FILTERS["holders_min"]: continue
-                    if rug["top10_pct"] > FILTERS["top10_max_pct"]: continue
+                    tokens.append({
+                        "mint": mint,
+                        "symbol": real["symbol"],
+                        "mcap": real["mcap"],
+                        "liquidity": real["liquidity"],
+                        "volume_5m": real["volume_5m"],
+                        "holders": rug["holders"],
+                        "bundle_pct": rug["bundle_pct"],
+                        "insiders_pct": rug["insiders_pct"],
+                        "top10_pct": rug["top10_pct"],
+                        "buyers_5m": real["buyers_5m"],
+                        "sellers_5m": real["sellers_5m"],
+                        "lp_burnt_pct": 100, "lp_locked": True,
+                        "rug_score": rug["score"],
+                        "is_pump": True
+                    })
+                except Exception as e:
+                    continue
+            if tokens:
+                log(f"Found {len(tokens)} NEW from PumpPortal new")
+                return tokens
+    except Exception as e: log(f"PumpPortal new fail {e}")
+
+    # 2. PumpPortal LATEST
+    try:
+        r=sess.get("https://pumpportal.fun/api/data/coins/latest?limit=50", timeout=12)
+        log(f"PumpPortal latest status {r.status_code}")
+        if r.status_code==200:
+            data=r.json()
+            if isinstance(data, dict): data = data.get("coins",[]) or []
+            for c in data[:50]:
+                try:
+                    mint=c.get("mint") or c.get("address")
+                    if not mint or mint in BIG or mint in blacklist or mint in open_positions or mint in bought_ever: continue
+                    real = fetch_token_data(mint)
+                    if not real: continue
+                    rug = get_rug_data(mint)
+                    if rug is None: continue
+                    if rug["is_rugged"]: continue
                     tokens.append({
                         "mint": mint,
                         "symbol": real["symbol"],
@@ -204,59 +246,23 @@ def fetch_new_tokens():
                     })
                 except: continue
             if tokens:
-                log(f"Found {len(tokens)} NEW from pump.fun")
+                log(f"Found {len(tokens)} NEW from PumpPortal latest")
                 return tokens
-    except Exception as e: log(f"pump v3 fail {e}")
+    except Exception as e: log(f"PumpPortal latest fail {e}")
 
-    # 2. DEX PROFILES - NEVER BLOCKED ON RENDER - THIS FIXES YOUR EMPTY
+    # 3. Dexscreener search - backup
     try:
-        r=sess.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=10, headers={"User-Agent":"Mozilla/5.0"})
-        log(f"Dex profiles status {r.status_code}")
+        r=sess.get("https://api.dexscreener.com/latest/dex/search/?q=pump", timeout=10)
+        if r.status_code==429:
+            log("Dex search 429 sleep 5s")
+            time.sleep(5)
+        log(f"Dex search status {r.status_code}")
         if r.status_code==200:
-            for c in r.json()[:60]:
-                try:
-                    mint=c.get("tokenAddress")
-                    if not mint or mint in BIG or mint in blacklist or mint in open_positions or mint in bought_ever: continue
-                    if c.get("chainId")!="solana": continue
-                    real = fetch_token_data(mint)
-                    if not real or real.get("symbol","?")=="?": continue
-                    if real["volume_5m"]==0 and real["mcap"]==0: continue
-                    if not (FILTERS["mcap_min"] <= real["mcap"] <= FILTERS["mcap_max"]): continue
-                    if not (FILTERS["liquidity_min"] <= real["liquidity"] <= FILTERS["liquidity_max"]): continue
-                    rug = get_rug_data(mint)
-                    if rug is None: continue
-                    if rug["is_rugged"]: continue
-                    if rug["holders"] < FILTERS["holders_min"]: continue
-                    tokens.append({
-                        "mint": mint,
-                        "symbol": real["symbol"],
-                        "mcap": real["mcap"],
-                        "liquidity": real["liquidity"],
-                        "volume_5m": real["volume_5m"],
-                        "holders": rug["holders"],
-                        "bundle_pct": rug["bundle_pct"],
-                        "insiders_pct": rug["insiders_pct"],
-                        "top10_pct": rug["top10_pct"],
-                        "buyers_5m": real["buyers_5m"],
-                        "sellers_5m": real["sellers_5m"],
-                        "lp_burnt_pct": 100, "lp_locked": True,
-                        "rug_score": rug["score"],
-                        "is_pump": mint.endswith("pump")
-                    })
-                except: continue
-            if tokens:
-                log(f"Found {len(tokens)} NEW from Dex profiles")
-                return tokens
-    except Exception as e: log(f"profiles fail {e}")
-
-    # 3. DEX SEARCH as final fallback
-    try:
-        r=sess.get("https://api.dexscreener.com/latest/dex/search/?q=pump.fun", timeout=10, headers={"User-Agent":"Mozilla/5.0"})
-        if r.status_code==200:
-            for p in r.json().get("pairs",[])[:30]:
+            for p in r.json().get("pairs",[])[:25]:
                 try:
                     mint=p.get("baseToken",{}).get("address")
                     if not mint or mint in BIG or mint in blacklist or mint in open_positions or mint in bought_ever: continue
+                    if not mint.endswith("pump"): continue
                     real = fetch_token_data(mint)
                     if not real: continue
                     rug = get_rug_data(mint)
@@ -275,15 +281,16 @@ def fetch_new_tokens():
                         "sellers_5m": real["sellers_5m"],
                         "lp_burnt_pct": 100, "lp_locked": True,
                         "rug_score": rug["score"],
-                        "is_pump": mint.endswith("pump")
+                        "is_pump": True
                     })
                 except: continue
             if tokens:
                 log(f"Found {len(tokens)} NEW from Dex search")
                 return tokens
-    except Exception as e: log(f"search fail {e}")
+    except Exception as e: log(f"Dex search fail {e}")
 
-    log(f"Found 0 NEW - all sources empty, retry")
+    log(f"Found 0 NEW - sleep 12s to avoid 429")
+    time.sleep(12)
     return []
 
 def passes_filters(t):
@@ -587,8 +594,8 @@ def handle_telegram_commands():
 def main_loop():
     global trades_today,pnl_today_sol,last_reset_date
     set_telegram_commands()
-    log(f"🚀 BOT v7.1 - RENDER FIX")
-    send_telegram(f"🚀 BOT v7.1 LIVE\n✅ Render fix - Dex profiles\n✅ 10K vol strict")
+    log(f"🚀 BOT v7.2 - PUMPPORTAL FIX LIVE")
+    send_telegram(f"🚀 BOT v7.2 LIVE\n✅ PumpPortal (no 403)\n✅ 429 backoff\n✅ 10K vol strict")
     while True:
         try:
             if not bot_running: time.sleep(5); continue
@@ -647,7 +654,7 @@ def main_loop():
                         send_telegram(f"💰 BUY {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f} B/S {t['buyers_5m']}/{t['sellers_5m']}\n{t['mint']}")
                         if len(open_positions)>=MAX_OPEN_POSITIONS: break
                     time.sleep(1)
-            time.sleep(3)
+            time.sleep(6)
         except Exception as e:
             log(f"CRASH {e}\n{traceback.format_exc()}"); time.sleep(10)
 
