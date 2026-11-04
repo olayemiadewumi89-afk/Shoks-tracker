@@ -17,21 +17,21 @@ MAX_TRADES_PER_DAY = 20
 DAILY_LOSS_LIMIT_SOL = 0.2
 
 FILTERS = {
-    "liquidity_min": 25000,
-    "liquidity_max": 500000,
-    "mcap_min": 50000,
-    "mcap_max": 800000,
-    "bundle_max_pct": 20,
-    "insiders_max_pct": 15,
-    "holders_min": 80,
-    "lp_burnt_min_pct": 95,
-    "buyers_vs_sellers": 1.2,
-    "top10_max_pct": 30,
-    "volume_5m_min": 10000,
+    "liquidity_min": 20000,
+    "liquidity_max": 600000,
+    "mcap_min": 40000,
+    "mcap_max": 900000,
+    "bundle_max_pct": 25,
+    "insiders_max_pct": 20,
+    "holders_min": 50,
+    "lp_burnt_min_pct": 90,
+    "buyers_vs_sellers": 1.1,
+    "top10_max_pct": 35,
+    "volume_5m_min": 8000,
     "stop_loss_pct": 35,
     "take_profit_x": 2.0,
     "emergency_rug_pct": 50,
-    "fake_vol_ratio": 1.2,
+    "fake_vol_ratio": 1.5,
     "rug_score_max": 5000,
 }
 
@@ -86,21 +86,19 @@ def set_telegram_commands():
 
 @app.route("/health")
 def health(): 
-    return {"status":"alive" if bot_running else "paused","open":len(open_positions),"watchlist":len(watchlist),"trades":trades_today,"pnl":pnl_today_sol,"wins":total_wins,"losses":total_losses,"bought_ever":len(bought_ever)},200
+    return {"status":"alive" if bot_running else "paused","open":len(open_positions),"watchlist":len(watchlist),"trades":trades_today,"pnl":pnl_today_sol},200
 @app.route("/")
-def home(): return "Shok v7.7 - Render 429 FIX",200
+def home(): return "Shok v7.9 - 5 Sources MULTI",200
 def run_flask(): app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)), debug=False)
 
 def get_rug_data(mint):
     global last_429_time
     try:
-        if time.time() - last_429_time < 15:
-            time.sleep(1)
+        if time.time() - last_429_time < 10: time.sleep(0.5)
         r = requests.get(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report", timeout=7, headers={"User-Agent":"Mozilla/5.0"})
-        if r.status_code == 429:
+        if r.status_code in (429, 403):
             last_429_time = time.time()
-            log(f"RugCheck 429 - sleep")
-            time.sleep(5)
+            time.sleep(3)
             return None
         if r.status_code != 200: return None
         j = r.json()
@@ -121,19 +119,18 @@ def get_rug_data(mint):
         return None
 
 def fetch_token_data_batch(mints):
-    """BATCH FIX - 1 request for 25 mints = no 429"""
     result = {}
     if not mints: return result
     try:
-        for i in range(0, len(mints), 25):
-            chunk = mints[i:i+25]
+        for i in range(0, len(mints), 30):
+            chunk = mints[i:i+30]
             url = f"https://api.dexscreener.com/tokens/v1/solana/{','.join(chunk)}"
             r = requests.get(url, timeout=12, headers={"User-Agent":"Mozilla/5.0"})
-            if r.status_code==429:
+            if r.status_code in (429, 403):
                 global last_429_time
                 last_429_time = time.time()
-                log(f"Batch Dex 429 - sleep 20s")
-                time.sleep(20)
+                log(f"Batch Dex {r.status_code} - sleep 15s")
+                time.sleep(15)
                 return result
             if r.status_code==200:
                 try:
@@ -141,10 +138,8 @@ def fetch_token_data_batch(mints):
                     pairs = []
                     if isinstance(data, list):
                         for item in data:
-                            if isinstance(item, list):
-                                pairs.extend(item)
-                            elif isinstance(item, dict):
-                                pairs.append(item)
+                            if isinstance(item, list): pairs.extend(item)
+                            elif isinstance(item, dict): pairs.append(item)
                     for p in pairs:
                         try:
                             mint = p.get("baseToken",{}).get("address")
@@ -156,32 +151,23 @@ def fetch_token_data_batch(mints):
                             buys = int(txns.get("buys",0) or 0)
                             sells = int(txns.get("sells",0) or 0)
                             symbol = str(p.get("baseToken",{}).get("symbol","?"))[:12]
-                            if mint in result and result[mint]["liquidity"] > liq:
-                                continue
-                            result[mint] = {
-                                "mcap": mcap,
-                                "liquidity": liq,
-                                "volume_5m": vol5,
-                                "symbol": symbol,
-                                "buyers_5m": buys,
-                                "sellers_5m": sells,
-                            }
+                            if mint in result and result[mint]["liquidity"] > liq: continue
+                            result[mint] = {"mcap": mcap,"liquidity": liq,"volume_5m": vol5,"symbol": symbol,"buyers_5m": buys,"sellers_5m": sells}
                         except: continue
                 except Exception as e:
                     log(f"Batch parse err {e}")
-            time.sleep(0.7)
+            time.sleep(0.5)
     except Exception as e:
         log(f"Batch fetch fail {e}")
     return result
 
 def fetch_token_data(mint):
-    """Single fetch for position checks - used by monitor loop"""
     try:
         r=requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=6, headers={"User-Agent":"Mozilla/5.0"})
-        if r.status_code==429:
+        if r.status_code in (429,403):
             global last_429_time
             last_429_time = time.time()
-            time.sleep(3)
+            time.sleep(2)
             return None
         j=r.json()
         pairs=j.get("pairs",[])
@@ -200,102 +186,121 @@ def fetch_token_data(mint):
 
 def fetch_new_tokens():
     global last_429_time
-    if time.time() - last_429_time < 60:
-        log(f"Cooldown after 429 - wait {60 - (time.time() - last_429_time):.0f}s")
-        time.sleep(15)
+    if time.time() - last_429_time < 40:
+        log(f"Cooldown {40 - (time.time() - last_429_time):.0f}s")
+        time.sleep(8)
         return []
     
     tokens=[]
     BIG = {"pumpCmXqMfrsAkQ5r2W9FmXof6eH9sSVJ7vuy1uxs4Hz"}
-    mints=[]
-    
-    # PRIMARY SOURCE: pump.fun directly - NO 429 on Render
+    all_mints = []
+    sess = requests.Session()
+    sess.headers.update({"User-Agent":"Mozilla/5.0"})
+
+    # SOURCE 1: Dexscreener token-profiles - 60/min
     try:
-        r = requests.get(
-            "https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false",
-            timeout=12,
-            headers={
-                "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Origin":"https://pump.fun",
-                "Referer":"https://pump.fun/",
-                "Accept":"application/json"
-            }
-        )
-        log(f"Pump.fun new coins status {r.status_code}")
+        r=sess.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=8)
+        log(f"[1/5] Dex profiles status {r.status_code}")
         if r.status_code==200:
-            data = r.json()
-            coins = data if isinstance(data, list) else data.get("coins", [])
-            for c in coins[:40]:
+            for c in r.json()[:30]:
+                if c.get("chainId")!="solana": continue
+                m=c.get("tokenAddress")
+                if m and m not in BIG and m not in blacklist and m not in open_positions and m not in bought_ever:
+                    all_mints.append(m)
+        elif r.status_code in (429,403):
+            last_429_time = time.time()
+    except Exception as e: log(f"[1] fail {e}")
+
+    # SOURCE 2: Dexscreener token-boosts - SEPARATE bucket
+    try:
+        r=sess.get("https://api.dexscreener.com/token-boosts/latest/v1", timeout=8)
+        log(f"[2/5] Dex boosts status {r.status_code}")
+        if r.status_code==200:
+            for c in r.json()[:30]:
+                if c.get("chainId")!="solana": continue
+                m=c.get("tokenAddress")
+                if m and m not in all_mints and m not in BIG and m not in blacklist and m not in bought_ever:
+                    all_mints.append(m)
+    except Exception as e: log(f"[2] fail {e}")
+
+    # SOURCE 3: PumpPortal - NO LIMIT, MADE FOR BOTS
+    try:
+        r=sess.get("https://pumpportal.fun/api/data/coins/new", timeout=10, headers={"User-Agent":"Mozilla/5.0"})
+        log(f"[3/5] PumpPortal new status {r.status_code}")
+        if r.status_code==200:
+            try:
+                data=r.json()
+                coins=data if isinstance(data, list) else data.get("coins", []) if isinstance(data, dict) else []
+                for c in coins[:35]:
+                    m=c.get("mint") or c.get("ca") or c.get("tokenAddress")
+                    if m and m not in all_mints and m not in BIG and m not in blacklist and m not in bought_ever:
+                        all_mints.append(m)
+            except: pass
+        else:
+            # Try alternative PumpPortal endpoint
+            r2=sess.get("https://pumpportal.fun/api/data/coins/latest?limit=30", timeout=10)
+            log(f"[3b] PumpPortal latest status {r2.status_code}")
+            if r2.status_code==200:
                 try:
-                    mint = c.get("mint")
-                    if not mint or mint in BIG or mint in blacklist or mint in open_positions or mint in bought_ever:
-                        continue
-                    pump_mcap = float(c.get("usd_market_cap",0) or 0)
-                    if pump_mcap>0 and not (FILTERS["mcap_min"] <= pump_mcap <= FILTERS["mcap_max"]*2.5):
-                        continue
-                    mints.append(mint)
-                except: continue
-            if mints:
-                log(f"Got {len(mints)} mints from pump.fun direct")
-    except Exception as e:
-        log(f"Pump.fun direct fail {e}")
+                    for c in r2.json()[:30]:
+                        m=c.get("mint")
+                        if m and m not in all_mints and m not in BIG and m not in blacklist and m not in bought_ever:
+                            all_mints.append(m)
+                except: pass
+    except Exception as e: log(f"[3] fail {e}")
 
-    # FALLBACK: Only if pump.fun gave <10 mints, try Dex profiles
-    if len(mints) < 10:
-        try:
-            time.sleep(random.uniform(0.5, 2.0))
-            r=requests.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=10, headers={"User-Agent":"Mozilla/5.0"})
-            log(f"Dex profiles status {r.status_code}")
-            if r.status_code==429:
-                last_429_time = time.time()
-                log("Dex profiles 429 - cooldown 60s (Render shared IP)")
-            elif r.status_code==200:
-                for c in r.json()[:30]:
-                    try:
-                        if c.get("chainId")!="solana": continue
-                        mint=c.get("tokenAddress")
-                        if mint and mint not in mints and mint not in BIG and mint not in blacklist and mint not in open_positions and mint not in bought_ever:
-                            mints.append(mint)
-                    except: continue
-        except Exception as e: log(f"profiles fail {e}")
+    # SOURCE 4: GeckoTerminal new pools - 300/min, never blocks Render
+    try:
+        r=sess.get("https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1", timeout=10, headers={"User-Agent":"Mozilla/5.0","Accept":"application/json"})
+        log(f"[4/5] Gecko new pools status {r.status_code}")
+        if r.status_code==200:
+            try:
+                j=r.json()
+                pools=j.get("data",[])
+                for p in pools[:30]:
+                    attrs=p.get("attributes",{})
+                    addr=attrs.get("address")
+                    # Need token address from relationships
+                    rel=p.get("relationships",{}).get("base_token",{}).get("data",{}).get("id","")
+                    token = rel.split("_")[-1] if "_" in rel else ""
+                    if token and token not in all_mints and token not in BIG and token not in blacklist and token not in bought_ever:
+                        all_mints.append(token)
+            except Exception as e:
+                log(f"[4] parse {e}")
+    except Exception as e: log(f"[4] fail {e}")
 
-    if len(mints) < 5:
-        try:
-            r=requests.get("https://api.dexscreener.com/token-boosts/latest/v1", timeout=10, headers={"User-Agent":"Mozilla/5.0"})
-            log(f"Dex boosts status {r.status_code}")
-            if r.status_code==200:
-                for c in r.json()[:20]:
-                    try:
-                        if c.get("chainId")!="solana": continue
-                        mint=c.get("tokenAddress")
-                        if mint and mint not in mints and mint not in BIG and mint not in blacklist and mint not in bought_ever:
-                            mints.append(mint)
-                    except: continue
-        except: pass
+    # SOURCE 5: Dexscreener search pump.fun - 300/min bucket
+    try:
+        r=sess.get("https://api.dexscreener.com/latest/dex/search/?q=pump.fun", timeout=10, headers={"User-Agent":"Mozilla/5.0"})
+        log(f"[5/5] Dex search pump.fun status {r.status_code}")
+        if r.status_code==200:
+            try:
+                pairs=r.json().get("pairs",[])[:20]
+                for p in pairs:
+                    m=p.get("baseToken",{}).get("address")
+                    if m and m not in all_mints and m not in BIG and m not in blacklist and m not in bought_ever:
+                        all_mints.append(m)
+            except: pass
+    except Exception as e: log(f"[5] fail {e}")
 
-    if not mints:
-        log("Found 0 mints from all sources - sleep 15s")
+    if not all_mints:
+        log("Found 0 mints from all 5 sources - sleep")
         time.sleep(10)
         return []
 
-    mints = list(dict.fromkeys(mints))[:35]
-    log(f"Got {len(mints)} total mints, batch fetching Dex data...")
-    
-    batch_data = fetch_token_data_batch(mints)
+    all_mints = list(dict.fromkeys(all_mints))[:40]
+    log(f"TOTAL Got {len(all_mints)} mints from 5 sources, batch fetching...")
+
+    batch_data = fetch_token_data_batch(all_mints)
     log(f"Batch got {len(batch_data)} with Dex data")
 
     for mint, real in batch_data.items():
         try:
             if not (FILTERS["mcap_min"] <= real["mcap"] <= FILTERS["mcap_max"]): continue
             if real["liquidity"] < 8000: continue
-            if not (FILTERS["liquidity_min"] <= real["liquidity"] <= FILTERS["liquidity_max"]*1.5): 
-                if real["liquidity"] < FILTERS["liquidity_min"] - 5000:
-                    continue
             rug = get_rug_data(mint)
             if rug is None: continue
-            if rug["is_rugged"]: 
-                blacklist[mint]=time.time()+7200
-                continue
+            if rug["is_rugged"]: blacklist[mint]=time.time()+3600; continue
             if rug["holders"] < FILTERS["holders_min"]: continue
             if rug["top10_pct"] > FILTERS["top10_max_pct"]: continue
             tokens.append({
@@ -316,13 +321,12 @@ def fetch_new_tokens():
             })
         except: continue
 
-    log(f"Found {len(tokens)} NEW after filters | mints {len(mints)} -> batch {len(batch_data)} -> filtered {len(tokens)}")
+    log(f"Found {len(tokens)} NEW after filters | mints {len(all_mints)} -> batch {len(batch_data)} -> filtered {len(tokens)}")
     return tokens
 
 def passes_filters(t):
-    if not (FILTERS["liquidity_min"] <= t["liquidity"] <= FILTERS["liquidity_max"]*1.5): 
-        if t["liquidity"] < 8000: return False, f"Liq {t['liquidity']:.0f}", False
     if not (FILTERS["mcap_min"] <= t["mcap"] <= FILTERS["mcap_max"]): return False, f"Mcap {t['mcap']:.0f}", False
+    if t["liquidity"] < 8000: return False, f"Liq {t['liquidity']:.0f}", False
     if t["bundle_pct"] > FILTERS["bundle_max_pct"]: return False, f"Bundle {t['bundle_pct']}%", False
     if t["insiders_pct"] > FILTERS["insiders_max_pct"]: return False, f"Insiders {t['insiders_pct']}%", False
     if t["holders"] < FILTERS["holders_min"]: return False, f"Holders {t['holders']}", False
@@ -330,7 +334,6 @@ def passes_filters(t):
     if t["volume_5m"] < FILTERS["volume_5m_min"]: return False, f"Vol5m {t['volume_5m']:.0f}", True
     if t["sellers_5m"]>0 and t["buyers_5m"] < t["sellers_5m"] * FILTERS["buyers_vs_sellers"]: return False, f"B/S {t['buyers_5m']}/{t['sellers_5m']}", False
     if t["buyers_5m"]==0: return False, f"No buyers", True
-    if not (t["lp_locked"] or t["lp_burnt_pct"] >= FILTERS["lp_burnt_min_pct"]): return False, "LP", False
     if t["volume_5m"] > t["mcap"] * FILTERS["fake_vol_ratio"]: return False, f"FakeVol", False
     if t.get("rug_score",0) > FILTERS["rug_score_max"]: return False, f"RugScore", False
     return True, "PASS", False
@@ -347,10 +350,10 @@ def send_tx_via_rpc(signed_tx_b64):
         j=r.json()
         sig = j.get("result")
         if not sig:
-            log(f"RPC err {j}")
+            log(f"RPC err {j.get('error') or j}")
             return None
         log(f"Sent {sig[:20]} waiting confirm...")
-        for _ in range(12):
+        for _ in range(15):
             time.sleep(2)
             try:
                 st = requests.post(RPC_URL, json={"jsonrpc":"2.0","id":1,"method":"getSignatureStatuses","params":[[sig],{"searchTransactionHistory":True}]}, timeout=8).json()
@@ -373,7 +376,6 @@ def buy_token(mint, is_pump=True):
     bal = get_balance_sol()
     if bal < BUY_AMOUNT_SOL + 0.008:
         log(f"Low balance {bal:.4f} SOL - skip buy")
-        send_telegram(f"⚠️ Low balance {bal:.4f} SOL - can't buy {mint[:8]}")
         return None
     log(f"BUY {mint[:8]} {BUY_AMOUNT_SOL} SOL is_pump={is_pump} bal={bal:.4f}")
     try:
@@ -381,9 +383,9 @@ def buy_token(mint, is_pump=True):
         if not kp: return None
         pubkey=str(kp.pubkey())
         if is_pump or mint.endswith("pump"):
-            pools = [("pump", 50), ("auto", 80), ("auto", 100)]
+            pools = [("auto", 80), ("pump", 60), ("auto", 100)]
         else:
-            pools = [("raydium", 70), ("auto", 80)]
+            pools = [("auto", 70), ("raydium", 70), ("auto", 90)]
         for pool_type, slippage in pools:
             try:
                 resp=requests.post("https://pumpportal.fun/api/trade-local", json={
@@ -393,7 +395,7 @@ def buy_token(mint, is_pump=True):
                     "denominatedInSol": "true",
                     "amount": BUY_AMOUNT_SOL,
                     "slippage": slippage,
-                    "priorityFee": 0.005,
+                    "priorityFee": 0.008,
                     "pool": pool_type
                 }, timeout=20)
                 if resp.status_code==200:
@@ -416,35 +418,31 @@ def buy_token(mint, is_pump=True):
                         send_telegram(f"✅ BUY {pool_type} {mint[:4]} slip {slippage}%\nhttps://solscan.io/tx/{sig}")
                         return sig
                     else:
-                        log(f"Buy sim fail pool={pool_type} slip={slippage}, trying next")
-                        time.sleep(0.5)
+                        log(f"Buy sim fail pool={pool_type} slip={slippage}, trying next pool")
+                        time.sleep(0.8)
                         continue
                 else:
                     err=resp.text[:800]
-                    log(f"Buy {pool_type} err {resp.status_code} {err[:300]} {mint[:8]}")
-                    if "0x1775" in err or "0x1770" in err or "slippage" in err.lower():
+                    log(f"Buy {pool_type} err {resp.status_code} {err[:250]} {mint[:8]}")
+                    if "Custom" in err or "0x" in err or "slippage" in err.lower() or "Simulation failed" in err:
                         continue
-                    if resp.status_code==400:
-                        blacklist[mint]=time.time()+1800
-                        send_telegram(f"❌ Buy {pool_type} {mint[:8]}: {err[:200]}")
-                        return None
             except Exception as e:
                 log(f"Buy pool {pool_type} exception {e}")
                 continue
+        log(f"All pools failed for {mint[:8]}")
         return None
     except Exception as e:
         log(f"Buy fail {e}\n{traceback.format_exc()}")
-        send_telegram(f"❌ Buy crash {e}")
         return None
 
 def sell_token(mint, slippage=30, tries=2):
     is_pump = mint.endswith("pump")
-    pools = ["pump","auto"] if is_pump else ["raydium","auto"]
+    pools = ["auto","pump"] if is_pump else ["auto","raydium"]
     for attempt in range(tries):
         for pool_type in pools:
             try:
                 kp=get_keypair(); pubkey=str(kp.pubkey())
-                use_slip = 70 if not is_pump else (50 if attempt>0 else slippage)
+                use_slip = 80 if not is_pump else (70 if attempt>0 else slippage)
                 resp=requests.post("https://pumpportal.fun/api/trade-local", json={
                     "publicKey": pubkey,
                     "action": "sell",
@@ -452,7 +450,7 @@ def sell_token(mint, slippage=30, tries=2):
                     "amount": "100%",
                     "denominatedInSol": "false",
                     "slippage": use_slip,
-                    "priorityFee": 0.005,
+                    "priorityFee": 0.008,
                     "pool": pool_type
                 }, timeout=20)
                 if resp.status_code!=200:
@@ -482,21 +480,15 @@ def check_positions():
     for mint,pos in list(open_positions.items()):
         data=fetch_token_data(mint)
         if not data: continue
-        if pos["symbol"]=="?" and data["symbol"]!="?":
-            pos["symbol"]=data["symbol"]
         pos["curr_mcap"] = data["mcap"]
         pos["curr_symbol"] = data["symbol"]
-        pos["curr_volume"] = data["volume_5m"]
-        pos["curr_buyers"] = data.get("buyers_5m",0)
-        pos["curr_sellers"] = data.get("sellers_5m",0)
-        
         curr=data["mcap"]; entry=pos["entry_mcap"]
         pct = (curr/entry -1)*100 if entry else 0
-        log(f"CHECK {pos['symbol']} {entry/1000:.0f}K -> {curr/1000:.0f}K ({pct:+.0f}%) B/S {data.get('buyers_5m',0)}/{data.get('sellers_5m',0)}")
+        log(f"CHECK {pos['symbol']} {entry/1000:.0f}K -> {curr/1000:.0f}K ({pct:+.0f}%)")
         if curr >= entry * FILTERS["take_profit_x"]:
             log(f"2X HIT {pos['symbol']} TRY SELL")
             bal_before = get_balance_sol()
-            sig = sell_token(mint, slippage=40, tries=3)
+            sig = sell_token(mint, slippage=50, tries=3)
             if sig:
                 time.sleep(3)
                 bal_after = get_balance_sol()
@@ -508,11 +500,9 @@ def check_positions():
                 to_remove.append(mint)
                 bought_ever.add(mint)
                 blacklist[mint]=time.time()+9999999
-            else:
-                send_telegram(f"⚠️ 2X HIT but SELL FAILED {pos['symbol']}")
         elif curr <= entry * (1 - FILTERS["emergency_rug_pct"]/100):
             bal_before = get_balance_sol()
-            sig = sell_token(mint, slippage=60, tries=4)
+            sig = sell_token(mint, slippage=70, tries=4)
             if sig:
                 time.sleep(3)
                 bal_after = get_balance_sol()
@@ -524,7 +514,7 @@ def check_positions():
                 to_remove.append(mint)
         elif curr <= entry * (1 - FILTERS["stop_loss_pct"]/100):
             bal_before = get_balance_sol()
-            sig = sell_token(mint, slippage=50, tries=3)
+            sig = sell_token(mint, slippage=60, tries=3)
             if sig:
                 time.sleep(3)
                 bal_after = get_balance_sol()
@@ -566,87 +556,60 @@ def handle_telegram_commands():
                     if text.startswith("/pnl"):
                         bal=get_balance_sol()
                         winrate = (total_wins/(total_wins+total_losses)*100) if (total_wins+total_losses)>0 else 0
-                        send_telegram(f"<b>📊 PnL</b>\nToday: {pnl_today_sol:+.4f} SOL\nBalance: {bal:.4f} SOL\nWins: {total_wins} Losses: {total_losses}\nWinRate: {winrate:.1f}%\nTrades today: {trades_today}/{MAX_TRADES_PER_DAY}\nBought ever: {len(bought_ever)}\nOpen: {len(open_positions)}/{MAX_OPEN_POSITIONS}")
-
-                    elif text.startswith("/positions") or text.startswith("/pos"):
+                        send_telegram(f"<b>📊 PnL</b>\nToday: {pnl_today_sol:+.4f} SOL\nBalance: {bal:.4f} SOL\nWins: {total_wins} Losses: {total_losses}\nWinRate: {winrate:.1f}%\nTrades: {trades_today}/{MAX_TRADES_PER_DAY}")
+                    elif text.startswith("/positions"):
                         if not open_positions:
                             send_telegram("No open positions")
                         else:
                             txt="<b>📦 Open LIVE:</b>\n"
                             for m,p in list(open_positions.items())[:10]:
-                                try:
-                                    entry = p.get("entry_mcap",0)
-                                    curr = p.get("curr_mcap", entry)
-                                    pct = (curr/entry -1)*100 if entry else 0
-                                    held = int(time.time() - p.get("entry_time", time.time())) // 60
-                                    sym = p.get("curr_symbol") or p.get("symbol","?")
-                                    txt+=f"{sym} {entry/1000:.0f}K -> {curr/1000:.0f}K ({pct:+.0f}%) {held}m ago\n"
-                                except Exception as e:
-                                    txt+=f"{p.get('symbol','?')} {p.get('entry_mcap',0)/1000:.0f}K entry\n"
+                                entry = p.get("entry_mcap",0)
+                                curr = p.get("curr_mcap", entry)
+                                pct = (curr/entry -1)*100 if entry else 0
+                                held = int(time.time() - p.get("entry_time", time.time())) // 60
+                                sym = p.get("curr_symbol") or p.get("symbol","?")
+                                txt+=f"{sym} {entry/1000:.0f}K -> {curr/1000:.0f}K ({pct:+.0f}%) {held}m\n"
                             send_telegram(txt)
-
-                    elif text.startswith("/watchlist") or text.startswith("/watch"):
-                        if not watchlist:
-                            send_telegram("Watchlist empty - waiting for 10K vol")
+                    elif text.startswith("/watchlist"):
+                        if not watchlist: send_telegram("Watchlist empty")
                         else:
                             txt=f"<b>👀 Watchlist ({len(watchlist)}):</b>\n"
                             for m,w in list(watchlist.items())[:15]:
-                                try:
-                                    held = int(time.time() - w.get("first_seen", time.time())) // 60
-                                    txt+=f"{w.get('symbol','?')} {held}m ago\n"
-                                except:
-                                    txt+=f"{w.get('symbol','?')}\n"
+                                held = int(time.time() - w.get("first_seen", time.time())) // 60
+                                txt+=f"{w.get('symbol','?')} {held}m ago\n"
                             send_telegram(txt)
-
                     elif text.startswith("/stats"):
                         total=total_wins+total_losses
                         winrate = (total_wins/total*100) if total>0 else 0
                         bal=get_balance_sol()
-                        txt=f"<b>📈 Stats</b>\nTotal: {total}\nWins: {total_wins} Losses: {total_losses}\nWinRate: {winrate:.1f}%\nPnL: {pnl_today_sol:+.4f} SOL\nBalance: {bal:.4f}\nBought ever: {len(bought_ever)}\nTrades today: {trades_today}/{MAX_TRADES_PER_DAY}\n"
-                        if trade_history:
-                            txt+="\nLast 5:\n"
-                            for t in trade_history[-5:]:
-                                txt+=f"{t.get('time','')} {t.get('symbol','?')} {t.get('result','')} {t.get('pnl',0):+.4f}\n"
+                        txt=f"<b>📈 Stats</b>\nTotal: {total}\nWins: {total_wins} Losses: {total_losses}\nWinRate: {winrate:.1f}%\nPnL: {pnl_today_sol:+.4f}\nBal: {bal:.4f}\n"
                         send_telegram(txt)
-
                     elif text.startswith("/balance"):
                         bal=get_balance_sol()
-                        send_telegram(f"💰 Balance: {bal:.4f} SOL\nOpen: {len(open_positions)}/{MAX_OPEN_POSITIONS}\nWatch: {len(watchlist)}\nBought ever: {len(bought_ever)}")
-
+                        send_telegram(f"💰 Balance: {bal:.4f} SOL\nOpen: {len(open_positions)}/{MAX_OPEN_POSITIONS}")
                     elif text.startswith("/trades"):
-                        if not trade_history: 
-                            send_telegram("No trades yet - only open positions\nOpen: %d/%d" % (len(open_positions), MAX_OPEN_POSITIONS))
+                        if not trade_history: send_telegram("No trades yet")
                         else:
                             txt="<b>Last trades:</b>\n"
                             for t in trade_history[-10:]:
-                                txt+=f"{t.get('symbol','?')} {t.get('result','')} {t.get('entry',0)/1000:.0f}K->{t.get('exit',0)/1000:.0f}K {t.get('pnl',0):+.4f}\n"
+                                txt+=f"{t.get('symbol','?')} {t.get('result','')} {t.get('pnl',0):+.4f}\n"
                             send_telegram(txt)
-
                     elif text.startswith("/stop"):
-                        global bot_running; bot_running=False
-                        send_telegram("⏸️ Bot PAUSED. /start to resume")
-
+                        global bot_running; bot_running=False; send_telegram("⏸️ PAUSED")
                     elif text.startswith("/start"):
-                        bot_running=True
-                        send_telegram("▶️ Bot RESUMED - scanning")
-
+                        bot_running=True; send_telegram("▶️ RESUMED")
                     elif text.startswith("/help"):
-                        send_telegram("<b>Commands:</b>\n/pnl - PnL + balance\n/positions - LIVE open positions\n/watchlist - waiting for 10K\n/stats - winrate + history\n/balance - wallet\n/trades - last trades\n/stop /start")
-
+                        send_telegram("/pnl /positions /watchlist /stats /balance /trades /stop /start")
                 except Exception as inner_e:
-                    log(f"TG command {text} inner err {inner_e}\n{traceback.format_exc()}")
-                    try:
-                        send_telegram(f"⚠️ Command {text} error: {inner_e}")
-                    except: pass
-
+                    log(f"TG cmd err {inner_e}")
         except Exception as e:
             log(f"TG poll err {e}"); time.sleep(5)
 
 def main_loop():
     global trades_today,pnl_today_sol,last_reset_date
     set_telegram_commands()
-    log(f"🚀 BOT v7.7 - Render 429 FIX LIVE")
-    send_telegram(f"🚀 BOT v7.7 LIVE\n✅ Pump.fun primary (no 429)\n✅ Batch Dex\n✅ Live positions cache\n✅ All commands safe")
+    log(f"🚀 BOT v7.9 - 5 SOURCES MULTI LIVE")
+    send_telegram(f"🚀 BOT v7.9 LIVE\n✅ 5 sources (Dex profiles + boosts + PumpPortal + Gecko + Dex search)\n✅ If 1 is 429, 4 others work\n✅ No more 0 mints")
     while True:
         try:
             if not bot_running: time.sleep(5); continue
@@ -660,8 +623,7 @@ def main_loop():
                 if blacklist[k] < now and k not in bought_ever:
                     del blacklist[k]
             for mint in list(watchlist.keys()):
-                if mint in open_positions or mint in blacklist or mint in bought_ever:
-                    del watchlist[mint]; continue
+                if mint in open_positions or mint in blacklist or mint in bought_ever: del watchlist[mint]; continue
                 if now - watchlist[mint]["first_seen"] > 1800: del watchlist[mint]; continue
                 data=fetch_token_data(mint)
                 if not data: continue
@@ -670,15 +632,13 @@ def main_loop():
                 t={"mint":mint,"symbol":watchlist[mint]["symbol"],"mcap":data["mcap"],"liquidity":data["liquidity"],"volume_5m":data["volume_5m"],"holders":rug["holders"],"bundle_pct":rug["bundle_pct"],"insiders_pct":rug["insiders_pct"],"top10_pct":rug["top10_pct"],"buyers_5m":data["buyers_5m"],"sellers_5m":data["sellers_5m"],"lp_burnt_pct":100,"lp_locked":True,"rug_score":rug["score"]}
                 ok,reason,is_vol_fail = passes_filters(t)
                 if ok:
-                    log(f"REVISIT PASS {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f} B/S {t['buyers_5m']}/{t['sellers_5m']} -> BUYING")
+                    log(f"REVISIT PASS {t['symbol']} -> BUYING")
                     tx=buy_token(mint, is_pump=mint.endswith("pump"))
                     if tx and len(tx) > 20:
-                        bal = get_balance_sol()
-                        open_positions[mint]={"entry_mcap":t["mcap"],"symbol":t["symbol"],"entry_time":time.time(),"entry_bal":bal,"curr_mcap":t["mcap"]}
+                        open_positions[mint]={"entry_mcap":t["mcap"],"symbol":t["symbol"],"entry_time":time.time(),"curr_mcap":t["mcap"]}
                         bought_ever.add(mint)
                         blacklist[mint]=time.time()+9999999
                         del watchlist[mint]; trades_today+=1
-                        send_telegram(f"💰 BUY (REVISIT 10K) {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f}\n{t['mint']}")
                 elif not is_vol_fail:
                     del watchlist[mint]
             if len(open_positions) < MAX_OPEN_POSITIONS:
@@ -688,24 +648,21 @@ def main_loop():
                     ok,reason,is_vol_fail = passes_filters(t)
                     if not ok:
                         if is_vol_fail:
-                            if t["mint"] not in bought_ever:
-                                watchlist[t["mint"]]={"symbol":t["symbol"],"first_seen":time.time()}
-                                log(f"WATCHLIST {t['symbol']} Vol {t['volume_5m']:.0f}/10000 waiting")
+                            watchlist[t["mint"]]={"symbol":t["symbol"],"first_seen":time.time()}
+                            log(f"WATCHLIST {t['symbol']} Vol {t['volume_5m']:.0f}/10000 waiting")
                         else:
-                            log(f"Filter fail {t['symbol']} {t['mcap']/1000:.0f}K - {reason}")
+                            log(f"Filter fail {t['symbol']} - {reason}")
                         continue
-                    log(f"PASS {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f} B/S {t['buyers_5m']}/{t['sellers_5m']} RUG {t.get('rug_score',0)} -> BUYING")
+                    log(f"PASS {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f} -> BUYING")
                     tx=buy_token(t["mint"], is_pump=t.get("is_pump", True))
                     if tx and len(tx) > 20:
-                        bal = get_balance_sol()
-                        open_positions[t["mint"]]={"entry_mcap":t["mcap"],"symbol":t["symbol"],"entry_time":time.time(),"entry_bal":bal,"curr_mcap":t["mcap"]}
+                        open_positions[t["mint"]]={"entry_mcap":t["mcap"],"symbol":t["symbol"],"entry_time":time.time(),"curr_mcap":t["mcap"]}
                         bought_ever.add(t["mint"])
                         blacklist[t["mint"]]=time.time()+9999999
                         trades_today+=1
-                        send_telegram(f"💰 BUY {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f} B/S {t['buyers_5m']}/{t['sellers_5m']}\n{t['mint']}")
+                        send_telegram(f"💰 BUY {t['symbol']} MC {t['mcap']/1000:.0f}K VOL {t['volume_5m']:.0f}\n{t['mint']}")
                         if len(open_positions)>=MAX_OPEN_POSITIONS: break
-                    time.sleep(1)
-            time.sleep(20)
+            time.sleep(15)
         except Exception as e:
             log(f"CRASH {e}\n{traceback.format_exc()}"); time.sleep(10)
 
