@@ -2,5 +2,4 @@ flask
 requests
 solders
 base58
-solana
-websocket-client==1.7.0
+websocket-client==1.8.0
