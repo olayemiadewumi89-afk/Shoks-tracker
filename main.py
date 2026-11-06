@@ -1,4 +1,4 @@
-import os, time, threading, json, queue, traceback
+import os, time, threading, json, queue, traceback, re
 from datetime import date, datetime
 from flask import Flask
 import requests
@@ -43,6 +43,7 @@ ws_q = queue.Queue()
 ws_ok = False
 bot_running = True
 threads_started = False
+seen_mints = set() # FIX: for race condition
 
 app = Flask(__name__)
 
@@ -72,7 +73,7 @@ def health():
 
 @app.route("/")
 def home(): 
-    return f"v10.5 FINAL FIX DRY_RUN={DRY_RUN} STOP={STOP_LOSS}% TP={TAKE_PROFIT_X}x WS={ws_ok} Watch={len(watchlist)} Open={len(open_positions)}",200
+    return f"v10.6 FIXED DRY_RUN={DRY_RUN} STOP={STOP_LOSS}% TP={TAKE_PROFIT_X}x WS={ws_ok} Watch={len(watchlist)} Open={len(open_positions)}",200
 
 def ws_on_message(ws, message):
     try:
@@ -80,15 +81,11 @@ def ws_on_message(ws, message):
         mint=d.get("mint") or d.get("ca") or (d.get("data",{}).get("mint") if isinstance(d.get("data"),dict) else None)
         if not mint or len(mint)<32: 
             return
-        if mint in blacklist or mint in open_positions or mint in watchlist: 
+        if mint in blacklist or mint in open_positions or mint in watchlist or mint in seen_mints: 
             return
-        try:
-            if mint in list(ws_q.queue):
-                return
-        except:
-            pass
         log(f"WS NEW {mint[:8]}")
         ws_q.put(mint)
+        seen_mints.add(mint)
     except Exception as e:
         log(f"WS msg err {e}")
 
@@ -96,7 +93,7 @@ def ws_on_open(ws):
     global ws_ok
     ws_ok=True
     log("WS Connected to pumpportal.fun")
-    tg(f"WS Connected v10.5 DRY_RUN={DRY_RUN} STOP={STOP_LOSS}%")
+    tg(f"WS Connected v10.6 DRY_RUN={DRY_RUN} STOP={STOP_LOSS}%")
     try: 
         ws.send(json.dumps({"method":"subscribeNewToken"}))
         log("WS subscribe sent")
@@ -168,6 +165,16 @@ def fetch_dex(mint):
     except Exception as e:
         return None
 
+def extract_number_pct(text):
+    try:
+        m = re.search(r'(\d+(?:\.\d+)?)\s*%', str(text))
+        if m: return float(m.group(1))
+        m2 = re.search(r'(\d+(?:\.\d+)?)', str(text))
+        if m2: return float(m2.group(1))
+        return 0
+    except:
+        return 0
+
 def fetch_rug(mint):
     try:
         r=requests.get(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report", timeout=6, headers={"User-Agent":"Mozilla/5.0"})
@@ -180,10 +187,27 @@ def fetch_rug(mint):
         holders=j.get("totalHolders",0)
         top10=sum([h.get("pct",0) for h in j.get("topHolders",[])[:10]])
         bundle=0; insiders=0
+        # FIXED: read real % from risk, not hardcoded 25
         for rk in j.get("risks",[]):
-            n=rk.get("name","").lower()
-            if "bundle" in n: bundle=25
-            if "insider" in n: insiders=25
+            n=str(rk.get("name","")).lower()
+            val = str(rk.get("value","")) + " " + str(rk.get("description",""))
+            if "bundle" in n:
+                # rugcheck gives like "3 bundles found" or pct
+                num = extract_number_pct(val)
+                # if it's bundle count, convert count to rough % (count*2)
+                if num > 0:
+                    if num < 10: # likely count, not pct
+                        bundle = max(bundle, num * 2) 
+                    else:
+                        bundle = max(bundle, num)
+                else:
+                    bundle = max(bundle, 15)
+            if "insider" in n:
+                num = extract_number_pct(val)
+                if num > 0:
+                    insiders = max(insiders, num)
+                else:
+                    insiders = max(insiders, 15)
             if "single holder" in n: top10=max(top10,90)
         return {"score":score,"holders":holders,"top10":top10,"bundle":bundle,"insiders":insiders}
     except:
@@ -276,6 +300,7 @@ def sell(mint):
     return None
 
 def check_positions():
+    global trades_today, pnl_today
     remove=[]
     for mint,pos in list(open_positions.items()):
         data=fetch_dex(mint)
@@ -290,8 +315,12 @@ def check_positions():
         elif curr <= entry*(1-EMERGENCY_RUG/100): should_sell="RUG"
         elif curr <= entry*(1-STOP_LOSS/100): should_sell="STOP"
         if should_sell:
-            if DRY_RUN:
-                tg(f"DRY CLOSE {should_sell} {pos['symbol']} {pct:+.0f}% {entry/1000:.0f}K->{curr/1000:.0f}K")
+            # FIXED: calc pnl
+            profit_sol = (curr/entry - 1) * BUY_AMOUNT if entry else 0
+            if DRY_RUN or pos.get("is_paper"):
+                tg(f"DRY CLOSE {should_sell} {pos['symbol']} {pct:+.0f}% {entry/1000:.0f}K->{curr/1000:.0f}K PnL {profit_sol:+.4f} SOL")
+                pnl_today += profit_sol
+                trades_today += 1
                 remove.append(mint)
                 continue
             s=None
@@ -302,18 +331,24 @@ def check_positions():
                 time.sleep(2)
             if s:
                 tg(f"{should_sell} {pos['symbol']} {pct:+.0f}% https://solscan.io/tx/{s}")
+                pnl_today += profit_sol
+                trades_today += 1
                 remove.append(mint)
             else:
                 log(f"SELL FAIL {pos['symbol']} - retry next loop")
                 if pct <= -60:
                     tg(f"FORCE CLOSE {pos['symbol']} {pct:.0f}%")
+                    pnl_today += profit_sol
+                    trades_today += 1
                     remove.append(mint)
-    for m in remove: open_positions.pop(m,None)
+    for m in remove: 
+        open_positions.pop(m,None)
+        seen_mints.discard(m)
 
 def main_loop():
     global trades_today, pnl_today, last_reset, bot_running
-    log(f"v10.5 FINAL FIX START DRY_RUN={DRY_RUN} STOP={STOP_LOSS}% TP={TAKE_PROFIT_X}x Filters {FILTERS['mcap_min']/1000:.0f}K-{FILTERS['mcap_max']/1000:.0f}K")
-    tg(f"v10.5 START DRY={DRY_RUN} STOP {STOP_LOSS}% TP {TAKE_PROFIT_X}x WS={ws_ok}")
+    log(f"v10.6 FIXED START DRY_RUN={DRY_RUN} STOP={STOP_LOSS}% TP={TAKE_PROFIT_X}x Filters {FILTERS['mcap_min']/1000:.0f}K-{FILTERS['mcap_max']/1000:.0f}K")
+    tg(f"v10.6 START DRY={DRY_RUN} STOP {STOP_LOSS}% TP {TAKE_PROFIT_X}x WS={ws_ok}")
     last_ws_log = time.time()
     while True:
         try:
@@ -358,11 +393,14 @@ def main_loop():
                 log(f"STRICT PASS {dex['symbol']} MC {dex['mcap']/1000:.0f}K Vol {dex['volume_5m']:.0f} Holders {rug['holders']} Top10 {rug['top10']:.0f}% -> BUY")
                 sig=buy(mint)
                 if sig:
+                    # FIXED: paper also goes to open_positions + pnl tracking
                     if DRY_RUN:
+                        open_positions[mint]={"entry":dex["mcap"],"symbol":dex["symbol"],"time":now,"is_paper":True}
+                        blacklist[mint]=now+86400 # FIXED was 3600
+                        del watchlist[mint]
                         tg(f"📝 PAPER BUY {dex['symbol']} MC {dex['mcap']/1000:.0f}K Liq {dex['liquidity']/1000:.0f}K\nhttps://dexscreener.com/solana/{mint}")
-                        blacklist[mint]=now+3600; del watchlist[mint]
                     else:
-                        open_positions[mint]={"entry":dex["mcap"],"symbol":dex["symbol"],"time":now}
+                        open_positions[mint]={"entry":dex["mcap"],"symbol":dex["symbol"],"time":now,"is_paper":False}
                         blacklist[mint]=now+9999999; del watchlist[mint]; trades_today+=1
                         tg(f"🚀 BUY {dex['symbol']} MC {dex['mcap']/1000:.0f}K https://solscan.io/tx/{sig}")
             time.sleep(4)
@@ -404,12 +442,12 @@ def tg_loop():
                             d=fetch_dex(m)
                             if d:
                                 pct=(d['mcap']/p['entry']-1)*100 if p['entry'] else 0
-                                lines.append(f"{p['symbol']} {p['entry']/1000:.0f}K->{d['mcap']/1000:.0f}K {pct:+.0f}%")
-                        tg("\n".join(lines))
+                                lines.append(f"{p['symbol']} {p['entry']/1000:.0f}K->{d['mcap']/1000:.0f}K {pct:+.0f}% {'PAPER' if p.get('is_paper') else ''}")
+                        tg("\n".join(lines) + f"\nPnL today {pnl_today:+.4f} SOL Trades {trades_today}")
                 if "/watch" in low or "/watchlist" in low:
                     tg(f"Watch {len(watchlist)} Q {ws_q.qsize()} WS={ws_ok}\nLast: {list(watchlist.keys())[-2:] if watchlist else 'empty'}")
                 if "/pnl" in low:
-                    tg(f"PnL {pnl_today:+.4f} Trades {trades_today} STOP {STOP_LOSS}% TP {TAKE_PROFIT_X}x")
+                    tg(f"PnL {pnl_today:+.4f} SOL Trades {trades_today} STOP {STOP_LOSS}% TP {TAKE_PROFIT_X}x")
                 if "/dry" in low and "off" in low:
                     DRY_RUN=False; tg("DRY OFF - LIVE")
                 if "/dry" in low and "on" in low:
