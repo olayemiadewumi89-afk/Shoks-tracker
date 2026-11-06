@@ -22,10 +22,10 @@ EMERGENCY_RUG = 45
 TAKE_PROFIT_X = 2.0
 
 FILTERS = {
-    "mcap_min": 50000,
+    "mcap_min": 20000,
     "mcap_max": 900000,
-    "liquidity_min": 12000,
-    "volume_5m_min": 6000,
+    "liquidity_min": 5000,
+    "volume_5m_min": 1000,
     "holders_min": 50,
     "bundle_max": 25,
     "insiders_max": 20,
@@ -192,11 +192,9 @@ def fetch_rug(mint):
             n=str(rk.get("name","")).lower()
             val = str(rk.get("value","")) + " " + str(rk.get("description",""))
             if "bundle" in n:
-                # rugcheck gives like "3 bundles found" or pct
                 num = extract_number_pct(val)
-                # if it's bundle count, convert count to rough % (count*2)
                 if num > 0:
-                    if num < 10: # likely count, not pct
+                    if num < 10:
                         bundle = max(bundle, num * 2) 
                     else:
                         bundle = max(bundle, num)
@@ -315,7 +313,6 @@ def check_positions():
         elif curr <= entry*(1-EMERGENCY_RUG/100): should_sell="RUG"
         elif curr <= entry*(1-STOP_LOSS/100): should_sell="STOP"
         if should_sell:
-            # FIXED: calc pnl
             profit_sol = (curr/entry - 1) * BUY_AMOUNT if entry else 0
             if DRY_RUN or pos.get("is_paper"):
                 tg(f"DRY CLOSE {should_sell} {pos['symbol']} {pct:+.0f}% {entry/1000:.0f}K->{curr/1000:.0f}K PnL {profit_sol:+.4f} SOL")
@@ -393,10 +390,9 @@ def main_loop():
                 log(f"STRICT PASS {dex['symbol']} MC {dex['mcap']/1000:.0f}K Vol {dex['volume_5m']:.0f} Holders {rug['holders']} Top10 {rug['top10']:.0f}% -> BUY")
                 sig=buy(mint)
                 if sig:
-                    # FIXED: paper also goes to open_positions + pnl tracking
                     if DRY_RUN:
                         open_positions[mint]={"entry":dex["mcap"],"symbol":dex["symbol"],"time":now,"is_paper":True}
-                        blacklist[mint]=now+86400 # FIXED was 3600
+                        blacklist[mint]=now+86400
                         del watchlist[mint]
                         tg(f"📝 PAPER BUY {dex['symbol']} MC {dex['mcap']/1000:.0f}K Liq {dex['liquidity']/1000:.0f}K\nhttps://dexscreener.com/solana/{mint}")
                     else:
