@@ -22,10 +22,10 @@ EMERGENCY_RUG = 45
 TAKE_PROFIT_X = 2.0
 
 FILTERS = {
-    "mcap_min": 40000,
+    "mcap_min": 50000,
     "mcap_max": 900000,
-    "liquidity_min": 20000,
-    "volume_5m_min": 8000,
+    "liquidity_min": 12000,
+    "volume_5m_min": 6000,
     "holders_min": 50,
     "bundle_max": 25,
     "insiders_max": 20,
