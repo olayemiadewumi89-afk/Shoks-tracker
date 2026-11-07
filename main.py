@@ -21,7 +21,6 @@ STOP_LOSS = 35
 EMERGENCY_RUG = 45
 TAKE_PROFIT_X = 2.0
 
-# === YOUR ORIGINAL NEW COIN FILTER (MODE A) ===
 FILTERS = {
     "mcap_min": 40000,
     "mcap_max": 900000,
@@ -34,7 +33,6 @@ FILTERS = {
     "rug_score_max": 4000
 }
 
-# === NEW WHALE MOMENTUM FILTER (MODE B) ===
 FILTERS_MOMENTUM = {
     "mcap_min": 80000,
     "mcap_max": 350000,
@@ -44,18 +42,18 @@ FILTERS_MOMENTUM = {
     "bundle_max": 15,
     "insiders_max": 15,
     "volume_5m_min": 3000,
-    "buys_m5_min": 25,
+    "buys_m5_min": 30,
     "buy_sell_ratio_min": 2.5,
-    "price_m5_min": 20,   # +20% in 5m
-    "price_m15_min": 50,  # +50% in 15m
+    "price_m5_min": 20,
+    "price_m15_min": 50,
     "holders_growth_min": 10,
-    "dip_min_pct": 50 # must have dipped 50% from ATH before
+    "dip_min_pct": 50
 }
 
 open_positions = {}
 blacklist = {}
 watchlist = {}
-momentum_watch = {} # mint -> {first_seen, holders_prev, liq_prev, mcap_low, ath}
+momentum_watch = {}
 trades_today = 0
 pnl_today = 0.0
 last_reset = date.today()
@@ -87,14 +85,12 @@ def health():
         "momentum_watch":len(momentum_watch),
         "open":len(open_positions),
         "trades":trades_today,
-        "stop_loss":STOP_LOSS,
-        "take_profit":TAKE_PROFIT_X,
         "queue":ws_q.qsize()
     },200
 
 @app.route("/")
 def home(): 
-    return f"v11.0 DUAL DRY_RUN={DRY_RUN} STOP={STOP_LOSS}% TP={TAKE_PROFIT_X}x WS={ws_ok} Watch={len(watchlist)} Mom={len(momentum_watch)} Open={len(open_positions)}",200
+    return f"v11.1 INDEPENDENT DRY={DRY_RUN} Watch={len(watchlist)} Mom={len(momentum_watch)} Open={len(open_positions)}",200
 
 def ws_on_message(ws, message):
     try:
@@ -104,32 +100,24 @@ def ws_on_message(ws, message):
             return
         if mint in blacklist or mint in open_positions or mint in watchlist or mint in seen_mints: 
             return
-        log(f"WS NEW {mint[:8]}")
         ws_q.put(mint)
         seen_mints.add(mint)
-    except Exception as e:
-        log(f"WS msg err {e}")
+    except:
+        pass
 
 def ws_on_open(ws):
     global ws_ok
     ws_ok=True
-    log("WS Connected to pumpportal.fun")
-    tg(f"WS Connected v11 DUAL DRY_RUN={DRY_RUN}")
+    log("WS Connected")
+    tg(f"WS Connected v11.1 DRY={DRY_RUN}")
     try: 
         ws.send(json.dumps({"method":"subscribeNewToken"}))
-        # Also try to get graduated for momentum feed
-        try:
-            ws.send(json.dumps({"method":"subscribeRecentlyGraduated"}))
-        except:
-            pass
-        log("WS subscribe sent")
     except Exception as e:
         log(f"WS sub fail {e}")
 
 def ws_on_close(ws,c,m):
     global ws_ok
     ws_ok=False
-    log(f"WS Closed code={c} msg={m}")
 
 def ws_on_error(ws,e): 
     log(f"WS Err {e}")
@@ -138,39 +126,26 @@ def ws_loop():
     global ws_ok
     while True:
         try:
-            log("WS connecting...")
-            w=websocket.WebSocketApp(
-                "wss://pumpportal.fun/api/data", 
-                on_open=ws_on_open, 
-                on_message=ws_on_message, 
-                on_error=ws_on_error, 
-                on_close=ws_on_close
-            )
-            w.run_forever(ping_interval=20, ping_timeout=15, ping_payload="ping")
+            w=websocket.WebSocketApp("wss://pumpportal.fun/api/data", on_open=ws_on_open, on_message=ws_on_message, on_error=ws_on_error, on_close=ws_on_close)
+            w.run_forever(ping_interval=20, ping_timeout=15)
             ws_ok=False
-            log("WS run_forever ended - reconnect in 5s")
             time.sleep(5)
         except Exception as e:
             ws_ok=False
-            log(f"WS loop crash {e}")
+            log(f"WS crash {e}")
             time.sleep(5)
 
 def get_balance():
     try:
-        if not PRIVATE_KEY_B58 or not RPC_URL:
-            return 0
         kp=Keypair.from_bytes(b58decode(PRIVATE_KEY_B58.strip()))
         r=requests.post(RPC_URL, json={"jsonrpc":"2.0","id":1,"method":"getBalance","params":[str(kp.pubkey())]}, timeout=8).json()
         return r.get("result",{}).get("value",0)/1e9
-    except Exception as e:
-        log(f"bal err {e}")
+    except:
         return 0
 
 def get_keypair():
-    try: 
-        return Keypair.from_bytes(b58decode(PRIVATE_KEY_B58.strip()))
-    except: 
-        return None
+    try: return Keypair.from_bytes(b58decode(PRIVATE_KEY_B58.strip()))
+    except: return None
 
 def fetch_dex(mint):
     try:
@@ -179,12 +154,11 @@ def fetch_dex(mint):
             time.sleep(0.5)
             return None
         pairs=r.json().get("pairs",[])
-        if not pairs: 
-            return None
+        if not pairs: return None
         p=sorted(pairs, key=lambda x: float(x.get("liquidity",{}).get("usd",0)), reverse=True)[0]
         vol = p.get("volume",{})
         txns = p.get("txns",{})
-        priceChange = p.get("priceChange",{})
+        pc = p.get("priceChange",{})
         return {
             "mcap":float(p.get("fdv",0)or 0), 
             "liquidity":float(p.get("liquidity",{}).get("usd",0)or 0), 
@@ -193,20 +167,18 @@ def fetch_dex(mint):
             "volume_6h":float(vol.get("h6",0)or 0),
             "buys_m5": int(txns.get("m5",{}).get("buys",0) or 0),
             "sells_m5": int(txns.get("m5",{}).get("sells",0) or 0),
-            "price_m5": float(priceChange.get("m5",0) or 0),
-            "price_m15": float(priceChange.get("m15",0) or 0),
-            "price_h1": float(priceChange.get("h1",0) or 0),
+            "price_m5": float(pc.get("m5",0) or 0),
+            "price_m15": float(pc.get("m15",0) or 0),
+            "price_h1": float(pc.get("h1",0) or 0),
             "symbol":str(p.get("baseToken",{}).get("symbol","?"))[:12]
         }
-    except Exception as e:
+    except:
         return None
 
 def extract_number_pct(text):
     try:
         m = re.search(r'(\d+(?:\.\d+)?)\s*%', str(text))
         if m: return float(m.group(1))
-        m2 = re.search(r'(\d+(?:\.\d+)?)', str(text))
-        if m2: return float(m2.group(1))
         return 0
     except:
         return 0
@@ -214,12 +186,8 @@ def extract_number_pct(text):
 def fetch_rug(mint):
     try:
         r=requests.get(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report", timeout=6, headers={"User-Agent":"Mozilla/5.0"})
-        if r.status_code in (429,403): 
-            return None
-        if r.status_code!=200: 
-            return None
+        if r.status_code!=200: return None
         j=r.json()
-        score=j.get("score",0)
         holders=j.get("totalHolders",0)
         top10=sum([h.get("pct",0) for h in j.get("topHolders",[])[:10]])
         bundle=0; insiders=0
@@ -228,21 +196,12 @@ def fetch_rug(mint):
             val = str(rk.get("value","")) + " " + str(rk.get("description",""))
             if "bundle" in n:
                 num = extract_number_pct(val)
-                if num > 0:
-                    if num < 10:
-                        bundle = max(bundle, num * 2) 
-                    else:
-                        bundle = max(bundle, num)
-                else:
-                    bundle = max(bundle, 15)
+                bundle = max(bundle, num*2 if num<10 and num>0 else num if num>0 else 15)
             if "insider" in n:
                 num = extract_number_pct(val)
-                if num > 0:
-                    insiders = max(insiders, num)
-                else:
-                    insiders = max(insiders, 15)
+                insiders = max(insiders, num if num>0 else 15)
             if "single holder" in n: top10=max(top10,90)
-        return {"score":score,"holders":holders,"top10":top10,"bundle":bundle,"insiders":insiders}
+        return {"score":j.get("score",0),"holders":holders,"top10":top10,"bundle":bundle,"insiders":insiders}
     except:
         return None
 
@@ -257,10 +216,8 @@ def strict_pass(t):
     if t["rug_score"] > FILTERS["rug_score_max"]: return False, f"score {t['rug_score']}"
     return True, "PASS"
 
-# === NEW: WHALE MOMENTUM CHECK ===
 def momentum_pass(dex, rug, track):
     f = FILTERS_MOMENTUM
-    # basic size
     if not (f["mcap_min"] <= dex["mcap"] <= f["mcap_max"]): return False, f"mom mcap {dex['mcap']/1000:.0f}K"
     if dex["liquidity"] < f["liquidity_min"]: return False, f"mom liq {dex['liquidity']:.0f}"
     if rug["holders"] < f["holders_min"]: return False, f"mom holders {rug['holders']}"
@@ -268,107 +225,72 @@ def momentum_pass(dex, rug, track):
     if rug["bundle"] > f["bundle_max"]: return False, f"mom bundle {rug['bundle']}%"
     if rug["insiders"] > f["insiders_max"]: return False, f"mom insiders {rug['insiders']}%"
     if dex["volume_5m"] < f["volume_5m_min"]: return False, f"mom vol {dex['volume_5m']:.0f}"
-    # whale behavior
     if dex["buys_m5"] < f["buys_m5_min"]: return False, f"mom buys {dex['buys_m5']}"
     ratio = dex["buys_m5"] / max(1, dex["sells_m5"])
     if ratio < f["buy_sell_ratio_min"]: return False, f"mom ratio {ratio:.1f}"
-    # volume spike: m5 should be high vs h1 (explosion)
-    if dex["volume_1h"] > 0 and dex["volume_5m"] < dex["volume_1h"] * 0.6:
-        # if h1 is huge, allow if m5 still > 3k, else fail - this prevents dying coins
+    if dex["volume_1h"]>0 and dex["volume_5m"] < dex["volume_1h"]*0.15: # m5 should be >15% of h1 = spike
         if dex["volume_5m"] < 4000:
-            return False, f"mom vol spike m5 {dex['volume_5m']:.0f} vs h1 {dex['volume_1h']:.0f}"
+            return False, f"mom no spike"
     if dex["price_m5"] < f["price_m5_min"]: return False, f"mom p m5 {dex['price_m5']:.0f}%"
     if dex["price_m15"] < f["price_m15_min"]: return False, f"mom p m15 {dex['price_m15']:.0f}%"
-    # holders growth: compare to prev snapshot
     if track:
         growth = rug["holders"] - track.get("holders_prev", rug["holders"])
-        if growth < f["holders_growth_min"]: return False, f"mom holder growth {growth}"
-        # liquidity growing
-        if dex["liquidity"] <= track.get("liq_prev", dex["liquidity"]):
-            return False, f"mom liq not growing"
-        # dip check: current vs ATH tracked
-        ath = track.get("ath", dex["mcap"])
-        if ath > 0:
-            dip_pct = (ath - dex["mcap"]) / ath * 100
-            # if never dipped 30%+ it's not a revival
-            if track.get("mcap_low", dex["mcap"]) > 0:
-                # we want it to have dipped before, so ath should be much higher than low
-                if ath < track.get("mcap_low",0) * 1.5 and ath < 100000:
-                    pass # first time tracking, ignore
-    return True, f"PASS ratio {ratio:.1f} buys {dex['buys_m5']}"
+        if growth < f["holders_growth_min"]: return False, f"mom growth {growth}"
+        if dex["liquidity"] <= track.get("liq_prev", dex["liquidity"]): return False, f"mom liq not growing"
+    return True, f"PASS ratio {ratio:.1f}"
 
 def send_tx(b64):
     try:
         pl={"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":[b64,{"encoding":"base64","skipPreflight":False}]}
         r=requests.post(RPC_URL, json=pl, timeout=15).json()
         sig=r.get("result")
-        if not sig:
-            log(f"send err {r}")
-            return None
+        if not sig: return None
         for _ in range(12):
             time.sleep(2)
             st=requests.post(RPC_URL, json={"jsonrpc":"2.0","id":1,"method":"getSignatureStatuses","params":[[sig],{"searchTransactionHistory":True}]}, timeout=8).json()
             v=st.get("result",{}).get("value",[None])[0]
             if v and v.get("confirmationStatus") in ("confirmed","finalized") and not v.get("err"):
                 return sig
-            if v and v.get("err"):
-                log(f"tx failed {v.get('err')}")
-                return None
+            if v and v.get("err"): return None
         return sig
-    except Exception as e:
-        log(f"send_tx {e}")
+    except:
         return None
 
 def buy(mint):
     if DRY_RUN:
-        log(f"DRY RUN WOULD BUY {mint[:8]} - no tx sent")
+        log(f"DRY BUY {mint[:8]}")
         return "DRY_RUN_SIG"
     bal=get_balance()
-    if bal < BUY_AMOUNT+0.008:
-        log(f"low bal {bal:.4f} skip {mint[:8]}")
-        tg(f"Low bal {bal:.4f} SOL - cannot buy {mint[:6]}")
-        return None
+    if bal < BUY_AMOUNT+0.008: return None
     kp=get_keypair()
-    if not kp:
-        log("no keypair for buy")
-        return None
+    if not kp: return None
     try:
         resp=requests.post("https://pumpportal.fun/api/trade-local", json={"publicKey":str(kp.pubkey()),"action":"buy","mint":mint,"denominatedInSol":"true","amount":BUY_AMOUNT,"slippage":50,"priorityFee":0.005,"pool":"auto"}, timeout=20)
-        if resp.status_code!=200:
-            log(f"buy portal {resp.status_code} {resp.text[:150]}")
-            return None
+        if resp.status_code!=200: return None
         try: vtx=VersionedTransaction.from_bytes(resp.content)
         except:
-            b64=''.join(resp.text.strip().split())
-            tx_bytes=base64.b64decode(b64)
+            tx_bytes=base64.b64decode(''.join(resp.text.strip().split()))
             vtx=VersionedTransaction.from_bytes(tx_bytes)
         signed=VersionedTransaction(vtx.message,[kp])
-        sig=send_tx(base64.b64encode(bytes(signed)).decode())
-        return sig
-    except Exception as e:
-        log(f"buy ex {e}")
+        return send_tx(base64.b64encode(bytes(signed)).decode())
+    except:
         return None
 
 def sell(mint):
     kp=get_keypair()
-    if not kp: 
-        return None
+    if not kp: return None
     for slip in [40,70,100]:
         try:
             resp=requests.post("https://pumpportal.fun/api/trade-local", json={"publicKey":str(kp.pubkey()),"action":"sell","mint":mint,"amount":"100%","denominatedInSol":"false","slippage":slip,"priorityFee":0.005,"pool":"auto"}, timeout=20)
-            if resp.status_code!=200: 
-                log(f"sell portal {resp.status_code} slip {slip}")
-                continue
+            if resp.status_code!=200: continue
             try: vtx=VersionedTransaction.from_bytes(resp.content)
             except:
                 tx_bytes=base64.b64decode(''.join(resp.text.strip().split()))
                 vtx=VersionedTransaction.from_bytes(tx_bytes)
             signed=VersionedTransaction(vtx.message,[kp])
             sig=send_tx(base64.b64encode(bytes(signed)).decode())
-            if sig: 
-                return sig
-        except Exception as e:
-            log(f"sell ex {e} slip {slip}")
+            if sig: return sig
+        except:
             continue
     return None
 
@@ -377,9 +299,7 @@ def check_positions():
     remove=[]
     for mint,pos in list(open_positions.items()):
         data=fetch_dex(mint)
-        if not data: 
-            log(f"CHECK {pos['symbol']} no dex data")
-            continue
+        if not data: continue
         entry=pos["entry"]; curr=data["mcap"]
         pct=(curr/entry-1)*100 if entry else 0
         log(f"CHECK {pos['symbol']} {entry/1000:.0f}K->{curr/1000:.0f}K {pct:+.0f}%")
@@ -390,14 +310,13 @@ def check_positions():
         if should_sell:
             profit_sol = (curr/entry - 1) * BUY_AMOUNT if entry else 0
             if DRY_RUN or pos.get("is_paper"):
-                tg(f"DRY CLOSE {should_sell} {pos['symbol']} {pct:+.0f}% {entry/1000:.0f}K->{curr/1000:.0f}K PnL {profit_sol:+.4f} SOL")
+                tg(f"DRY CLOSE {should_sell} {pos['symbol']} {pct:+.0f}% PnL {profit_sol:+.4f}")
                 pnl_today += profit_sol
                 trades_today += 1
                 remove.append(mint)
                 continue
             s=None
-            for attempt in range(3):
-                log(f"SELL ATTEMPT {attempt+1}/3 {pos['symbol']} {should_sell}")
+            for _ in range(3):
                 s=sell(mint)
                 if s: break
                 time.sleep(2)
@@ -406,21 +325,14 @@ def check_positions():
                 pnl_today += profit_sol
                 trades_today += 1
                 remove.append(mint)
-            else:
-                log(f"SELL FAIL {pos['symbol']} - retry next loop")
-                if pct <= -60:
-                    tg(f"FORCE CLOSE {pos['symbol']} {pct:.0f}%")
-                    pnl_today += profit_sol
-                    trades_today += 1
-                    remove.append(mint)
     for m in remove: 
         open_positions.pop(m,None)
         seen_mints.discard(m)
 
+# THREAD 1 - NEW COINS (Pump WS)
 def main_loop():
     global trades_today, pnl_today, last_reset, bot_running
-    log(f"v11.0 DUAL START DRY_RUN={DRY_RUN} STOP={STOP_LOSS}% TP={TAKE_PROFIT_X}x")
-    tg(f"v11.0 DUAL START DRY={DRY_RUN} NEW {FILTERS['mcap_min']/1000:.0f}K + MOM {FILTERS_MOMENTUM['mcap_min']/1000:.0f}K-{FILTERS_MOMENTUM['mcap_max']/1000:.0f}K")
+    log(f"v11.1 NEW LOOP START")
     last_ws_log = time.time()
     while True:
         try:
@@ -430,21 +342,20 @@ def main_loop():
                 time.sleep(5); continue
             now=time.time()
             if now - last_ws_log > 120:
-                log(f"WS ok={ws_ok} q={ws_q.qsize()} watch={len(watchlist)} mom={len(momentum_watch)} open={len(open_positions)}")
+                log(f"WS ok={ws_ok} q={ws_q.qsize()} watch={len(watchlist)} open={len(open_positions)}")
                 last_ws_log = now
             if pnl_today <= -DAILY_LOSS_LIMIT:
-                log("Daily loss limit"); time.sleep(300); continue
+                time.sleep(300); continue
             while not ws_q.empty() and len(watchlist)<50:
                 try:
                     m=ws_q.get_nowait()
                     if m not in blacklist and m not in open_positions and m not in watchlist:
                         watchlist[m]={"first_seen":now,"symbol":f"WS-{m[:4]}"}
-                        log(f"WATCHLIST ADD {m[:8]} total {len(watchlist)}")
                 except: break
             for mint in list(watchlist.keys()):
                 if mint in open_positions or mint in blacklist:
                     del watchlist[mint]; continue
-                if now - watchlist[mint]["first_seen"] > 1800:
+                if now - watchlist[mint]["first_seen"] > 21600: # FIX: 6h not 30min
                     del watchlist[mint]; continue
                 if now - watchlist[mint]["first_seen"] < 90: continue
                 dex=fetch_dex(mint)
@@ -454,58 +365,93 @@ def main_loop():
                 t={"mcap":dex["mcap"],"liquidity":dex["liquidity"],"volume_5m":dex["volume_5m"],"holders":rug["holders"],"bundle":rug["bundle"],"insiders":rug["insiders"],"top10":rug["top10"],"rug_score":rug["score"]}
                 ok,reason=strict_pass(t)
                 if not ok:
-                    if "vol" in reason: continue
+                    if "vol" in reason: 
+                        # FIX: don't delete, move to momentum tracker for ROCCO-type
+                        momentum_watch[mint] = {
+                            "first_seen": now,
+                            "holders_prev": rug["holders"],
+                            "liq_prev": dex["liquidity"],
+                            "mcap_low": dex["mcap"],
+                            "ath": dex["mcap"],
+                            "last_check": now
+                        }
+                        del watchlist[mint]
+                        log(f"NEW vol low -> moved to MOM tracker {mint[:8]}")
+                        continue
                     del watchlist[mint]
-                    log(f"FILTER FAIL NEW {mint[:8]} {reason}")
                     continue
-                if len(open_positions)>=MAX_OPEN: 
-                    continue
-                if trades_today>=MAX_TRADES_DAY: 
-                    time.sleep(60); continue
-                log(f"STRICT PASS NEW {dex['symbol']} MC {dex['mcap']/1000:.0f}K Vol {dex['volume_5m']:.0f} Holders {rug['holders']} Top10 {rug['top10']:.0f}% -> BUY")
+                if len(open_positions)>=MAX_OPEN: continue
+                if trades_today>=MAX_TRADES_DAY: time.sleep(60); continue
                 sig=buy(mint)
                 if sig:
                     if DRY_RUN:
                         open_positions[mint]={"entry":dex["mcap"],"symbol":dex["symbol"]+"-NEW","time":now,"is_paper":True}
                         blacklist[mint]=now+86400
                         del watchlist[mint]
-                        tg(f"📝 PAPER BUY NEW {dex['symbol']} MC {dex['mcap']/1000:.0f}K Liq {dex['liquidity']/1000:.0f}K\nhttps://dexscreener.com/solana/{mint}")
+                        tg(f"📝 PAPER BUY NEW {dex['symbol']} MC {dex['mcap']/1000:.0f}K\nhttps://dexscreener.com/solana/{mint}")
                     else:
                         open_positions[mint]={"entry":dex["mcap"],"symbol":dex["symbol"],"time":now,"is_paper":False}
                         blacklist[mint]=now+9999999; del watchlist[mint]; trades_today+=1
-                        tg(f"🚀 BUY NEW {dex['symbol']} MC {dex['mcap']/1000:.0f}K https://solscan.io/tx/{sig}")
+                        tg(f"🚀 BUY NEW {dex['symbol']} https://solscan.io/tx/{sig}")
             time.sleep(4)
         except Exception as e:
             log(f"MAIN CRASH {e}\n{traceback.format_exc()}"); time.sleep(10)
 
+# === FIXED: INDEPENDENT DEX SCANNER - NO DEPENDENCY ON THREAD 1 ===
+def fetch_dex_trending_mints():
+    mints = []
+    try:
+        r = requests.get("https://frontend-api-v2.pump.fun/coins?offset=0&limit=60&sort=market_cap&order=DESC&includeNsfw=false", timeout=8, headers={"User-Agent":"Mozilla/5.0"})
+        if r.status_code == 200:
+            data = r.json()
+            coins = data if isinstance(data, list) else data.get("coins", [])
+            for c in coins:
+                mc = float(c.get("usd_market_cap",0) or 0)
+                if 60000 <= mc <= 400000:
+                    mint = c.get("mint")
+                    if mint: mints.append(mint)
+    except Exception as e:
+        log(f"pump trending fail {e}")
+
+    try:
+        r = requests.get("https://api.dexscreener.com/latest/dex/search/?q=SOL", timeout=8, headers={"User-Agent":"Mozilla/5.0"})
+        if r.status_code == 200:
+            for p in r.json().get("pairs",[])[:40]:
+                if p.get("chainId") != "solana": continue
+                fdv = float(p.get("fdv",0) or 0)
+                if 70000 <= fdv <= 400000:
+                    mint = p.get("baseToken",{}).get("address")
+                    if mint and mint not in mints:
+                        mints.append(mint)
+    except Exception as e:
+        log(f"dex trending fail {e}")
+    return mints[:50]
+
 def momentum_loop():
     global trades_today
-    log("MOMENTUM loop started - scanning for revival")
+    log("MOMENTUM DEX DIRECT START - independent")
     while True:
         try:
             if not bot_running:
                 time.sleep(10); continue
             now=time.time()
-            # Build candidate list: from momentum_watch + graduated WS + old watchlist
-            candidates = list(momentum_watch.keys())[:30]
-            # add some from blacklist that are old enough to check for revival (2h+)
-            for m, exp in list(blacklist.items()):
-                if now > exp - 80000: # expired or near expiry
-                    if m not in candidates and m not in open_positions:
-                        candidates.append(m)
-                        if len(candidates) > 40: break
-            
-            for mint in candidates:
-                if mint in open_positions: 
-                    momentum_watch.pop(mint,None)
+            # DIRECT DEX SCAN - independent of WS
+            candidates = fetch_dex_trending_mints()
+            # also include coins moved from NEW loop (low vol)
+            for m in list(momentum_watch.keys()):
+                if m not in candidates:
+                    candidates.append(m)
+
+            log(f"MOM DEX scan {len(candidates)} candidates")
+            for mint in candidates[:40]:
+                if mint in open_positions: continue
+                if mint in blacklist and now < blacklist[mint] - 1000:
                     continue
                 dex = fetch_dex(mint)
                 if not dex: continue
-                # only care 80K-350K
-                if not (FILTERS_MOMENTUM["mcap_min"] <= dex["mcap"] <= FILTERS_MOMENTUM["mcap_max"]):
-                    # update tracking for future dip
-                    track = momentum_watch.get(mint, {})
-                    if dex["mcap"] > 0:
+                if not (FILTERS_MOMENTUM["mcap_min"] <= dex["mcap"] <= 500000): # allow up to 500K to catch breakout like ROCCO 646K
+                    track = momentum_watch.get(mint)
+                    if track:
                         track["ath"] = max(track.get("ath",0), dex["mcap"])
                         track["mcap_low"] = min(track.get("mcap_low", dex["mcap"]), dex["mcap"])
                     continue
@@ -514,67 +460,45 @@ def momentum_loop():
                 
                 track = momentum_watch.get(mint)
                 if not track:
-                    # first time seen for momentum - store baseline
                     momentum_watch[mint] = {
                         "first_seen": now,
                         "holders_prev": rug["holders"],
                         "liq_prev": dex["liquidity"],
                         "mcap_low": dex["mcap"],
                         "ath": dex["mcap"],
-                        "last_check": now
+                        "last_check": now - 60
                     }
                     continue
-                # update ath/low
+                if now - track.get("last_check",0) < 60: continue
+                track["last_check"] = now
                 track["ath"] = max(track.get("ath",0), dex["mcap"])
                 track["mcap_low"] = min(track.get("mcap_low", dex["mcap"]), dex["mcap"])
-                
-                # only re-check every 60s per coin to avoid rate limit
-                if now - track.get("last_check",0) < 60:
-                    continue
-                track["last_check"] = now
-                
+
                 ok, reason = momentum_pass(dex, rug, track)
                 if not ok:
-                    # if it's just holder growth not yet, keep tracking
-                    if "growth" in reason or "liq not growing" in reason:
-                        log(f"MOM TRACK {dex['symbol']} {reason} MC {dex['mcap']/1000:.0f}K buys {dex['buys_m5']}/{dex['sells_m5']}")
-                    else:
-                        log(f"MOM FAIL {dex['symbol']} {reason}")
-                    # update prev for next growth calc after 5 min
                     if now - track["first_seen"] > 300:
                         track["holders_prev"] = rug["holders"]
                         track["liq_prev"] = dex["liquidity"]
                     continue
-                
-                # PASS = MOMENTUM BUY
-                if len(open_positions)>=MAX_OPEN: 
-                    log(f"MOMENTUM PASS but MAX_OPEN {dex['symbol']}")
-                    continue
-                if trades_today>=MAX_TRADES_DAY:
-                    log("MOMENTUM skip daily limit")
-                    time.sleep(60); continue
-                
-                log(f"🚀 MOMENTUM PASS {dex['symbol']} MC {dex['mcap']/1000:.0f}K buys {dex['buys_m5']}/{dex['sells_m5']} m5 {dex['price_m5']:.0f}% m15 {dex['price_m15']:.0f}% Vol {dex['volume_5m']:.0f} Holders {rug['holders']}")
+
+                if len(open_positions)>=MAX_OPEN: continue
+                if trades_today>=MAX_TRADES_DAY: continue
+
+                log(f"🚀 MOM DEX PASS {dex['symbol']} {dex['mcap']/1000:.0f}K buys {dex['buys_m5']}/{dex['sells_m5']} m5 +{dex['price_m5']:.0f}%")
                 sig = buy(mint)
                 if sig:
                     if DRY_RUN:
-                        open_positions[mint]={"entry":dex["mcap"],"symbol":dex["symbol"]+"-MOM","time":now,"is_paper":True}
+                        open_positions[mint]={"entry":dex["mcap"],"symbol":dex["symbol"]+"-MOM-DEX","time":now,"is_paper":True}
                         blacklist[mint]=now+86400
                         momentum_watch.pop(mint,None)
-                        tg(f"📈 PAPER BUY MOMENTUM {dex['symbol']} MC {dex['mcap']/1000:.0f}K Buys {dex['buys_m5']}/{dex['sells_m5']} +{dex['price_m5']:.0f}%/{dex['price_m15']:.0f}% Vol {dex['volume_5m']:.0f}\nhttps://dexscreener.com/solana/{mint}")
+                        tg(f"📈 PAPER BUY MOM-DEX {dex['symbol']} MC {dex['mcap']/1000:.0f}K Buys {dex['buys_m5']}/{dex['sells_m5']} +{dex['price_m5']:.0f}% Vol {dex['volume_5m']:.0f}\nhttps://dexscreener.com/solana/{mint}")
                     else:
                         open_positions[mint]={"entry":dex["mcap"],"symbol":dex["symbol"]+"-MOM","time":now,"is_paper":False}
-                        blacklist[mint]=now+9999999
-                        momentum_watch.pop(mint,None)
-                        trades_today+=1
-                        tg(f"📈 BUY MOMENTUM {dex['symbol']} MC {dex['mcap']/1000:.0f}K https://solscan.io/tx/{sig}")
-                    # reset growth baseline
-                    track["holders_prev"] = rug["holders"]
-                    track["liq_prev"] = dex["liquidity"]
-            
-            time.sleep(15)
+                        blacklist[mint]=now+9999999; momentum_watch.pop(mint,None); trades_today+=1
+                        tg(f"📈 BUY MOM-DEX {dex['symbol']} MC {dex['mcap']/1000:.0f}K https://solscan.io/tx/{sig}")
+            time.sleep(20)
         except Exception as e:
-            log(f"MOMENTUM CRASH {e}\n{traceback.format_exc()}")
+            log(f"MOM DEX CRASH {e}\n{traceback.format_exc()}")
             time.sleep(10)
 
 def pos_loop():
@@ -583,13 +507,12 @@ def pos_loop():
             if open_positions: check_positions()
             time.sleep(3)
         except Exception as e:
-            log(f"pos_loop err {e}")
+            log(f"pos err {e}")
             time.sleep(3)
 
 def tg_loop():
     global DRY_RUN, bot_running
     off=0
-    log("TG loop started")
     while True:
         try:
             if not BOT_TOKEN:
@@ -601,31 +524,30 @@ def tg_loop():
                 if CHAT_ID and str(msg.get("chat",{}).get("id",""))!=str(CHAT_ID): continue
                 txt=(msg.get("text") or ""); low=txt.lower()
                 if not low.startswith("/"): continue
-                log(f"TG cmd {low}")
                 if "/balance" in low:
-                    tg(f"Bal {get_balance():.4f} SOL DRY={DRY_RUN} WS={ws_ok} Watch {len(watchlist)} Mom {len(momentum_watch)} Open {len(open_positions)} Q {ws_q.qsize()}")
+                    tg(f"Bal {get_balance():.4f} SOL DRY={DRY_RUN} Watch {len(watchlist)} Mom {len(momentum_watch)} Open {len(open_positions)}")
                 if "/positions" in low or "/pos" in low:
-                    if not open_positions: tg("No open positions")
+                    if not open_positions: tg("No open")
                     else:
                         lines=[]
                         for m,p in open_positions.items():
                             d=fetch_dex(m)
                             if d:
                                 pct=(d['mcap']/p['entry']-1)*100 if p['entry'] else 0
-                                lines.append(f"{p['symbol']} {p['entry']/1000:.0f}K->{d['mcap']/1000:.0f}K {pct:+.0f}% {'PAPER' if p.get('is_paper') else ''}")
-                        tg("\n".join(lines) + f"\nPnL today {pnl_today:+.4f} SOL Trades {trades_today}")
-                if "/watch" in low or "/watchlist" in low:
-                    tg(f"Watch {len(watchlist)} Mom {len(momentum_watch)} Q {ws_q.qsize()} WS={ws_ok}")
+                                lines.append(f"{p['symbol']} {p['entry']/1000:.0f}K->{d['mcap']/1000:.0f}K {pct:+.0f}%")
+                        tg("\n".join(lines))
+                if "/watch" in low:
+                    tg(f"Watch {len(watchlist)} Mom {len(momentum_watch)}")
                 if "/mom" in low:
-                    tg(f"Mom {len(momentum_watch)} tracked\n" + "\n".join([f"{k[:6]} H {v['holders_prev']} L {v['liq_prev']/1000:.0f}K" for k,v in list(momentum_watch.items())[:10]]))
+                    tg(f"Mom {len(momentum_watch)} tracked")
                 if "/pnl" in low:
-                    tg(f"PnL {pnl_today:+.4f} SOL Trades {trades_today} STOP {STOP_LOSS}% TP {TAKE_PROFIT_X}x")
+                    tg(f"PnL {pnl_today:+.4f} Trades {trades_today}")
                 if "/dry" in low and "off" in low:
-                    DRY_RUN=False; tg("DRY OFF - LIVE")
+                    DRY_RUN=False; tg("DRY OFF LIVE")
                 if "/dry" in low and "on" in low:
-                    DRY_RUN=True; tg("DRY ON - safe")
+                    DRY_RUN=True; tg("DRY ON")
                 if "/stop" in low:
-                    bot_running=False; tg("PAUSED buying, selling still active")
+                    bot_running=False; tg("PAUSED")
                 if "/start" in low or "/resume" in low:
                     bot_running=True; tg("RESUMED")
                 if "/sellall" in low:
@@ -636,20 +558,17 @@ def tg_loop():
 
 def start_background_threads():
     global threads_started
-    if threads_started:
-        return
+    if threads_started: return
     threads_started = True
-    log("Starting background threads...")
     threading.Thread(target=ws_loop,daemon=True).start()
     threading.Thread(target=pos_loop,daemon=True).start()
     threading.Thread(target=tg_loop,daemon=True).start()
     threading.Thread(target=main_loop,daemon=True).start()
     threading.Thread(target=momentum_loop,daemon=True).start()
-    log("All threads started DUAL MODE")
+    log("All threads INDEPENDENT started")
 
 start_background_threads()
 
 if __name__=="__main__":
     port=int(os.getenv("PORT",10000))
-    log(f"Running Flask on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
