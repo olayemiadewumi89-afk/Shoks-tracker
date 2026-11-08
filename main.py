@@ -21,31 +21,33 @@ STOP_LOSS = 35
 EMERGENCY_RUG = 45
 TAKE_PROFIT_X = 2.0
 
+# FIXED: Looser at birth to catch HEREWEGO early
 FILTERS = {
-    "mcap_min": 40000,
+    "mcap_min": 20000,
     "mcap_max": 900000,
-    "liquidity_min": 20000,
-    "volume_5m_min": 8000,
-    "holders_min": 50,
+    "liquidity_min": 15000,
+    "volume_5m_min": 3000,
+    "holders_min": 25,
     "bundle_max": 25,
     "insiders_max": 20,
     "top10_max": 35,
     "rug_score_max": 4000
 }
 
+# FIXED: Tight for buy but allows 800K runners
 FILTERS_MOMENTUM = {
     "mcap_min": 80000,
-    "mcap_max": 350000,
+    "mcap_max": 800000,
     "liquidity_min": 18000,
-    "holders_min": 150,
+    "holders_min": 120,
     "top10_max": 25,
     "bundle_max": 15,
     "insiders_max": 15,
     "volume_5m_min": 3000,
     "buys_m5_min": 30,
     "buy_sell_ratio_min": 2.5,
-    "price_m5_min": 20,
-    "price_m15_min": 50,
+    "price_m5_min": 10,
+    "price_m15_min": 20,
     "holders_growth_min": 10,
     "dip_min_pct": 50
 }
@@ -90,7 +92,7 @@ def health():
 
 @app.route("/")
 def home(): 
-    return f"v11.1 INDEPENDENT DRY={DRY_RUN} Watch={len(watchlist)} Mom={len(momentum_watch)} Open={len(open_positions)}",200
+    return f"v11.2 FIXED DRY={DRY_RUN} Watch={len(watchlist)} Mom={len(momentum_watch)} Open={len(open_positions)}",200
 
 def ws_on_message(ws, message):
     try:
@@ -98,7 +100,8 @@ def ws_on_message(ws, message):
         mint=d.get("mint") or d.get("ca") or (d.get("data",{}).get("mint") if isinstance(d.get("data"),dict) else None)
         if not mint or len(mint)<32: 
             return
-        if mint in blacklist or mint in open_positions or mint in watchlist or mint in seen_mints: 
+        # FIX 1: Don't block on seen_mints forever
+        if mint in blacklist or mint in open_positions or mint in watchlist: 
             return
         ws_q.put(mint)
         seen_mints.add(mint)
@@ -109,7 +112,7 @@ def ws_on_open(ws):
     global ws_ok
     ws_ok=True
     log("WS Connected")
-    tg(f"WS Connected v11.1 DRY={DRY_RUN}")
+    tg(f"WS Connected v11.2 DRY={DRY_RUN}")
     try: 
         ws.send(json.dumps({"method":"subscribeNewToken"}))
     except Exception as e:
@@ -228,9 +231,6 @@ def momentum_pass(dex, rug, track):
     if dex["buys_m5"] < f["buys_m5_min"]: return False, f"mom buys {dex['buys_m5']}"
     ratio = dex["buys_m5"] / max(1, dex["sells_m5"])
     if ratio < f["buy_sell_ratio_min"]: return False, f"mom ratio {ratio:.1f}"
-    if dex["volume_1h"]>0 and dex["volume_5m"] < dex["volume_1h"]*0.15: # m5 should be >15% of h1 = spike
-        if dex["volume_5m"] < 4000:
-            return False, f"mom no spike"
     if dex["price_m5"] < f["price_m5_min"]: return False, f"mom p m5 {dex['price_m5']:.0f}%"
     if dex["price_m15"] < f["price_m15_min"]: return False, f"mom p m15 {dex['price_m15']:.0f}%"
     if track:
@@ -327,12 +327,10 @@ def check_positions():
                 remove.append(mint)
     for m in remove: 
         open_positions.pop(m,None)
-        seen_mints.discard(m)
 
-# THREAD 1 - NEW COINS (Pump WS)
 def main_loop():
     global trades_today, pnl_today, last_reset, bot_running
-    log(f"v11.1 NEW LOOP START")
+    log(f"v11.2 NEW LOOP START")
     last_ws_log = time.time()
     while True:
         try:
@@ -342,7 +340,7 @@ def main_loop():
                 time.sleep(5); continue
             now=time.time()
             if now - last_ws_log > 120:
-                log(f"WS ok={ws_ok} q={ws_q.qsize()} watch={len(watchlist)} open={len(open_positions)}")
+                log(f"WS ok={ws_ok} q={ws_q.qsize()} watch={len(watchlist)} mom={len(momentum_watch)} open={len(open_positions)}")
                 last_ws_log = now
             if pnl_today <= -DAILY_LOSS_LIMIT:
                 time.sleep(300); continue
@@ -355,9 +353,9 @@ def main_loop():
             for mint in list(watchlist.keys()):
                 if mint in open_positions or mint in blacklist:
                     del watchlist[mint]; continue
-                if now - watchlist[mint]["first_seen"] > 21600: # FIX: 6h not 30min
+                if now - watchlist[mint]["first_seen"] > 21600:
                     del watchlist[mint]; continue
-                if now - watchlist[mint]["first_seen"] < 90: continue
+                if now - watchlist[mint]["first_seen"] < 30: continue # FIX: was 90 -> 30 sec faster
                 dex=fetch_dex(mint)
                 if not dex: continue
                 rug=fetch_rug(mint)
@@ -365,8 +363,8 @@ def main_loop():
                 t={"mcap":dex["mcap"],"liquidity":dex["liquidity"],"volume_5m":dex["volume_5m"],"holders":rug["holders"],"bundle":rug["bundle"],"insiders":rug["insiders"],"top10":rug["top10"],"rug_score":rug["score"]}
                 ok,reason=strict_pass(t)
                 if not ok:
-                    if "vol" in reason: 
-                        # FIX: don't delete, move to momentum tracker for ROCCO-type
+                    # FIX 2: holders/vol/liq -> move to MOM, not trash
+                    if "vol" in reason or "holders" in reason or "liq" in reason:
                         momentum_watch[mint] = {
                             "first_seen": now,
                             "holders_prev": rug["holders"],
@@ -376,9 +374,10 @@ def main_loop():
                             "last_check": now
                         }
                         del watchlist[mint]
-                        log(f"NEW vol low -> moved to MOM tracker {mint[:8]}")
+                        log(f"NEW early -> MOM tracker {dex['symbol']} {reason} MC {dex['mcap']/1000:.0f}K")
                         continue
                     del watchlist[mint]
+                    log(f"FILTER FAIL NEW {mint[:8]} {reason}")
                     continue
                 if len(open_positions)>=MAX_OPEN: continue
                 if trades_today>=MAX_TRADES_DAY: time.sleep(60); continue
@@ -393,38 +392,25 @@ def main_loop():
                         open_positions[mint]={"entry":dex["mcap"],"symbol":dex["symbol"],"time":now,"is_paper":False}
                         blacklist[mint]=now+9999999; del watchlist[mint]; trades_today+=1
                         tg(f"🚀 BUY NEW {dex['symbol']} https://solscan.io/tx/{sig}")
-            time.sleep(4)
+            time.sleep(3)
         except Exception as e:
             log(f"MAIN CRASH {e}\n{traceback.format_exc()}"); time.sleep(10)
 
-# === FIXED: INDEPENDENT DEX SCANNER - NO DEPENDENCY ON THREAD 1 ===
 def fetch_dex_trending_mints():
     mints = []
     try:
-        r = requests.get("https://frontend-api-v2.pump.fun/coins?offset=0&limit=60&sort=market_cap&order=DESC&includeNsfw=false", timeout=8, headers={"User-Agent":"Mozilla/5.0"})
+        # FIX 3: lastTrade not market_cap - catches pumping NOW coins like HEREWEGO
+        r = requests.get("https://frontend-api-v2.pump.fun/coins?offset=0&limit=100&sort=lastTrade&order=DESC&includeNsfw=false", timeout=8, headers={"User-Agent":"Mozilla/5.0"})
         if r.status_code == 200:
             data = r.json()
             coins = data if isinstance(data, list) else data.get("coins", [])
             for c in coins:
                 mc = float(c.get("usd_market_cap",0) or 0)
-                if 60000 <= mc <= 400000:
+                if 30000 <= mc <= 1600000:
                     mint = c.get("mint")
                     if mint: mints.append(mint)
     except Exception as e:
         log(f"pump trending fail {e}")
-
-    try:
-        r = requests.get("https://api.dexscreener.com/latest/dex/search/?q=SOL", timeout=8, headers={"User-Agent":"Mozilla/5.0"})
-        if r.status_code == 200:
-            for p in r.json().get("pairs",[])[:40]:
-                if p.get("chainId") != "solana": continue
-                fdv = float(p.get("fdv",0) or 0)
-                if 70000 <= fdv <= 400000:
-                    mint = p.get("baseToken",{}).get("address")
-                    if mint and mint not in mints:
-                        mints.append(mint)
-    except Exception as e:
-        log(f"dex trending fail {e}")
     return mints[:50]
 
 def momentum_loop():
@@ -435,9 +421,7 @@ def momentum_loop():
             if not bot_running:
                 time.sleep(10); continue
             now=time.time()
-            # DIRECT DEX SCAN - independent of WS
             candidates = fetch_dex_trending_mints()
-            # also include coins moved from NEW loop (low vol)
             for m in list(momentum_watch.keys()):
                 if m not in candidates:
                     candidates.append(m)
@@ -449,7 +433,7 @@ def momentum_loop():
                     continue
                 dex = fetch_dex(mint)
                 if not dex: continue
-                if not (FILTERS_MOMENTUM["mcap_min"] <= dex["mcap"] <= 500000): # allow up to 500K to catch breakout like ROCCO 646K
+                if not (FILTERS_MOMENTUM["mcap_min"] <= dex["mcap"] <= FILTERS_MOMENTUM["mcap_max"]):
                     track = momentum_watch.get(mint)
                     if track:
                         track["ath"] = max(track.get("ath",0), dex["mcap"])
@@ -469,14 +453,14 @@ def momentum_loop():
                         "last_check": now - 60
                     }
                     continue
-                if now - track.get("last_check",0) < 60: continue
+                if now - track.get("last_check",0) < 45: continue
                 track["last_check"] = now
                 track["ath"] = max(track.get("ath",0), dex["mcap"])
                 track["mcap_low"] = min(track.get("mcap_low", dex["mcap"]), dex["mcap"])
 
                 ok, reason = momentum_pass(dex, rug, track)
                 if not ok:
-                    if now - track["first_seen"] > 300:
+                    if now - track["first_seen"] > 180:
                         track["holders_prev"] = rug["holders"]
                         track["liq_prev"] = dex["liquidity"]
                     continue
@@ -488,15 +472,15 @@ def momentum_loop():
                 sig = buy(mint)
                 if sig:
                     if DRY_RUN:
-                        open_positions[mint]={"entry":dex["mcap"],"symbol":dex["symbol"]+"-MOM-DEX","time":now,"is_paper":True}
+                        open_positions[mint]={"entry":dex["mcap"],"symbol":dex["symbol"]+"-MOM","time":now,"is_paper":True}
                         blacklist[mint]=now+86400
                         momentum_watch.pop(mint,None)
-                        tg(f"📈 PAPER BUY MOM-DEX {dex['symbol']} MC {dex['mcap']/1000:.0f}K Buys {dex['buys_m5']}/{dex['sells_m5']} +{dex['price_m5']:.0f}% Vol {dex['volume_5m']:.0f}\nhttps://dexscreener.com/solana/{mint}")
+                        tg(f"📈 PAPER BUY MOM {dex['symbol']} MC {dex['mcap']/1000:.0f}K Buys {dex['buys_m5']}/{dex['sells_m5']} +{dex['price_m5']:.0f}% Vol {dex['volume_5m']:.0f}\nhttps://dexscreener.com/solana/{mint}")
                     else:
                         open_positions[mint]={"entry":dex["mcap"],"symbol":dex["symbol"]+"-MOM","time":now,"is_paper":False}
                         blacklist[mint]=now+9999999; momentum_watch.pop(mint,None); trades_today+=1
-                        tg(f"📈 BUY MOM-DEX {dex['symbol']} MC {dex['mcap']/1000:.0f}K https://solscan.io/tx/{sig}")
-            time.sleep(20)
+                        tg(f"📈 BUY MOM {dex['symbol']} MC {dex['mcap']/1000:.0f}K https://solscan.io/tx/{sig}")
+            time.sleep(15)
         except Exception as e:
             log(f"MOM DEX CRASH {e}\n{traceback.format_exc()}")
             time.sleep(10)
@@ -556,6 +540,12 @@ def tg_loop():
         except Exception as e:
             log(f"TG err {e}"); time.sleep(5)
 
+def clear_seen():
+    while True:
+        time.sleep(7200)
+        seen_mints.clear()
+        log("seen_mints cleared - allow re-entry")
+
 def start_background_threads():
     global threads_started
     if threads_started: return
@@ -565,7 +555,8 @@ def start_background_threads():
     threading.Thread(target=tg_loop,daemon=True).start()
     threading.Thread(target=main_loop,daemon=True).start()
     threading.Thread(target=momentum_loop,daemon=True).start()
-    log("All threads INDEPENDENT started")
+    threading.Thread(target=clear_seen,daemon=True).start()
+    log("All threads v11.2 FIXED started")
 
 start_background_threads()
 
